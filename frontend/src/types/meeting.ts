@@ -1,0 +1,31 @@
+/**
+ * Meeting 状态：严格对应对应后端四态（PRD §11 / ADR D1）。
+ * 禁止出现 FINALIZING_FAILED / FAILED 等非四态值 —— Meeting 没有失败态，
+ * 纪要失败由 SummaryStatus.FAILED 表达（meeting=COMPLETED, summary=FAILED）。
+ */
+export type MeetingStatus =
+  | 'CREATED'
+  | 'IN_PROGRESS'
+  | 'FINALIZING'
+  | 'COMPLETED'
+
+/** POST /api/meetings 请求体（PRD §37） */
+export interface MeetingCreate {
+  title: string
+  description?: string | null
+}
+
+/** GET /api/meetings/:id 返回（MeetingOut） */
+export interface Meeting {
+  id: string
+  title: string
+  description: string | null
+  status: MeetingStatus
+  started_at: string | null
+  ended_at: string | null
+  completed_at: string | null
+  created_at: string | null
+  updated_at: string | null
+  /** 由后端推导的业务展示态（= status；FE 依赖驱动页面，见 MeetingStatusTag） */
+  displayStatus?: MeetingStatus
+}

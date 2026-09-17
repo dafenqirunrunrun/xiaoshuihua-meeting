@@ -150,9 +150,42 @@ existing implementation
   - 不改 Step 5 恢复协议（Snapshot + `after_segment_seq` 原样；无
     after_summary_version / durable SSE replay / Last-Event-ID）。
   - 明确不做：React/Zustand/Result Page/真实 ASR/Celery/Redis/Kafka/启动期调度。
-  - 测试：`backend/scripts/test_summary_step7b.py` 36/36 PASS；
-    Step 7A regression 28/28 PASS；Step 6 regression 21/21 PASS（H06 更新为
-    "Freeze 后经 Finalizer 终态 COMPLETED"）；Step 5 regression 21/21 PASS；parser 2/2 PASS。
+- **Step 8A 已完成**：React Frontend Foundation（前端基础设施）。
+  - 技术栈落地（固定，禁换）：React 18 + TypeScript + Vite 5 + React Router 6
+    + Zustand 4 + Axios + Ant Design 5 + @ant-design/icons。
+  - 目录结构（对齐 `fronted_designer.md §45`）：`src/app`（App + router）/
+    `layouts`（AppShell）/ `pages`（Home · Meetings · MeetingRoom · MeetingResult ·
+    Settings · NotFound）/ `components` / `hooks`（8B 用）/ `stores`（meetingStore）/
+    `api`（http · meeting · transcript · summary）/ `types` / `utils` / `styles`。
+  - **API Client 只对后端实际契约封装**（未猜）：`createMeeting` / `getMeeting` /
+    `startMeeting` / `finishMeeting` / `getTranscriptSnapshot` / `getSummary` /
+    `regenerateSummary`；`http.ts` 统一 Axios + 极薄错误归一化
+    （http status / backend detail / network error，`ApiError`）。
+  - **Types 严格映射后端 schema**：`meeting`（四态 CREATED / IN_PROGRESS /
+    FINALIZING / COMPLETED，**无 FINALIZING_FAILED**）/ `transcript`
+    （TranscriptSegment / TranscriptSnapshot / PartialUtterance）/ `summary`
+    （MeetingSummary · SummaryStatus / RegenerationAccepted）/ `sse`
+    （SseEventType / SseEnvelope / StreamStatus）。
+  - **Zustand store（8A 仅 shape + reset，redducer 8B 填）**：`meeting` /
+    `finalSegments`（FINAL）/ `partialUtterances`（keyed by utterance_id，
+    PARTIAL）/**两者硬分离** / `summary` / `streamStatus` / `resetMeetingState`。
+  - **路由**（fronted_designer §7）：`/` / `/meetings` / `/meetings/:meetingId` /
+    `/meetings/:meetingId/result` / `/settings`；`AppShell` 侧栏 = 首页 · 会议 · 设置。
+  - **Design Token**：`src/styles/designTokens.ts` → Ant Design `ConfigProvider theme`
+    统一入口（色值来自 fronted_designer §47，零散 magic number 只在一处）。
+  - **Vite proxy**：`/api → http://127.0.0.1:8000`（业务代码不硬编码后端 host）；
+    `VITE_API_BASE_URL` 仅作部署覆盖；`.env.example` 提交、真实 `.env` 禁止提交。
+  - Home 页真创建（POST /meetings + /start → navigate(`/meetings/${id}`)）；
+    Meetings 页为 **MVP 占位**（后端无 GET /meetings 列表，不改后端加接口）。
+  - Home / Meetings / MeetingResult / MeetingRoom / Settings 均为 Step 8A 骨架
+    （SSE / Snapshot 恢复 / Summary 渲染在 8B/8C）。**不做前端 Mock Stream 主路径
+    （VITE_USE_MOCK_STREAM）** —— 8B/8C 直连真实后端（真实 HTTP/SSE + Mock
+    Producer + Fake LLMProvider）。
+  - 验证：`npm install` + `npm run typecheck` + `npm run build`（vite build PASS）；
+    `npm run dev` 起 5173，`/ /meetings /settings /meetings/test /meetings/test/result`
+    路由可达（SPA fallback 200），Vite proxy `/api/health → 8000` 连通。
+  - **Backend 零修改**（Step 8A 未动 `backend/`）。
+  - 前端命令见下方「常用命令」。
 
 
 ## 常用命令
@@ -164,6 +197,13 @@ cd backend
 
 # 依赖
 cd backend && .venv/Scripts/python -m pip install -r requirements.txt
+
+# 前端
+cd frontend
+npm install
+npm run dev        # Vite dev server on :5173（proxy /api -> :8000）
+npm run typecheck  # tsc --noEmit
+npm run build      # tsc --noEmit && vite build
 ```
 
 ## 文档索引

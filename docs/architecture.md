@@ -430,3 +430,53 @@ React / Zustand / Result Page / 真实 ASR
 Celery / Redis / Kafka / 启动期全库扫描调度
 BackgroundTasks 仅作进程内 MVP 触发（≠ durable job queue；durable 事实在 DB）
 ```
+
+## 12. React Frontend Foundation（Step 8A 已实现）
+
+> 前端工程基础。技术栈：React 18 + TypeScript + Vite + React Router 6 + Zustand +
+> Axios + Ant Design 5（fronted_designer §4/§45/§62 Step 1–6）。目录：`frontend/`。
+
+### 12.1 结构
+
+```text
+frontend/src/
+  app/        App.tsx（ConfigProvider theme + AntdApp + RouterProvider）、router.tsx
+  layouts/    AppShell.tsx（侧栏：首页 · 会议 · 设置）
+  pages/      Home / Meetings / MeetingRoom / MeetingResult / Settings / NotFound
+  components/ MeetingStatusTag、CreateMeetingModal（8B/8C 扩展）
+  stores/     meetingStore.ts（shape + reset，8B 填 reducer）
+  api/        http.ts（Axios + ApiError 归一化）、meeting.ts、transcript.ts、summary.ts
+  types/      meeting.ts、transcript.ts、summary.ts、sse.ts（严格映射后端 schema）
+  styles/     designTokens.ts（ConfigProvider theme 唯一入口）、global.css
+```
+
+### 12.2 对齐契约的原则
+
+- **Types 不猜**：`MeetingStatus` 严格四态（CREATED / IN_PROGRESS / FINALIZING /
+  COMPLETED，ADR D1）；`TranscriptSegment/TranscriptSnapshot`（TranscriptSegmentOut）、
+  `MeetingSummary`（SummaryOut 含 version）、`SseEnvelope`（SSEEventEnvelope，含
+  payload 按 event_type 区分）—— 全部源自 `backend/app/schemas/*`。
+- **API client**：只封装实际存在的后端端点；业务组件不直接 `axios`（fronted_designer
+  §44/§61.10）。错误经 `ApiError` 分 http/network/unknown。
+- **前端恢复模型不变式（PRD §32，arch §6）不变**：GET Meeting → GET Transcript
+  Snapshot → GET Summary（Step 7B）→ SSE 增量。SSE 非事实源。
+- **Meeting 状态驱动页面**：四态分别 = CREATED「待开始」/ IN_PROGRESS「会议进行中」/
+  FINALIZING「处理中」/ COMPLETED「已完成」；**无 FINALIZING_FAILED**（fe 不显示
+  "会议失败"；纪要失败由 `meeting=COMPLETED + summary=FAILED` 表达，PRD §12）。
+- **PARTIAL / FINAL 硬分离**：`partialUtterances`（keyed by utterance_id，原地覆盖）
+  与 `finalSegments`（按 segment_seq，append/upsert）为 store 中两个独立字段
+  （PRD §34/§35）。
+- **Mock**：Step 8 不做前端 Mock Stream 主路径（VITE_USE_MOCK_STREAM 仅保留为
+  fronted_designer §58 说明）；8B/8C 直接连真实后端（真实 HTTP/SSE + Mock Transcript
+  Producer + Fake LLMProvider）。
+- **Vite proxy**：`/api → http://127.0.0.1:8000`（post-dev CORS 无关，浏览器同源）；
+  `VITE_API_BASE_URL` 为部署覆盖项（.env.example 已提交，真实 .env 不提交）。
+
+### 12.3 明确不做（8A）
+
+```text
+无 SSE / Snapshot 恢复（8B）          无 Summary / Regenerate / Result 渲染（8C）
+无前端 Mock Stream 协议              不改后端 / 不新增 GET /api/meetings 列表
+无 API Key 输入框（Browser 不收 DeepSeek Secret，PRD §45/arch §10）
+```
+
