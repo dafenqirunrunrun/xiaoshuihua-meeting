@@ -131,7 +131,7 @@ Request（Transcript Event Contract，PRD §15）：
 ### FINAL 语义（PRD §23-§24）
 
 ```
-Receive → Validate(status/meeting/seq) → Idempotency Check → Persist → Commit → (未来 SSE)
+Receive → Validate(status/meeting/seq) → Idempotency Check → Persist → Commit → SSE Broadcast
 ```
 
 - 幂等（Case A）：完全相同（event_id 一致且 text/speaker/timing 相同）→ `200`，不重复 INSERT。
@@ -139,7 +139,39 @@ Receive → Validate(status/meeting/seq) → Idempotency Check → Persist → C
 - 幂等兼容（Case C）：同 `(meeting_id, segment_seq)`、内容相同（不同 event_id）→ `200`；
   内容不同（不同 event_id）→ **409**。绝不产生两个正式 segment。
 - `UNIQUE(event_id)`（全局，PRD §16）；`UNIQUE(meeting_id, segment_seq)`。
-- 必须先持久化成功（Commit），未来才能广播 SSE（ADR D4）。
+- **Commit-before-publish（Step 5）**：必须先持久化成功（Commit）才广播 SSE
+  （ADR D4 / arch §8.3）。SSE 广播失败（无订阅者 / 队列满 / 断开）不回滚已提交事务。
+
+### GET /api/meetings/{meeting_id}/events — SSE Incremental Stream
+
+> 实时增量流（PRD §30/§31，arch §8.3）。Step 5。单 GET 连接，非 WebSocket。
+
+- 响应 `Content-Type: text/event-stream`；`Cache-Control: no-cache`、
+  `Connection: keep-alive`、`X-Accel-Buffering: no`。
+- Query 参数：`after_segment_seq`（int，默认 0）——恢复游标：重放 `segment_seq > 该值` 的
+  持久化 FINAL（catch-up）后再进入 live。
+- `after_segment_seq < 0` → **400**；Meeting 不存在 → **404**（优先于游标校验）。
+- **恢复模型**（gap-free）：调用方先 `GET /transcript` 拿 `max_segment_seq = N`，
+  再以 `after_segment_seq=N` 连接。connect 在 **per-meeting 锁内**先读持久化 FINAL
+  （catch-up）、后注册订阅——与 FINAL ingest 同锁互斥，故无丢失 / 无重复窗口。
+- **帧（envelope）**：`{sse_id?, event_type, meeting_id, emitted_at, payload}`；
+  每帧包含可选的 `id:`、`event:`、`data:` 行 + 空行。
+- **事件类型**（本 Step 产出）：`transcript.partial`、`transcript.final`、
+  `meeting.status`、`heartbeat`。`summary.*` 仅保留（后续 Step）。
+- **稳定 SSE id（Part 13）**：FINAL = `final:<meeting_id>:<segment_seq>`。
+- **PARTIAL 不重放**（Part 12）：只 live 推送，断线后不补。
+- `TRANSCRIPT_STREAM_END` **不广播**（PRD §30 未列出，契约不可扩展）。
+- `Last-Event-ID` header **未实现**（Part 14）：`after_segment_seq` 是唯一恢复游标。
+- 心跳：`settings.sse_heartbeat_interval`（默认 15s）。空闲连接周期性收到 `heartbeat`。
+- Broker 进程内（Part 20）：重启丢订阅者/队列，靠 Snapshot + catch-up 恢复；
+  multi-instance 后续演进（Redis / Kafka）。
+
+```text
+恢复示例（after_segment_seq=1，DB 已有 1,2,3）：
+  event: transcript.final  seq=2        ← catch-up（segment_seq ASC）
+  event: transcript.final  seq=3        ← catch-up
+  event: transcript.partial / final …   ← 之后全部为 live
+```
 
 ### POST /api/internal/meetings/{meeting_id}/stream-end
 
@@ -234,7 +266,6 @@ FINAL after Stream End（Part 8）：
 
 ## 4. 尚未实现（后续 Step）
 
-- `GET /api/meetings/{meeting_id}/events`（SSE）
 - `GET /api/meetings/{meeting_id}/summary`
 - `POST /api/meetings/{meeting_id}/summary/regenerate`
 - Transcript Freeze / FINALIZING → COMPLETED / Summary Pipeline / LLM

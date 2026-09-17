@@ -93,6 +93,30 @@ Agent / Multi-Agent / Memory / RAG / Discussion Node / Todo / Decision / 向量�
 - 当前为 single-process 方案；multi-worker / multi-instance / PostgreSQL 必须升级为
   数据库级并发控制（见 D8）。不得把进程内锁当作跨进程锁。
 
+### D12. SSE Broker + gap-free handoff + slow-consumer 策略（Step 5）
+
+**Broker 定位**：`EventBroker` 是**进程内**的增量通知通道（Broker ≠ durable event log）。
+`meeting_id → set[Subscriber]`，每个 Subscriber 一个有界 `asyncio.Queue`。
+重启丢订阅者 / 队列——恢复靠 **DB Snapshot + 持久化 FINAL catch-up**，不靠重放 broker。
+multi-instance / Redis / Kafka 为后续演进，不在本 Step 实现。
+
+**Commit-before-publish**：FINAL ingest 在 meeting 锁内 `persist → commit → publish`；
+SSE 广播失败（无订阅者 / 队列满 / 断开）**绝不回滚**已提交业务事务；Producer 线程
+只做 bounded `put_nowait`（经 `call_soon_threadsafe` 调度到订阅者事件循环），永不阻塞。
+
+**Gap-free handoff（connect 同锁原子）**：`GET /events?after_segment_seq=N` 的
+`connect()` 在 per-meeting 锁内：先读持久化 `seq > N`（catch-up）、后注册订阅者。
+FINAL ingest 与 connect 用同一把锁 → catch-up 查询与订阅注册之间不存在 FINAL 提交窗口，
+服务端 **Snapshot → Catch-up → Live handoff 不丢 FINAL、不因 connect race 双投**。
+注意：这**不是端到端 exactly-once**；网络断连 / 客户端游标推进不及时仍可能重放，
+Consumer 应以稳定 SSE id `final:<meeting_id>:<segment_seq>` 或 `segment_seq` 去重。
+
+**Slow-consumer 策略**：订阅者队列满（`sse_queue_maxsize`）→ 驱逐该订阅者
+（发 disconnect sentinel 使其退出，移除订阅），**绝不让 Producer / FINAL commit 阻塞**。
+
+**PARTIAL 不重放**：只 live 推送；断线不补（恢复靠 Snapshot + catch-up）。
+`TRANSCRIPT_STREAM_END` 不广播（PRD §30 未列出，契约不可扩展）。
+
 ## 后果
 
 - **正面**：跨团队契约可先于真实 ASR 稳定下来；前后端可并行开发；事实清晰可验收。

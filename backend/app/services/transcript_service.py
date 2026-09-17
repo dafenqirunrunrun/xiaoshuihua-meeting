@@ -25,6 +25,7 @@ from app.repositories import transcript_repository
 from app.schemas import transcript as transcript_schemas
 from app.services.live_utterance_cache import live_utterance_cache
 from app.services.lock_registry import meeting_lock
+from app.services import sse_service  # publish AFTER db.commit() only
 
 # Meeting statuses that are allowed to receive transcript events (arch §4).
 # IN_PROGRESS: normal receive. FINALIZING: ASR may still emit last few FINALs.
@@ -81,7 +82,13 @@ def handle_partial(
     meeting_id: str,
     event: transcript_schemas.TranscriptEvent,
 ) -> None:
-    """PARTIAL: upsert into live cache, never write the DB. PRD §22."""
+    """PARTIAL: upsert into live cache, never write the DB. PRD §22.
+
+    Publish `transcript.partial` to SSE subscribers. PARTIAL is not a fact
+    source (ADR D4/D10): the frame may be dropped if there is no subscriber,
+    and is never replayed. This is a cache-only operation — no DB commit to
+    wait on — so publishing from here is safe and non-blocking.
+    """
     live_utterance_cache.upsert(
         meeting_id,
         event.utterance_id,
@@ -90,6 +97,15 @@ def handle_partial(
         start_ms=event.start_ms,
         end_ms=event.end_ms,
         emitted_at=event.emitted_at,
+    )
+    # publish is non-blocking (bounded queue + evict-on-full); never gates ingest.
+    sse_service.publish_partial(
+        meeting_id,
+        utterance_id=event.utterance_id,
+        speaker_id=event.speaker_id,
+        text=event.text,
+        start_ms=event.start_ms,
+        end_ms=event.end_ms,
     )
 
 
@@ -169,8 +185,10 @@ def handle_final(
     # FINAL 已固化：删除对应 PARTIAL cache（PRD §23，Part 8）
     live_utterance_cache.delete(meeting_id, event.utterance_id)
 
-    # --- Future SSE broadcast point (ADR D4: publish AFTER commit) ---------
-    # next step: publish_final(meeting_id, segment)
+    # Commit-before-publish (ADR D4, Step 5 Part 4): insert_segment() above has
+    # already committed. Only now do we broadcast. If a subscriber is slow/full
+    # it is EVICTED (event_broker) — propagation never blocks this business path.
+    sse_service.publish_final(meeting_id, segment)
 
 
 def _ensure_identical(

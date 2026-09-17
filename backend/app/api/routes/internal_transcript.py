@@ -14,6 +14,7 @@ from sqlalchemy.orm import Session
 from app.db import get_db
 from app.schemas import transcript as transcript_schemas
 from app.services import stream_service, transcript_service
+from app.services.event_broker import event_broker
 
 router = APIRouter(tags=["internal"])
 
@@ -42,3 +43,13 @@ def ingest_stream_end(
         last_segment_seq=stream.last_segment_seq,
         transcript_complete=complete,
     )
+
+
+@router.get("/internal/debug/sse-subscribers")
+def sse_subscribers() -> dict:
+    """Debug/introspection: current SSE subscriber counts (not a prod contract).
+
+    Lets tests assert disconnect cleanup (Part 18) without reaching into the
+    broker. Aggregated counts only — no per-client identity is exposed.
+    """
+    return {"total_subscribers": event_broker.total_subscribers()}

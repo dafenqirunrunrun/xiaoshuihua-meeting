@@ -29,6 +29,10 @@ class Settings(BaseSettings):
     # SSE heartbeat interval (seconds)
     sse_heartbeat_interval: float = 15.0
 
+    # SSE per-subscriber bounded queue size (Step 5 Part 8): a subscriber whose
+    # queue is full is EVICTED, never blocks the Producer. Tests can lower this.
+    sse_queue_maxsize: int = 100
+
     # LLM call limits
     llm_timeout_seconds: float = 120.0
     llm_max_retries: int = 1

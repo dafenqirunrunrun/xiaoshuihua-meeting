@@ -23,6 +23,10 @@ from app.exceptions import (
 async def lifespan(_app: FastAPI):
     create_all()  # ensure tables exist (PRD §46)
     yield
+    # Close every SSE subscriber so generators end cleanly on shutdown.
+    from app.services.event_broker import event_broker
+
+    event_broker.disconnect_all()
 
 
 app = FastAPI(

@@ -30,6 +30,7 @@ from sqlalchemy.orm import Session
 from app import models
 from app.exceptions import InvalidMeetingStateTransition, MeetingNotFoundError
 from app.schemas import meeting as meeting_schemas
+from app.services import sse_service  # publish AFTER db.commit() only
 
 
 def _now() -> datetime:
@@ -101,6 +102,9 @@ def start_meeting(db: Session, meeting_id: str) -> models.Meeting:
             db.rollback()
             raise
         db.refresh(meeting)
+        # Commit-before-publish (Step 5 Part 6): only broadcast on the real
+        # transition (the idempotent branch above returned early). Non-blocking.
+        sse_service.publish_meeting_status(meeting)
         return meeting
 
 
@@ -130,4 +134,6 @@ def finish_meeting(db: Session, meeting_id: str) -> models.Meeting:
             db.rollback()
             raise
         db.refresh(meeting)
+        # Commit-before-publish (Step 5 Part 6). Real transition only.
+        sse_service.publish_meeting_status(meeting)
         return meeting

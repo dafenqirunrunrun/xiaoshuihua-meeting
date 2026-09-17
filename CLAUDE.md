@@ -51,7 +51,7 @@ existing implementation
 
 1. Transcript 是会议唯一事实源；Summary 是 AI 派生结果。
 2. PARTIAL 只做实时展示，不得写正式 `transcript_segment` 表。
-3. FINAL 是唯一可持久化的正式事实（先持久化成功，才能广播）。
+3. FINAL 是唯一可持久化的正式事实（先持久化成功，才能广播 SSE；SSE 广播失败不回滚已提交事务）。
 4. Meeting 状态机只有四态：CREATED → IN_PROGRESS → FINALIZING → COMPLETED。
    禁止新增 `FINALIZING_FAILED` / `FAILED`；Summary 失败用 `summary.status = FAILED` 表达。
 5. 结束会议必须进入 FINALIZING；必须等待最后 FINAL + `TRANSCRIPT_STREAM_END` +
@@ -65,6 +65,22 @@ existing implementation
 10. LLM 必须经过 Provider 层；API Key 不进前端；日志不输出密钥。
 
 完整清单见 `prd.md §61` 与 `docs/architecture.md`。
+
+## Step 进度
+
+- **Step 5 已完成**：Gap-free SSE Incremental Stream + Snapshot → SSE Recovery
+  （`GET /api/meetings/{meeting_id}/events`，StreamingResponse）。
+- SSE 正式不变式（见 `docs/architecture.md §8.3` 与 `ADR-001 D12`）：
+  - Commit-before-publish：FINAL = `Persist → Commit → Publish`；SSE 失败不回滚业务事务。
+  - Gap-free handoff：FINAL ingest 与 SSE `connect()` 共用同一 per-meeting lock；
+    connect 在锁内"先读 catch-up、后注册订阅" → Snapshot/Catch-up/Live handoff 不丢、
+    不因 connect race 双投。**非端到端 exactly-once**：Consumer 用
+    `final:<meeting_id>:<segment_seq>` 去重。
+  - PARTIAL 只 live 推送、不重放；`TRANSCRIPT_STREAM_END` 不广播（PRD §30 未列出）。
+  - EventBroker 进程内（非 durable log）；慢消费者队列满 → 驱逐，绝不阻塞 Producer。
+  - 心跳 `settings.sse_heartbeat_interval`；`after_segment_seq` 是唯一恢复游标
+    （`Last-Event-ID` 未实现）；`after_segment_seq < 0` → 400。
+- 测试：`backend/scripts/test_sse_step5.py` 21/21 PASS + 2 parser 单测。
 
 ## 常用命令
 
