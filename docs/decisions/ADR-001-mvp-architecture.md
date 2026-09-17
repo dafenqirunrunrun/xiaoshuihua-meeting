@@ -134,6 +134,39 @@ Consumer 应以稳定 SSE id `final:<meeting_id>:<segment_seq>` 或 `segment_seq
   再将 `meeting.status` 置为 `COMPLETED`。
   Summary 失败不新增 Meeting FAILED / FINALIZING_FAILED。
 
+### D14. LLM Provider 抽象 + Summary 生成管线（Step 7A）
+
+- **业务层不绑定具体 LLM**：`summary_service` 只依赖 `LLMProvider` 协议
+  （`app/services/llm/base.py`：`name` + `complete(prompt) -> str`）。
+  实现：`DeepSeekProvider`（env-only 配置，OpenAI 兼容 chat/completions，httpx 同步）与
+  `FakeProvider`（**默认测试基础设施**，离线确定性）。工厂 `LLMProviderFactory`
+  依据 `settings.llm_provider`（`fake` 默认 / `deepseek`）解析；未识别值回落 Fake，
+  绝不阻断启动。测试通过 `generate(..., provider=...)` 注入。
+- **未配置 Key 是 lazy 失败**：`DeepSeekProvider` 构造不触网，仅首次 `complete()`
+  抛 `SummaryGenerationError`（→ summary FAILED），绝不阻断 import / startup。
+- **只有冻结过的 Transcript 才能进 LLM**（D6/D13）：Start 门控 = meeting 存在 +
+  `status == FINALIZING` + `is_finalization_ready()`（ACCEPTED stream-end）。
+  输入只从**持久化 FINAL**（`list_sorted ASC`）读取，PARTIAL 永不进 prompt。
+- **不锁长事务**：生成分 Phase A（锁内短事务：门控 + 幂等 + upsert GENERATING）→
+  Phase B（**无锁、无事务**：读 FINAL ASC → build prompt → provider.complete →
+  `MeetingSummarySchema` Pydantic 校验，可 repair 重试）→ Phase C（锁内回写终态）。
+  LLM 调用期间不持任何 DB 锁 / 事务。单进程 MVP 用同一 per-meeting lock（D8）。
+- **有界重试**：结构化校验失败 → **repair prompt**（携带失败原文 + 具体校验错误，
+  重新喂同一 `<transcript>` 素材）→ 重试，至多 `summary_max_attempts`（默认 2）。
+  `summary_parse_repair=False` → 首次失败即 FAILED。Provider 级失败（超时/5xx/未配置）
+  不做 repair，直接 FAILED。
+- **无静默截断**：`MAX_TRANSCRIPT_CHARS` 硬上界；transcript 超限 → FAILED
+  （reason=transcript too large），绝不静默丢弃内容。
+- **幂等**：初始生成固定 `version=1`，`UNIQUE(meeting_id, version)`；
+  同 version 已终态（COMPLETED / FAILED）的重复 generate → **幂等 no-op，不覆盖**
+  （显式 regenerate + 新版本留给 Step 7B）。并发 double-generate 由 Phase C 同锁裁决：
+  后到者若发现已写终态 → 409，**不覆盖赢家**。
+- **失败不传导到 Meeting 状态机**：`summary.status = FAILED` + reason；Step 7A 中
+  Meeting **保持 FINALIZING**，任何结果都**不驱动 COMPLETED**
+  （`FINALIZING → COMPLETED` 是 Step 7B，当 summary 进入终态后触发，见 D13）。
+- **崩溃恢复**：Phase A 对遗留 `GENERATING` 行支持 resume（Phase C 回写终态），
+  不会留下孤儿 GENERATING 或重复终态行。
+
 ## 后果
 
 - **正面**：跨团队契约可先于真实 ASR 稳定下来；前后端可并行开发；事实清晰可验收。

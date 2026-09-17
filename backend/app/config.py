@@ -37,5 +37,18 @@ class Settings(BaseSettings):
     llm_timeout_seconds: float = 120.0
     llm_max_retries: int = 1
 
+    # Which provider the summary pipeline uses: "fake" (default, offline
+    # deterministic tests) or "deepseek" (env-only config, real internal LLM).
+    llm_provider: str = "fake"
+
+    # Summary pipeline (Step 7A)
+    # Structured-output (Pydantic) validation attempts per generation. Each
+    # attempt after the first is driven by a repair prompt that includes the
+    # offending raw output + the parse error, so a full retry is bounded.
+    summary_max_attempts: int = 2
+    # When true, a parse failure triggers a repair prompt (finite retries above);
+    # when false, the first Pydantic failure immediately marks FAILED.
+    summary_parse_repair: bool = True
+
 
 settings = Settings()

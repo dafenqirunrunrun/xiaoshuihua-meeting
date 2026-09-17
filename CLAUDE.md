@@ -96,6 +96,26 @@ existing implementation
     Pipeline 在 `summary.status` 终态（COMPLETED/FAILED）后驱动，不新增 Meeting FAILED。
 - 测试：`backend/scripts/test_finalize_step6.py` 21/21 PASS；
   Step 5 regression 21/21 PASS；parser 2/2 PASS。
+- **Step 7A 已完成**：LLMProvider + DeepSeekProvider + Summary Generation Pipeline（后端）。
+  - 业务层只依赖 `LLMProvider` 协议（`app/services/llm/base.py`）；`DeepSeekProvider`
+    env-only 配置、**未配置 key 是 lazy 失败**（仅首次 `complete()` 抛，不阻断启动）；
+    `FakeProvider` 为**默认测试基础设施**（离线确定性）；`LLMProviderFactory` 依据
+    `settings.llm_provider` 解析（`fake` 默认 / `deepseek`）。测试注入 `generate(..., provider=...)`。
+  - **只有 Freeze 过的 Transcript 能进 LLM**（D6/D13）：meeting 存在 + FINALIZING +
+    `is_finalization_ready()`；输入只从**持久化 FINAL**（`list_sorted ASC`），PARTIAL 永不进 prompt。
+  - **Phase A/B/C —— 不锁长事务**：A 锁内门控+幂等+upsert GENERATING → B **无锁无事务**
+    调 LLM（httpx 同步）+ `MeetingSummarySchema` Pydantic 校验（成功判据）→ C 锁内回写终态。
+  - **有界重试 + repair prompt**：`SUMMARY_MAX_ATTEMPTS`（默认 2）；校验失败→带失败原文
+    +具体错误的 repair prompt 重试；Provider 级失败（超时/5xx/未配置）不 repair 直接 FAILED。
+  - **无静默截断**：`MAX_TRANSCRIPT_CHARS` 硬上界，超限 → FAILED（reason=too large）。
+  - **幂等**：初始生成 `version=1`，`UNIQUE(meeting_id, version)`；同 version 已终态
+    （COMPLETED/FAILED）重复 generate → **no-op 不覆盖**；并发 double-generate Phase C 同锁裁决。
+  - **失败不传导**：仅 `summary.status = FAILED`；**Meeting 保持 FINALIZING**
+    （`FINALIZING → COMPLETED` 是 Step 7B，summary 终态后驱动）；崩溃遗留 GENERATING 行可 resume。
+  - 明确不做：无 HTTP 端点（GET /summary 等）、无 SSE `summary.*`、无 BackgroundTasks /
+    Celery / Redis / Kafka 队列、无真实 ASR。
+  - 测试：`backend/scripts/test_summary_step7a.py` 28/28 PASS；
+    Step 6 regression 21/21 PASS；Step 5 regression 21/21 PASS；parser 2/2 PASS。
 
 
 ## 常用命令

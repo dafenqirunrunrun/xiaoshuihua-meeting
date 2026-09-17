@@ -274,7 +274,76 @@ GET /events?after_segment_seq=N
 - 断开清理：`event_stream` 的 `finally` 必然 `unsubscribe`；app shutdown 时 `disconnect_all()`。
 - **慢消费者策略（adopted in ADR-001 D12）**：队列满 → 驱逐（断连 sentinel）而非阻塞 Producer
 
-## 9. 明确不做（后续版本）
+## 9. Summary Generation Pipeline（Step 7A 已实现）
+
+> 契约：Freeze 后（FINALIZING + `transcript_stream ACCEPTED`）才可调 LLM。
+> 本 Step 是 **service 层内部生成**（`summary_service.generate`）；无新增 HTTP 端点，
+> 无 SSE `summary.*`，Meeting 保持 FINALIZING（COMPLETED 交给 Step 7B，summary 终态后驱动）。
+
+### 9.1 LLM 边界（Provider 抽象，ADR D14）
+
+- 业务层（`summary_service`）只依赖 `LLMProvider` 协议（`app/services/llm/base.py`）：
+  `name: str` + `complete(prompt) -> str`。单原语；结构化校验是业务层（Pydantic）的事。
+- 三个 provider：
+  - `DeepSeekProvider`（`app/services/llm/deepseek.py`）：**env-only 配置**
+    （`deepseek_base_url / deepseek_api_key / deepseek_model`），OpenAI 兼容
+    `POST {base}/chat/completions`（`response_format={"type":"json_object"}`），httpx 同步。
+    未配置 key → **lazy**：只在首次 `complete()` 抛 `SummaryGenerationError`，不阻断 import / startup。
+    HTTP 超时 / 5xx / 结构异常 → `SummaryGenerationError`，不抛 500。
+  - `FakeProvider`（`app/services/llm/fake.py`）：**默认测试基础设施**，离线确定性
+    （scripted responses / error / repair 场景）。
+  - `LLMProviderFactory`（`app/services/llm/factory.py`）：`settings.llm_provider`
+    支持 `"fake"`（默认）与 `"deepseek"`；未识别值回落 Fake（绝不阻断启动）。
+- **测试注入**：`summary_service.generate(..., provider=...)` 直接注入，无需改业务代码。
+
+### 9.2 生成管线（Phase A / B / C，无锁调 LLM）
+
+```text
+Phase A [locking, 短事务]
+  meeting 存在 (404)  &  status == FINALIZING (409)  &  transcripts frozen (D13, 409)
+  &  同 version 已终态 (COMPLETED/FAILED) -> 幂等 no-op（PRD §44，终态不覆盖）
+  -> upsert 行 status=GENERATING（崩溃后可 resume）
+Phase B [NO lock, NO transaction —— LLM 调用全程无 DB 锁/事务]
+  session 内 list_sorted(FINAL ASC)  ->  build prompt（<transcript> 边界）
+  -> provider.complete()  <=>  parse_and_validate()（Pydantic）
+Phase C [locking, 回写]
+  重新取锁：并发已写终态 -> 409（不覆盖赢家）
+  success -> status=COMPLETED + raw_model_output + model_name + version=1
+  failure -> status=FAILED + reason（meeting 仍 FINALIZING）
+```
+
+- **不锁长事务**：A/B/C 三阶段，Phase B 不持任何 meeting 锁、不持任何 DB 事务。
+  输入只从**持久化 FINAL**（`list_sorted ASC`）读取；PARTIAL 永不进 prompt。
+- **无静默截断**：`MAX_TRANSCRIPT_CHARS`（默认 90_000 字符）硬上界——
+  transcript 超限 → FAILED（reason=transcript too large），**绝不静默丢弃**。
+- **有界重试**：`settings.summary_max_attempts`（默认 2）。结构化校验失败 →
+  **repair prompt**（携带失败原文 + 具体 Pydantic 错误，重新喂同一 `<transcript>`
+  素材）→ 重试（最多 attempts 次）。`summary_parse_repair=False` → 首次失败即 FAILED。
+- **幂等 / 版本**：初始生成固定 `version=1`；`UNIQUE(meeting_id, version)`；
+  同 version 已 COMPLETED / FAILED 的重复 generate → 幂等 no-op，**不覆盖**。
+  显式重新生成（regenerate+新版本）在 Step 7B。
+- **失败表达**：仅 `summary.status = FAILED` + reason；Meeting **保持 FINALIZING**
+  （Step 7A 绝不驱动 COMPLETED）。`GENERATING` 中间态若进程崩溃 → resume 路径（Phase A）。
+- **并发**：Phase A/C 用与 FINAL ingest / STREAM_END **同一把 per-meeting lock**
+  （`lock_registry.meeting_lock`）；Phase B 完全锁外。单进程 MVP 有效（ADR D8）。
+
+### 9.3 结构化输出（schemas/summary.py）
+
+- `MeetingSummarySchema`（PRD §43）：`overview: str`、`key_topics / conclusions /
+  open_questions: list[str]`，**Pydantic 校验即成功判据**。
+- `raw_model_output` 存 LLM 原始文本（不回写覆盖）；`model_name` 存 provider 名。
+- `json.dumps(items, ensure_ascii=False)` 入库（模型 `dumps()` helper）→ 中文无损。
+
+### 9.4 明确不做（本 Step）
+
+```text
+无 HTTP 端点（GET /summary 等）      无 SSE summary.*
+无 FINALIZING → COMPLETED            无 regenerate / 新版本
+无 BackgroundTasks / Celery / Redis / Kafka 队列
+无真实 ASR 接入
+```
+
+## 10. 明确不做（后续版本）
 
 ```text
 Agent / Multi-Agent / Memory / RAG / Discussion Node / Todo / Decision

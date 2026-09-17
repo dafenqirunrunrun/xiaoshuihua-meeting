@@ -274,3 +274,9 @@ FINAL after Stream End（Part 8）：
 
 > Step 6 已完成：Transcript Freeze（durable 边界）+ Finalization Readiness
 > （service 层派生，无公开 API）—— 见 `architecture.md §7.0/§7.3` 与 `ADR-001 D13`。
+
+> Step 7A 已完成：LLMProvider + DeepSeekProvider + Summary Generation Pipeline
+> （`summary_service.generate`：Freeze → LLM → Schema 校验 → Summary 持久化）。
+> 均为 **service 层内部生成**，**无新增 HTTP 端点**、无 SSE `summary.*`、
+> Meeting 保持 FINALIZING —— 见 `architecture.md §9` 与 `ADR-001 D14`。
+> 前端读取（GET /summary）与重新生成（POST regenerate）留待 Step 7B。
