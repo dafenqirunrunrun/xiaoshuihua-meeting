@@ -60,6 +60,13 @@ def handle_event(
     so they are atomic w.r.t. the STREAM_END integrity check for the same
     meeting (Step 4 §9). PARTIAL has no DB side effects but we still serialize
     for determinism of the FINAL/STREAM_END boundary.
+
+    Dual-dimension ingest gate (Step 6, constraint 2):
+      - meeting.status       controls the MEETING lifecycle stage
+        (IN_PROGRESS / FINALIZING accept; CREATED / COMPLETED -> 409)
+      - persisted stream-end controls whether the TRANSCRIPT is frozen
+        (accepted ACCEPTED row = durable freeze boundary; see below)
+    The two responsibilities are distinct — not redundant state.
     """
     # --- Path/payload meeting_id consistency (PRD §49.1, arch §3) ---------
     if event.meeting_id != path_meeting_id:
@@ -72,9 +79,34 @@ def handle_event(
         _require_meeting_accepting(db, path_meeting_id)
 
         if event.status == "PARTIAL":
+            # Freeze hard gate FIRST: once the transcript is frozen, no PARTIAL
+            # may even touch the live cache (constraint 3).
+            _ensure_transcript_not_frozen(db, path_meeting_id)
             handle_partial(db, path_meeting_id, event)
         else:  # FINAL
             handle_final(db, path_meeting_id, event)
+
+
+def _transcript_frozen(db: Session, meeting_id: str) -> bool:
+    """True iff a durable ACCEPTED stream-end exists (freeze boundary)."""
+    from app.services.stream_service import stream_has_ended
+
+    return stream_has_ended(meeting_id)
+
+
+def _ensure_transcript_not_frozen(db: Session, meeting_id: str) -> None:
+    """Reject any NEW event once the transcript is frozen.
+
+    NOTE: this is deliberately NOT applied to existing FINAL retries. A
+    canonical existing FINAL concurrently retried while frozen must still get
+    200 (constraint 4) — handled in handle_final via existing-by-event/seq.
+    """
+    if _transcript_frozen(db, meeting_id):
+        raise TranscriptConflictError(
+            meeting_id,
+            "",
+            message=f"transcript frozen for meeting {meeting_id}, cannot accept new transcript events",
+        )
 
 
 def handle_partial(

@@ -46,6 +46,18 @@ class _PartialCache:
         with self._lock:
             self._store.pop(self._key(meeting_id, utterance_id), None)
 
+    def clear_meeting(self, meeting_id: str) -> None:
+        """Drop every PARTIAL entry for one meeting (Step 6 freeze cleanup).
+
+        Called ONLY after the durable freeze boundary (accepted transcript_stream
+        row) has committed successfully. If freeze fails (integrity 409) this is
+        NOT called, so residual PARTIAL survives for the retry path.
+        """
+        prefix = f"{meeting_id}:"
+        with self._lock:
+            for key in [k for k in self._store if k.startswith(prefix)]:
+                self._store.pop(key, None)
+
     def size(self) -> int:
         with self._lock:
             return len(self._store)

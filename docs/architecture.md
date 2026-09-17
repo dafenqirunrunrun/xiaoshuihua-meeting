@@ -139,7 +139,48 @@ Receive incremental events
 - **禁止** `sleep(3)` 等固定等待猜测 ASR 已结束。
 - Freeze 后不允许 silent append；COMPLETED 后收到 Transcript → 409。
 
-### 7.1 STREAM_END 持久化（Step 4）
+### 7.0 Transcript Freeze = durable 边界（Step 6 已实现）
+
+**freeze 边界即 `transcript_stream` 中被 ACCEPTED 的行**：
+
+```text
+receive STREAM_END
+ ↓ validate meeting / status / event_type / meeting_id
+ ↓ integrity check（gaps / overrun）
+ ↓ persist transcript_stream（status=ACCEPTED, last_segment_seq）  ← durable freeze boundary
+ ↓ commit success
+ ↓ clear 该 meeting 的 transient PARTIAL cache
+```
+
+- **不新增** `frozen` / `finalization_ready` / `FROZEN` 字段或状态；`ACCEPTED` 不重命名。
+  未做 schema change（ADR D1/D12 精神：不扩四态、不引入冗余状态）。
+- **双维度 ingest 门控（Step 6）**：
+  - `meeting.status` 控制 **Meeting 生命周期阶段**（CREATED/COMPLETED → 409）；
+  - `transcript_stream ACCEPTED` 控制 **Transcript 是否已冻结** —— 职责分离、非重复状态。
+- **Freeze 后 PARTIAL → 409**（在进入 `live_utterance_cache` 之前检查，且不得修改 cache）。
+- **Freeze 后新 FINAL → 409**；**Freeze 后 canonical existing FINAL retry → 200 幂等**
+  （先按 event_id / segment_seq 命中已有行做 canonical 比较，仅对"新 FINAL"拒绝）。
+- **PARTIAL cache 清理时序**：只在 freeze **commit 成功之后** `clear_meeting`；
+  完整性检查失败（gap / overrun → 409）**不得**清理 cache（Transcript 尚未冻结，
+  residual PARTIAL 需保留给重试路径）。cache 清理只是**临时状态清理**，
+  不是 freeze 的 Source of Truth（freeze 的 Source of Truth 是 `transcript_stream` 行）。
+
+### 7.1 Finalization Readiness（Step 6，派生状态，不新增持久化字段）
+
+- `stream_service.get_finalization_readiness(db, meeting_id)`（及 `is_finalization_ready` 布尔形式）
+  为未来 Step 7 Finalizer 提供领域门控。
+- Ready 条件（全部可从 DB 派生）：
+  - meeting 存在；
+  - `meeting.status == FINALIZING`；
+  - `transcript_stream` 存在 ACCEPTED 行；
+  - `last_segment_seq` 已持久化。
+- 因为 ACCEPTED 行已隐含完整性检查通过，readiness 不做重复全量 gap scan。
+- **不新增公开 API**（如 `GET /finalization-ready`）；Step 6 只在 service 层提供。
+- **Meeting 状态保持 FINALIZING**：即便 STREAM_END accepted / Transcript frozen /
+  finalization_ready=true，也**绝不在 Step 6 变 COMPLETED**（COMPLETED 由 Step 7
+  Summary Pipeline 完成后驱动）。
+
+### 7.2 STREAM_END 持久化（Step 4）
 
 - STREAM_END 不能只存内存：重启会遗忘。落盘到 `transcript_stream` 表
   （`meeting_id PK, last_segment_seq, status, received_at`）。
@@ -149,7 +190,7 @@ Receive incremental events
 - 完整性：FINAL seq 必须恰为 `1..last_segment_seq`；显式缺口 → 409 `missing=[...]`；
   `max(seq) > last` → 409（overrun，不得静默忽略）。
 
-### 7.2 FINAL 与 STREAM_END 共享同步边界（Step 4）
+### 7.3 FINAL 与 STREAM_END 共享同步边界（Step 4）
 
 ```text
 FINAL ingest  +  STREAM_END integrity check

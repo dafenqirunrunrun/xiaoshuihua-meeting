@@ -116,6 +116,23 @@ Consumer 应以稳定 SSE id `final:<meeting_id>:<segment_seq>` 或 `segment_seq
 
 **PARTIAL 不重放**：只 live 推送；断线不补（恢复靠 Snapshot + catch-up）。
 `TRANSCRIPT_STREAM_END` 不广播（PRD §30 未列出，契约不可扩展）。
+### D13. Transcript Freeze = durable 边界 + 派生 readiness（Step 6）
+
+- Freeze 边界复用 `transcript_stream` ACCEPTED 行（`status=ACCEPTED` + `last_segment_seq`），
+  不新增 `frozen` / `finalization_ready` / `FROZEN` 字段或状态，不改名 `ACCEPTED`。
+- 双维度 ingest 门控：`meeting.status` 管 Meeting 生命周期，
+  `transcript_stream ACCEPTED` 管 Transcript 是否冻结。
+- Freeze 后 PARTIAL → 409，且不得修改 cache。
+- Freeze 后新 FINAL → 409；canonical existing FINAL retry → 200。
+- cache 只在 freeze commit 成功后 `clear_meeting`；完整性检查失败不得清理。
+- Finalization Readiness 为派生状态，已实现：
+  `stream_service.get_finalization_readiness`
+  `stream_service.is_finalization_ready`
+  从 DB 推导，不新增持久化字段或公开 API。
+- Step 6 完成后 Meeting 仍为 FINALIZING。
+  Step 7 Summary Pipeline 中，当 `summary.status` 进入终态 `COMPLETED` 或 `FAILED` 后，
+  再将 `meeting.status` 置为 `COMPLETED`。
+  Summary 失败不新增 Meeting FAILED / FINALIZING_FAILED。
 
 ## 后果
 

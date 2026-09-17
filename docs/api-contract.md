@@ -268,5 +268,9 @@ FINAL after Stream End（Part 8）：
 
 - `GET /api/meetings/{meeting_id}/summary`
 - `POST /api/meetings/{meeting_id}/summary/regenerate`
-- Transcript Freeze / FINALIZING → COMPLETED / Summary Pipeline / LLM
+- Summary Pipeline / LLM / FINALIZING → COMPLETED（Step 7：`summary.status` 进入终态
+  COMPLETED 或 FAILED 后驱动 `meeting.status = COMPLETED`）
 - Mock Producer 的 `--phase` 分阶段能力（当前单次全流）
+
+> Step 6 已完成：Transcript Freeze（durable 边界）+ Finalization Readiness
+> （service 层派生，无公开 API）—— 见 `architecture.md §7.0/§7.3` 与 `ADR-001 D13`。

@@ -81,6 +81,22 @@ existing implementation
   - 心跳 `settings.sse_heartbeat_interval`；`after_segment_seq` 是唯一恢复游标
     （`Last-Event-ID` 未实现）；`after_segment_seq < 0` → 400。
 - 测试：`backend/scripts/test_sse_step5.py` 21/21 PASS + 2 parser 单测。
+- **Step 6 已完成**：Transcript Freeze + Finalization Readiness（后端）。
+  - freeze = persisted `transcript_stream` ACCEPTED 行（`status=ACCEPTED` +
+    `last_segment_seq`）作为 durable freeze boundary；**no schema change**，
+    不新增 `frozen` / `finalization_ready` / `FROZEN` 字段，`ACCEPTED` 不改名。
+  - 双维度 ingest 门控：`meeting.status` 管生命周期；（freeze 后）
+    **PARTIAL after freeze → 409**（进 cache 前）；**new FINAL after freeze → 409**；
+    **canonical FINAL retry → 200**。
+  - **clear cache only after freeze commit**（`clear_meeting`）；完整性检查失败
+    （gap/overrun 409）不得清理。
+  - **readiness 从 DB 派生**（service 层）：`stream_service.get_finalization_readiness`
+    / `stream_service.is_finalization_ready`，不新增持久化字段 / 公开 API。
+  - **meeting remains FINALIZING**；`FINALIZING → COMPLETED` 由 Step 7 Summary
+    Pipeline 在 `summary.status` 终态（COMPLETED/FAILED）后驱动，不新增 Meeting FAILED。
+- 测试：`backend/scripts/test_finalize_step6.py` 21/21 PASS；
+  Step 5 regression 21/21 PASS；parser 2/2 PASS。
+
 
 ## 常用命令
 
