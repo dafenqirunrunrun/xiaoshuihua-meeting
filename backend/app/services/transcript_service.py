@@ -1,0 +1,191 @@
+"""Transcript ingress service.
+
+Business rules (PRD §15-§24, ADR D4/D5, architecture §5):
+  - Meeting must exist (404 via MeetingNotFoundError)
+  - payload.meeting_id must equal path meeting_id (400, no silent override)
+  - Meeting status must be IN_PROGRESS or FINALIZING to accept events (409 otherwise)
+  - PARTIAL -> live_utterance_cache only (never the DB)
+  - FINAL -> idempotency check -> persist -> commit ->
+             then (future) SSE broadcast. Persist BEFORE broadcast.
+
+This layer raises domain exceptions only; it never imports FastAPI.
+"""
+
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import Session
+
+from app import models
+from app.exceptions import (
+    InvalidMeetingStateTransition,
+    MeetingNotFoundError,
+    TranscriptConflictError,
+    TranscriptValidationError,
+)
+from app.repositories import transcript_repository
+from app.schemas import transcript as transcript_schemas
+from app.services.live_utterance_cache import live_utterance_cache
+
+# Meeting statuses that are allowed to receive transcript events (arch §4).
+# IN_PROGRESS: normal receive. FINALIZING: ASR may still emit last few FINALs.
+ACCEPTING_STATUSES = frozenset({"IN_PROGRESS", "FINALIZING"})
+
+
+def _canonical(seg: models.TranscriptSegment) -> tuple[str, str, int | None, int | None]:
+    """Canonical content for idempotency comparison (ADR D5)."""
+    return (seg.text, seg.speaker_id, seg.start_ms, seg.end_ms)
+
+
+def _require_meeting_accepting(db: Session, meeting_id: str) -> models.Meeting:
+    meeting = db.get(models.Meeting, meeting_id)
+    if meeting is None:
+        raise MeetingNotFoundError(meeting_id)
+    if meeting.status not in ACCEPTING_STATUSES:
+        raise InvalidMeetingStateTransition(
+            f"meeting {meeting_id} status {meeting.status} cannot accept transcript "
+            f"(only {sorted(ACCEPTING_STATUSES)})"
+        )
+    return meeting
+
+
+def handle_event(
+    db: Session,
+    path_meeting_id: str,
+    event: transcript_schemas.TranscriptEvent,
+) -> None:
+    """Validate, gate, and apply a single transcript event."""
+
+    # --- Path/payload meeting_id consistency (PRD §49.1, arch §3) ---------
+    if event.meeting_id != path_meeting_id:
+        raise TranscriptValidationError(
+            f"path meeting_id {path_meeting_id} != payload meeting_id {event.meeting_id}"
+        )
+
+    # --- Meeting existence + accepting state -------------------------------
+    _require_meeting_accepting(db, path_meeting_id)
+
+    if event.status == "PARTIAL":
+        handle_partial(db, path_meeting_id, event)
+    else:  # FINAL
+        handle_final(db, path_meeting_id, event)
+
+
+def handle_partial(
+    db: Session,
+    meeting_id: str,
+    event: transcript_schemas.TranscriptEvent,
+) -> None:
+    """PARTIAL: upsert into live cache, never write the DB. PRD §22."""
+    live_utterance_cache.upsert(
+        meeting_id,
+        event.utterance_id,
+        text=event.text,
+        speaker_id=event.speaker_id,
+        start_ms=event.start_ms,
+        end_ms=event.end_ms,
+        emitted_at=event.emitted_at,
+    )
+
+
+def handle_final(
+    db: Session,
+    meeting_id: str,
+    event: transcript_schemas.TranscriptEvent,
+) -> None:
+    """FINAL: idempotency -> persist -> commit -> (future) broadcast. PRD §23, ADR D5."""
+    if event.segment_seq is None:
+        raise TranscriptValidationError(
+            f"FINAL event {event.event_id} missing segment_seq"
+        )
+
+    existing_by_event = transcript_repository.get_by_event_id(db, meeting_id, event.event_id)
+
+    # Case A: same event_id already persisted.
+    if existing_by_event is not None:
+        _ensure_identical(existing_by_event, event, event_id_conflict=True)
+        return  # idempotent retry, no re-INSERT (PRD §24 / Case A)
+
+    # Case C: same (meeting_id, segment_seq) already persisted (different event_id).
+    existing_by_seq = transcript_repository.get_by_seq(db, meeting_id, event.segment_seq)
+    if existing_by_seq is not None:
+        _ensure_identical(existing_by_seq, event, event_id_conflict=False)
+        return  # same seq + same canonical content -> idempotent
+
+    # New FINAL: create + persist + commit. Broadcast hook point below.
+    segment = models.TranscriptSegment(
+        meeting_id=meeting_id,
+        segment_seq=event.segment_seq,
+        utterance_id=event.utterance_id,
+        event_id=event.event_id,
+        speaker_id=event.speaker_id,
+        start_ms=event.start_ms,
+        end_ms=event.end_ms,
+        text=event.text,
+    )
+    try:
+        transcript_repository.insert_segment(db, segment)
+    except IntegrityError:
+        # event_id is globally unique (PRD §16). If the idempotency check above
+        # missed it (e.g. committed concurrently / cross-meeting collision),
+        # surface as a clean 409 rather than a 500.
+        db.rollback()
+        raise TranscriptConflictError(
+            meeting_id,
+            event.event_id,
+            message=(
+                f"transcript event_id already exists (global uniqueness, PRD §16): "
+                f"{event.event_id}"
+            ),
+        )
+
+    # FINAL 已固化：删除对应 PARTIAL cache（PRD §23，Part 8）
+    live_utterance_cache.delete(meeting_id, event.utterance_id)
+
+    # --- Future SSE broadcast point (ADR D4: publish AFTER commit) ---------
+    # next step: publish_final(meeting_id, segment)
+
+
+def _ensure_identical(
+    existing: models.TranscriptSegment,
+    event: transcript_schemas.TranscriptEvent,
+    *,
+    event_id_conflict: bool,
+) -> None:
+    """Enforce idempotency vs conflict. PRD §24 (Case A/B/C).
+
+    identical canonical content -> idempotent (ok)
+    different content -> TranscriptConflictError (no silent overwrite)
+    """
+    existing_tuple = _canonical(existing)
+    incoming_tuple = _canonical(
+        models.TranscriptSegment(  # lightweight stand-in for comparison
+            text=event.text,
+            speaker_id=event.speaker_id,
+            start_ms=event.start_ms,
+            end_ms=event.end_ms,
+            meeting_id=event.meeting_id,
+            segment_seq=event.segment_seq if event.segment_seq is not None else -1,
+            utterance_id=event.utterance_id,
+            event_id=event.event_id,
+        )
+    )
+    if existing_tuple != incoming_tuple:
+        kind = "event_id" if event_id_conflict else "(meeting_id, segment_seq)"
+        raise TranscriptConflictError(
+            existing.meeting_id,
+            event.event_id,
+            message=(
+                f"transcript conflict on {kind}: existing text={existing.text!r} "
+                f"but incoming text={event.text!r}"
+            ),
+        )
+
+
+def get_snapshot(
+    db: Session, meeting_id: str
+) -> tuple[models.Meeting, list[models.TranscriptSegment]]:
+    """Snapshot: meeting (existence + status) + FINAL segments sorted by seq."""
+    meeting = db.get(models.Meeting, meeting_id)
+    if meeting is None:
+        raise MeetingNotFoundError(meeting_id)
+    segments = transcript_repository.list_sorted(db, meeting_id)
+    return meeting, segments

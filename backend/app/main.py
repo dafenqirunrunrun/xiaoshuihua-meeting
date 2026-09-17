@@ -8,10 +8,15 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
-from app.api.routes import health, meetings
+from app.api.routes import health, internal_transcript, meetings
 from app.config import settings
 from app.db import create_all
-from app.exceptions import InvalidMeetingStateTransition, MeetingNotFoundError
+from app.exceptions import (
+    InvalidMeetingStateTransition,
+    MeetingNotFoundError,
+    TranscriptConflictError,
+    TranscriptValidationError,
+)
 
 
 @asynccontextmanager
@@ -38,5 +43,16 @@ async def _invalid_transition_handler(_request: Request, exc: InvalidMeetingStat
     return JSONResponse(status_code=409, content={"detail": str(exc)})
 
 
+@app.exception_handler(TranscriptValidationError)
+async def _transcript_validation_handler(_request: Request, exc: TranscriptValidationError) -> JSONResponse:
+    return JSONResponse(status_code=400, content={"detail": str(exc)})
+
+
+@app.exception_handler(TranscriptConflictError)
+async def _transcript_conflict_handler(_request: Request, exc: TranscriptConflictError) -> JSONResponse:
+    return JSONResponse(status_code=409, content={"detail": str(exc)})
+
+
 app.include_router(health.router, prefix="/api")
 app.include_router(meetings.router, prefix="/api")
+app.include_router(internal_transcript.router, prefix="/api")

@@ -9,7 +9,7 @@ import json
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import BigInteger, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint, func
+from sqlalchemy import DateTime, ForeignKey, Integer, String, Text, UniqueConstraint, func
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db import Base
@@ -19,7 +19,8 @@ class MeetingSummary(Base):
     __tablename__ = "meeting_summary"
     __table_args__ = (UniqueConstraint("meeting_id", "version", name="uq_summary_meeting_version"),)
 
-    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    # NOTE: plain Integer PK for SQLite autoincrement (BigInteger does not auto-gen on SQLite).
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     meeting_id: Mapped[str] = mapped_column(
         String(64), ForeignKey("meeting.id", ondelete="CASCADE"), nullable=False, index=True
     )

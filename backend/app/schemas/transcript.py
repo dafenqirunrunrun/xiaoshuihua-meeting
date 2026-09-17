@@ -45,3 +45,10 @@ class TranscriptSegmentOut(BaseModel):
     text: str
     start_ms: int | None = None
     end_ms: int | None = None
+
+
+class TranscriptSnapshot(BaseModel):
+    """GET /transcript response: FINAL segments only, ordered by segment_seq. PRD §32/§39, arch §6."""
+
+    meeting_id: str
+    segments: list[TranscriptSegmentOut]

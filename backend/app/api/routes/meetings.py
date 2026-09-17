@@ -18,7 +18,8 @@ from sqlalchemy.orm import Session
 
 from app.db import get_db
 from app.schemas import meeting as meeting_schemas
-from app.services import meeting_service
+from app.schemas import transcript as transcript_schemas
+from app.services import meeting_service, transcript_service
 
 router = APIRouter(prefix="/meetings", tags=["meetings"])
 
@@ -43,3 +44,13 @@ def start_meeting(meeting_id: str, db: Session = Depends(get_db)):
 def finish_meeting(meeting_id: str, db: Session = Depends(get_db)):
     """IN_PROGRESS → FINALIZING. Idempotent; 409 if still CREATED."""
     return meeting_service.finish_meeting(db, meeting_id)
+
+
+@router.get("/{meeting_id}/transcript", response_model=transcript_schemas.TranscriptSnapshot)
+def get_transcript(meeting_id: str, db: Session = Depends(get_db)):
+    """FINAL Transcript snapshot, ordered by segment_seq ASC (arch §6, PRD §32)."""
+    meeting, segments = transcript_service.get_snapshot(db, meeting_id)
+    return transcript_schemas.TranscriptSnapshot(
+        meeting_id=meeting.id,
+        segments=list(segments),
+    )
