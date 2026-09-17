@@ -27,17 +27,24 @@ from typing import Any, Literal
 
 from pydantic import BaseModel
 
-# Event types actually produced by this step.
+# Event types produced by this step.
 SSE_EVENT_TYPES = Literal[
     "transcript.partial",
     "transcript.final",
     "meeting.status",
+    "summary.started",
+    "summary.completed",
+    "summary.failed",
     "heartbeat",
 ]
 
 # Stable SSE `id:` prefix for a persited FINAL (Part 13):
 #   final:<meeting_id>:<segment_seq>
 FINAL_ID_PREFIX = "final:"
+
+# Stable SSE `id:` prefix for a summary lifecycle event (Step 7B §14):
+#   summary:<meeting_id>:<version>:started|completed|failed
+SUMMARY_ID_PREFIX = "summary:"
 
 
 class SSEEventEnvelope(BaseModel):

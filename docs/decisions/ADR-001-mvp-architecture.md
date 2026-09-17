@@ -140,8 +140,10 @@ Consumer 应以稳定 SSE id `final:<meeting_id>:<segment_seq>` 或 `segment_seq
   （`app/services/llm/base.py`：`name` + `complete(prompt) -> str`）。
   实现：`DeepSeekProvider`（env-only 配置，OpenAI 兼容 chat/completions，httpx 同步）与
   `FakeProvider`（**默认测试基础设施**，离线确定性）。工厂 `LLMProviderFactory`
-  依据 `settings.llm_provider`（`fake` 默认 / `deepseek`）解析；未识别值回落 Fake，
-  绝不阻断启动。测试通过 `generate(..., provider=...)` 注入。
+  依据 `settings.llm_provider`（`fake` 默认 / `deepseek`）解析。
+  **Step 7B 修订（§1/§24，见 D15）**：任何其它值 → `LLMConfigurationError`
+  （fail-closed），**绝不回落 FakeProvider**——生产误配必须大声失败，
+  不得静默生成假纪要。测试通过 `generate(..., provider=...)` 注入。
 - **未配置 Key 是 lazy 失败**：`DeepSeekProvider` 构造不触网，仅首次 `complete()`
   抛 `SummaryGenerationError`（→ summary FAILED），绝不阻断 import / startup。
 - **只有冻结过的 Transcript 才能进 LLM**（D6/D13）：Start 门控 = meeting 存在 +
@@ -166,6 +168,49 @@ Consumer 应以稳定 SSE id `final:<meeting_id>:<segment_seq>` 或 `segment_seq
   （`FINALIZING → COMPLETED` 是 Step 7B，当 summary 进入终态后触发，见 D13）。
 - **崩溃恢复**：Phase A 对遗留 `GENERATING` 行支持 resume（Phase C 回写终态），
   不会留下孤儿 GENERATING 或重复终态行。
+
+### D15. Finalizer + Summary 生命周期 + Meeting Completion（Step 7B）
+
+链路：`首个 accepted STREAM_END → 初始 Summary 生成 → Summary 终态
+（COMPLETED / FAILED）→ Meeting FINALIZING → COMPLETED → summary.completed|failed
+SSE → meeting.status SSE`。
+
+- **触发 = 首个 accepted STREAM_END**（`newly_accepted=True`）：BackgroundTasks
+  调 `run_finalizer_background`（**进程内 MVP 触发，≠ durable job queue**；durable
+  事实都在 DB，可由重跑 Finalizer 恢复，**不做启动期全库扫描**）。
+  相同 STREAM_END retry → `newly_accepted=False`，**绝不重跑 LLM / 重付模型成本**。
+- **Finalizer 幂等**：meeting COMPLETED → 早退；summary v1 已终态 → `generate()`
+  no-op（**零 LLM 调用**）；`complete_after_summary` 幂等。
+- **崩溃缺口可恢复**：`summary 终态 + meeting FINALIZING` 是合法可恢复状态
+  （Step 7A Phase C 先提交 summary）；Finalizer 重跑只补 Meeting 状态。
+- **Summary 终态驱动 Meeting COMPLETED**：COMPLETED **和 FAILED 都**驱动
+  FINALIZING → COMPLETED；**绝不新增 Meeting FAILED / FINALIZING_FAILED**（D1）。
+  Meeting COMPLETED 只在 Summary 终态**之后**（绝不 GENERATING 期间 / STREAM_END 后立即）。
+- **`complete_after_summary` 是唯一完成路径**（meeting_service）：
+  FINALIZING → COMPLETED 合法，COMPLETED → COMPLETED 幂等，CREATED / IN_PROGRESS
+  非法（409）。路由层永不直接写 `meeting.status = "COMPLETED"`。
+- **GET /summary = durable 恢复快照**（最新版本，GENERATING/COMPLETED/FAILED 均 200；
+  meeting 缺失 404 / 无 summary 404）。前端重连模型 = GET Meeting + GET Summary +
+  Transcript Snapshot + SSE。
+- **Summary SSE 非 durable、不回放**：事件只在内存 EventBroker（D12）；
+  重连取 GET /summary。payload 仅 `{version, status}`——**绝不含** raw_model_output /
+  provider 堆栈 / API key / prompt。commit-before-publish（SSE 失败不回滚 DB）。
+  顺序不变式：`summary.started → summary.completed|failed → meeting.status(COMPLETED)`。
+- **regenerate append-only 版本**：`POST /summary/regenerate` → 202
+  `{version: vN+1, status: GENERATING}`，同步分配 GENERATING 行 + `summary.started`，
+  BackgroundTasks 后台跑 Phase B/C（自己的 session）。latest GENERATING → 409；
+  版本永不覆盖（v1→v2→v3）。**regenerate 永不把 Meeting 移出 COMPLETED**（§19）。
+  regenerate 输入仍只用持久化 FINAL ASC（`stream_service.is_frozen` 状态无关门控，
+  D6 在 COMPLETED 会议同样成立）。
+- **BackgroundTasks session 生命周期**：后台任务**自有** `SessionLocal()`，
+  绝不复用请求 session（请求 session 在响应后关闭）；异常仅记录，
+  durable 事实可经重跑 Finalizer / regenerate 恢复。
+- **provider 门控 fail-closed**：`LLMProviderFactory` 对未知 `LLM_PROVIDER` 抛
+  `LLMConfigurationError`（D14 修订）；生成管线把它当 provider 级失败 → summary
+  FAILED（**绝不静默生成 fake 纪要**）。
+- **canonical FINAL retry 跨 COMPLETED 边界仍 200**（幂等重发 ≠ append；
+  新 FINAL / PARTIAL 在 COMPLETED 仍 409）——与 STREAM_END retry 对 COMPLETED
+  放行一致（见 `transcript_service.handle_event` 的 `_existing_final` 短路）。
 
 ## 后果
 

@@ -137,3 +137,44 @@ def finish_meeting(db: Session, meeting_id: str) -> models.Meeting:
         # Commit-before-publish (Step 5 Part 6). Real transition only.
         sse_service.publish_meeting_status(meeting)
         return meeting
+
+
+def complete_after_summary(db: Session, meeting_id: str) -> models.Meeting:
+    """FINALIZING → COMPLETED — THE ONLY Meeting-completion path (Step 7B §8).
+
+    Called exclusively by the Finalizer AFTER the Summary has reached a
+    terminal state (COMPLETED or FAILED). It is idempotent: an already
+    COMPLETED meeting returns unchanged (no state regression, no re-touch of
+    completed_at). CREATED / IN_PROGRESS are illegal transitions (409) — a
+    meeting cannot be completed before its transcript is frozen + summary
+    terminal.
+
+    Precondition (checked by the caller): summary terminal. This method does
+    not verify the summary itself — the Finalizer owns that gate.
+    """
+    with _MEETING_LOCK:
+        meeting = db.get(models.Meeting, meeting_id)
+        if meeting is None:
+            raise MeetingNotFoundError(meeting_id)
+
+        if meeting.status == "COMPLETED":
+            return meeting  # idempotent no-op
+
+        if meeting.status != "FINALIZING":
+            raise InvalidMeetingStateTransition(
+                f"meeting {meeting_id} status {meeting.status} cannot be completed "
+                f"(must be FINALIZING; only the Finalizer transitions to COMPLETED)"
+            )
+
+        meeting.status = "COMPLETED"
+        if meeting.completed_at is None:
+            meeting.completed_at = _now()
+        try:
+            db.commit()
+        except IntegrityError:
+            db.rollback()
+            raise
+        db.refresh(meeting)
+        # Commit-before-publish (Step 5 Part 6 / Step 7B §11).
+        sse_service.publish_meeting_status(meeting)
+        return meeting

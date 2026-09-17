@@ -102,6 +102,44 @@ def build_meeting_status(meeting: models.Meeting) -> SSEEventEnvelope:
     )
 
 
+def _summary_event(
+    meeting_id: str,
+    *,
+    event_type: str,
+    version: int,
+    status: str,
+) -> SSEEventEnvelope:
+    """Small, stable Summary lifecycle envelope (Step 7B §13/§14).
+
+    payload is deliberately minimal: {version, status}. NO raw_model_output,
+    NO provider error stack, NO API key, NO prompt — those never go to SSE.
+    After a terminal event the client recovers the full snapshot via
+    GET /summary. Stable `id:` allows client-side dedup.
+    """
+    return SSEEventEnvelope(
+        sse_id=f"summary:{meeting_id}:{version}:{status.lower()}",
+        event_type=event_type,  # type: ignore[arg-type]  # Literal widened
+        meeting_id=meeting_id,
+        emitted_at=_utcnow_iso(),
+        payload={"version": version, "status": status},
+    )
+
+
+def build_summary_started(meeting_id: str, *, version: int) -> SSEEventEnvelope:
+    return _summary_event(meeting_id, event_type="summary.started", version=version,
+                          status="GENERATING")
+
+
+def build_summary_completed(meeting_id: str, *, version: int) -> SSEEventEnvelope:
+    return _summary_event(meeting_id, event_type="summary.completed", version=version,
+                          status="COMPLETED")
+
+
+def build_summary_failed(meeting_id: str, *, version: int) -> SSEEventEnvelope:
+    return _summary_event(meeting_id, event_type="summary.failed", version=version,
+                          status="FAILED")
+
+
 def build_heartbeat(meeting_id: str) -> SSEEventEnvelope:
     return SSEEventEnvelope(
         sse_id=None,
@@ -142,6 +180,22 @@ def publish_final(meeting_id: str, segment: models.TranscriptSegment) -> None:
 
 def publish_meeting_status(meeting: models.Meeting) -> None:
     event_broker.publish(meeting.id, build_meeting_status(meeting))
+
+
+def publish_summary_started(meeting_id: str, *, version: int) -> None:
+    """summary.started — MUST be published AFTER the GENERATING row committed
+    (Step 7B §11: DB commit → SSE publish; SSE failure never rolls back DB)."""
+    event_broker.publish(meeting_id, build_summary_started(meeting_id, version=version))
+
+
+def publish_summary_completed(meeting_id: str, *, version: int) -> None:
+    """summary.completed — AFTER terminal SUMMARY + Meeting COMPLETED are durable."""
+    event_broker.publish(meeting_id, build_summary_completed(meeting_id, version=version))
+
+
+def publish_summary_failed(meeting_id: str, *, version: int) -> None:
+    """summary.failed — AFTER terminal FAILED summary is durable."""
+    event_broker.publish(meeting_id, build_summary_failed(meeting_id, version=version))
 
 
 def publish_heartbeat(meeting_id: str) -> None:
@@ -235,4 +289,7 @@ __all__ = [
     "publish_partial",
     "publish_final",
     "publish_meeting_status",
+    "publish_summary_started",
+    "publish_summary_completed",
+    "publish_summary_failed",
 ]

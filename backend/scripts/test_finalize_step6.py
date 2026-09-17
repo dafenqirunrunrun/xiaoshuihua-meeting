@@ -18,10 +18,11 @@ Part A (in-process service layer, temp sqlite DB):
 Part B (black-box HTTP against a subprocess uvicorn, fresh temp DB):
   H01  freeze 后 PARTIAL -> 409
   H02  freeze 后新 FINAL -> 409
-  H03  freeze 后 canonical retry -> 200
+  H03  freeze 后 canonical retry -> 200 (incl. after Finalizer completes meeting)
   H04  same STREAM_END retry -> 200
   H05  缺口 STREAM_END -> 409 (missing=[...])
-  H06  meeting.status 保持 FINALIZING
+  H06  meeting COMPLETED via Finalizer after freeze (Step 7B: summary terminal
+       drives FINALIZING -> COMPLETED; freeze alone never completes it)
 
 The Step 5 SSE regression (test_sse_step5.py: 21 cases + 2 parser) is run
 separately — this file focuses on Step 6 only.
@@ -302,10 +303,21 @@ def _part_b() -> int:
             g_code == 409 and "missing" in str(g_body).lower(),
             f"code={g_code} body={g_body}")
 
-    code, body = _http_request("GET", f"/api/meetings/{m['id']}")
-    _record("H06 meeting status stays FINALIZING after freeze",
-            code == 200 and body.get("status") == "FINALIZING",
-            f"status={body.get('status')}")
+    # H06 (Step 7B contract): freeze does NOT complete the meeting by itself;
+    # the Finalizer drives FINALIZING -> COMPLETED AFTER the summary is terminal
+    # (Step 7B §9). On the real HTTP path the first accepted STREAM_END schedules
+    # the Finalizer as a BackgroundTask; poll until it lands on a terminal state.
+    final_status = None
+    for _ in range(50):
+        code, body = _http_request("GET", f"/api/meetings/{m['id']}")
+        if code == 200:
+            final_status = body.get("status")
+            if final_status == "COMPLETED":
+                break
+        time.sleep(0.2)
+    _record("H06 meeting COMPLETED via Finalizer after freeze (summary terminal)",
+            final_status == "COMPLETED",
+            f"status={final_status}")
     return 0
 
 

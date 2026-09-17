@@ -81,7 +81,7 @@ def _readiness_meeting(db: Session, meeting_id: str) -> models.Meeting:
 def get_finalization_readiness(db: Session, meeting_id: str) -> dict:
     """Derived finalization readiness (Step 6). NO persisted flag.
 
-    Conditions (constraint 6):
+    Conditions (constraint 6) — the ORIGINAL initial-generation gate:
       - meeting exists
       - meeting.status == FINALIZING
       - accepted transcript_stream exists (durable freeze boundary)
@@ -107,6 +107,24 @@ def get_finalization_readiness(db: Session, meeting_id: str) -> dict:
     }
 
 
+def is_frozen(db: Session, meeting_id: str) -> bool:
+    """Durable transcript-freeze check ONLY (status-agnostic, Step 7B §21).
+
+    Regeneration on a COMPLETED meeting must still satisfy D6 ("only frozen
+    transcript enters the LLM") without demanding FINALIZING — the transcript
+    was frozen once at the first accepted STREAM_END and COMPLETED is a legal
+    (actually the normal) regeneration host (§19). Whether the meeting is
+    FINALIZING or COMPLETED does not change the freeze fact.
+    """
+    meeting = _readiness_meeting(db, meeting_id)
+    stream = _get_stream_end(db, meeting_id)
+    return (
+        stream is not None
+        and stream.last_segment_seq is not None
+        and stream.status == "ACCEPTED"
+    )
+
+
 def is_finalization_ready(db: Session, meeting_id: str) -> bool:
     """Boolean form of readiness (for the future Step 7 Finalizer gate)."""
     return get_finalization_readiness(db, meeting_id)["finalization_ready"]
@@ -123,8 +141,16 @@ def handle_stream_end(
     db: Session,
     meeting_id: str,
     payload: transcript_schemas.StreamEndEvent,
-) -> tuple[models.Meeting, models.TranscriptStream, bool]:
-    """Validate, persist (idempotently), run integrity check. Returns (meeting, stream, complete)."""
+) -> tuple[models.Meeting, models.TranscriptStream, bool, bool]:
+    """Validate, persist (idempotently), run integrity check.
+
+    Returns (meeting, stream, complete, newly_accepted):
+      - complete (bool): transcript is complete & frozen (mirrors transcript_complete).
+      - newly_accepted (bool): True ONLY for the FIRST accepted stream-end of
+        this meeting; False for an identical idempotent retry. The Finalizer
+        triggers the initial Summary generation on newly_accepted=True and
+        MUST NOT on retries (Step 7B §5 — a retry must not re-run DeepSeek).
+    """
     if payload.event_type != "TRANSCRIPT_STREAM_END":
         raise TranscriptValidationError(
             f"event_type must be TRANSCRIPT_STREAM_END, got {payload.event_type}"
@@ -147,7 +173,7 @@ def handle_stream_end(
         if existing is not None:
             if existing.last_segment_seq == payload.last_segment_seq:
                 # identical retry -> 200, no state change, keep first received_at
-                return meeting, existing, True
+                return meeting, existing, True, False
             raise TranscriptConflictError(
                 meeting_id,
                 "",
@@ -195,4 +221,4 @@ def handle_stream_end(
         # This is TEMPORARY-STATE cleanup only, NOT the source of truth for
         # finalization readiness (that is the committed transcript_stream row).
         live_utterance_cache.clear_meeting(meeting_id)
-        return meeting, stream_row, True
+        return meeting, stream_row, True, True

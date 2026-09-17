@@ -53,9 +53,25 @@ def max_version(db: Session, meeting_id: str) -> int | None:
     )
 
 
+def get_latest(db: Session, meeting_id: str) -> models.MeetingSummary | None:
+    """The latest-version summary row for a meeting (None if none exists).
+
+    Step 7B §15: GET /summary returns this — the durable recovery snapshot.
+    """
+    from app.models.meeting_summary import MeetingSummary
+
+    return db.scalar(
+        select(MeetingSummary)
+        .where(MeetingSummary.meeting_id == meeting_id)
+        .order_by(MeetingSummary.version.desc())
+        .limit(1)
+    )
+
+
 __all__ = [
     "insert_summary_item",
     "get_for_meeting_version",
     "list_sorted",
     "max_version",
+    "get_latest",
 ]

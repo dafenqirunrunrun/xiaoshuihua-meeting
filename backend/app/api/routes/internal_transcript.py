@@ -8,7 +8,7 @@ Routes:
   GET  /api/meetings/{meeting_id}/transcript                    (Snapshot, PRD §48)
 """
 
-from fastapi import APIRouter, Depends, Response, status
+from fastapi import APIRouter, BackgroundTasks, Depends, Response, status
 from sqlalchemy.orm import Session
 
 from app.db import get_db
@@ -33,11 +33,22 @@ def ingest_transcript_event(
 @router.post("/internal/meetings/{meeting_id}/stream-end", response_model=transcript_schemas.StreamEndOut)
 def ingest_stream_end(
     meeting_id: str,
+    background_tasks: BackgroundTasks,
     payload: transcript_schemas.StreamEndEvent,
     db: Session = Depends(get_db),
 ) -> transcript_schemas.StreamEndOut:
-    """Accept the terminal TRANSCRIPT_STREAM_END after integrity check (durable)."""
-    meeting, stream, complete = stream_service.handle_stream_end(db, meeting_id, payload)
+    """Accept the terminal TRANSCRIPT_STREAM_END after integrity check (durable).
+
+    On the FIRST accepted stream-end (`newly_accepted=True`) schedules the
+    Finalizer as a FastAPI BackgroundTask (process-local trigger; NOT a durable
+    queue — see arch §9.4 / ADR D15). Idempotent same-value retries return 200
+    with newly_accepted=False and never re-schedule the Summary pipeline.
+    """
+    meeting, stream, complete, newly_accepted = stream_service.handle_stream_end(db, meeting_id, payload)
+    if newly_accepted:
+        from app.services.finalizer_service import run_finalizer_background
+
+        background_tasks.add_task(run_finalizer_background, meeting_id)
     return transcript_schemas.StreamEndOut(
         meeting_id=meeting.id,
         last_segment_seq=stream.last_segment_seq,

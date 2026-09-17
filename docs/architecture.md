@@ -177,8 +177,11 @@ receive STREAM_END
 - 因为 ACCEPTED 行已隐含完整性检查通过，readiness 不做重复全量 gap scan。
 - **不新增公开 API**（如 `GET /finalization-ready`）；Step 6 只在 service 层提供。
 - **Meeting 状态保持 FINALIZING**：即便 STREAM_END accepted / Transcript frozen /
-  finalization_ready=true，也**绝不在 Step 6 变 COMPLETED**（COMPLETED 由 Step 7
-  Summary Pipeline 完成后驱动）。
+  finalization_ready=true，也**绝不在 Step 6 变 COMPLETED**（COMPLETED 由 Step 7B
+  Finalizer 在 Summary 终态后驱动）。
+- **Step 7B 补充**：`stream_service.is_frozen(db, meeting_id)` 是**状态无关的
+  仅 freeze 检查**（ACCEPTED 行 + `last_segment_seq`），供 regeneration 在
+  COMPLETED 会议上仍然满足 D6"仅 frozen transcript 进 LLM"（§11.3）。
 
 ### 7.2 STREAM_END 持久化（Step 4）
 
@@ -293,7 +296,8 @@ GET /events?after_segment_seq=N
   - `FakeProvider`（`app/services/llm/fake.py`）：**默认测试基础设施**，离线确定性
     （scripted responses / error / repair 场景）。
   - `LLMProviderFactory`（`app/services/llm/factory.py`）：`settings.llm_provider`
-    支持 `"fake"`（默认）与 `"deepseek"`；未识别值回落 Fake（绝不阻断启动）。
+    支持 `"fake"`（默认）与 `"deepseek"`；**任何其它值 → `LLMConfigurationError`
+    （fail-closed）**——绝不回落 FakeProvider（Step 7B §1/§24，见 ADR D15）。
 - **测试注入**：`summary_service.generate(..., provider=...)` 直接注入，无需改业务代码。
 
 ### 9.2 生成管线（Phase A / B / C，无锁调 LLM）
@@ -339,9 +343,13 @@ Phase C [locking, 回写]
 ```text
 无 HTTP 端点（GET /summary 等）      无 SSE summary.*
 无 FINALIZING → COMPLETED            无 regenerate / 新版本
-无 BackgroundTasks / Celery / Redis / Kafka 队列
+无 BackgroundTasks / Celery / Redis / Kafka 队列（Step 7A 约束）
 无真实 ASR 接入
 ```
+
+> Step 7B 变更：GET /summary、POST /summary/regenerate、`summary.*` SSE、
+> FINALIZING → COMPLETED、以及 **BackgroundTasks 作为进程内 MVP 触发（非 durable
+> job queue）** 均在 Step 7B 实现 —— 见 §11 与 ADR D15。
 
 ## 10. 明确不做（后续版本）
 
@@ -350,4 +358,75 @@ Agent / Multi-Agent / Memory / RAG / Discussion Node / Todo / Decision
 向量数据库 / 跨会议检索 / 声纹身份映射 / 自动议题 / 自动章节
 真实麦克风 / 音频上传 / ASR WebSocket / Whisper / FunASR / 音频 Codec / PCM / 采样率
 复杂权限 / AI Chat / 知识库 / 思维导图 / AI PPT
+```
+
+## 11. Finalizer + Summary API + Summary SSE + Meeting Completion（Step 7B 已实现）
+
+> 契约：`首个 accepted STREAM_END → 自动触发初始 Summary 生成 → Summary 终态
+> （COMPLETED / FAILED）→ 才允许 Meeting FINALIZING → COMPLETED`。补充 GET /summary
+> 恢复快照、POST /summary/regenerate（append-only 版本）、`summary.*` SSE。
+> 本 Step 不做 React / Zustand / 前端（Step 8）。ADR：**D15**。
+
+### 11.1 Finalizer（`app/services/finalizer_service.py`）
+
+- **职责边界**：协调 Summary 终态 → Meeting COMPLETED；**不重新实现 Summary 管线**
+  （prompt / retry / schema 校验 / DeepSeek / 持久化都在 Step 7A `summary_service`）。
+- **触发**：首次 accepted STREAM_END（`newly_accepted=True`）→ FastAPI BackgroundTasks
+  调 `run_finalizer_background(meeting_id)` → 自己的 DB session（`SessionLocal`，
+  绝不复用请求 session，§23）。
+- **幂等**（任何重入安全）：
+  - meeting 已是 COMPLETED → 早退（跳过 LLM + 状态迁移）；
+  - summary v1 已终态 → `generate()` 幂等 no-op，**零 LLM 调用**；
+  - `complete_after_summary()` 幂等（FINALIZING → COMPLETED）。
+- **崩溃缺口可恢复**：`summary 终态 + meeting FINALIZING` 是合法可恢复状态
+  （Step 7A Phase C 先提交 summary）；Finalizer 重跑只补 Meeting 状态，不重调 LLM。
+- **绝不创建 Meeting FAILED / FINALIZING_FAILED**（ADR D1）；Summary 失败用
+  `summary.status = FAILED` 表达，且同样驱动 Meeting COMPLETED。
+- **FakeProvider 注入**：`finalize_for_meeting(..., provider=...)` 透传（测试）。
+
+### 11.2 Meeting Completion（`meeting_service.complete_after_summary`）
+
+- **唯一** Meeting 完成路径：FINALIZING → COMPLETED（`completed_at` 首次置位）。
+- FINALIZING 但 Summary 未终态 → 该路径根本不会被调用（Finalizer 是唯一调用方，
+  且它在 Summary 终态后才调）；CREATED / IN_PROGRESS → 409（非法）。
+
+### 11.3 Summary API（HTTP）
+
+- **GET /api/meetings/{id}/summary**（§15）：最新版本 Summary 快照 —— durable
+  恢复事实源（GENERATING / COMPLETED / FAILED 均 200）。前端重连模型：
+  GET Meeting + GET Summary + Transcript Snapshot + SSE。meeting 不存在 →
+  404 "meeting not found"；存在但无 summary → 404 "summary not found"。
+- **POST /api/meetings/{id}/summary/regenerate**（§17-§22）→ **202**
+  `{meeting_id, version, status: "GENERATING"}`（不阻塞 LLM）：
+  1. 同步分配 vN+1 + 持久化 GENERATING 行 + 发 `summary.started`（`create_regeneration`）；
+  2. BackgroundTasks → `run_regenerate_background`（自己的 session，`complete_generation`）；
+  3. 返回 202。
+- 约束：meeting 必须是 FINALIZING **或 COMPLETED**（regeneration 永不把 Meeting
+  移出 COMPLETED，§19）；latest 已是 GENERATING → **409**（§18，避免重复模型成本）；
+  版本只 append（v1→v2→v3，never overwrite）；输入仍只来自**持久化 FINAL ASC**
+  （`is_frozen` 门控；不因 COMPLETED 而失效，§21）。
+- 无 `force=True` 混入；终态不覆盖。
+
+### 11.4 Summary SSE
+
+- 通过既有 EventBroker（`GET /events`），`event_type` 扩展为 `summary.started /
+  summary.completed / summary.failed`。
+- **Commit-before-publish**：DB commit → SSE publish；SSE 失败（驱逐/异常）
+  **绝不回滚**业务事务（Finalizer 对终态 publish 做了 best-effort try/except）。
+- **payload 最小化**：`{version, status}`；**绝不**含 raw_model_output / provider
+  堆栈 / API key / prompt。
+- **稳定 id**：`summary:<meeting_id>:<version>:<started|completed|failed>`。
+- **非 durable**：Summary 事件**不回放**（`after_segment_seq` 只回放 FINAL）；
+  重连客户端用 GET /summary 恢复（§15/§28）。
+- **顺序不变式**（§12/B21）：`summary.started → summary.completed|failed →
+  meeting.status(COMPLETED)`（终态事件在终端 Summary durable 之后）。
+
+### 11.5 明确不做
+
+```text
+不接 / 不替换 Step 5 恢复协议（Snapshot + after_segment_seq 原样保留，
+  无 after_summary_version / durable SSE replay / Last-Event-ID）
+React / Zustand / Result Page / 真实 ASR
+Celery / Redis / Kafka / 启动期全库扫描调度
+BackgroundTasks 仅作进程内 MVP 触发（≠ durable job queue；durable 事实在 DB）
 ```

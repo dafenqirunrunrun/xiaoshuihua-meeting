@@ -222,14 +222,156 @@ def generate(
     provider: LLMProvider | None = None,
     version: int = 1,
 ) -> models.MeetingSummary:
-    """Generate (or no-op) the initial summary for a meeting.
+    """Initial summary generation (Step 7A contract; idempotent).
+
+    Meeting MUST be FINALIZING + transcripts frozen. Same terminal version
+    already present -> idempotent no-op (never overwritten). See `_run_generation`.
+    """
+    return _run_generation(
+        db, path_meeting_id, provider=provider, version=version, allow_completed=False
+    )
+
+
+def regenerate(
+    db: "Session",
+    path_meeting_id: str,
+    *,
+    provider: LLMProvider | None = None,
+) -> models.MeetingSummary:
+    """Explicit human regeneration (Step 7B §17-§21).
+
+    Appends the NEXT version (vN+1) on top of the latest terminal summary — v1
+    is NEVER overwritten, no DELETE/UPDATE-in-place. Requires a FROZEN
+    transcript (input is still persisted FINAL ASC only). The meeting may be
+    COMPLETED (regeneration is a Summary-lifecycle concern and NEVER rolls the
+    Meeting back to FINALIZING, §19). If the LATEST version is still GENERATING
+    (a concurrent regeneration is in flight) this raises TranscriptConflictError
+    (409) to avoid duplicate model cost (§18).
+    """
+    from app.db import SessionLocal
+
+    # Determine next version under the meeting lock (consistent with any prior
+    # Phase A write for the same meeting).
+    with meeting_lock(path_meeting_id):
+        meeting = db.get(models.Meeting, path_meeting_id)
+        if meeting is None:
+            raise MeetingNotFoundError(path_meeting_id)
+        if meeting.status not in {"FINALIZING", "COMPLETED"}:
+            raise InvalidMeetingStateTransition(
+                f"meeting {path_meeting_id} status {meeting.status} cannot regenerate "
+                f"(needs FINALIZING or COMPLETED)"
+            )
+        latest = summary_repository.max_version(db, path_meeting_id) or 0
+        # If the latest version row exists and is GENERATING, a regeneration is
+        # already in flight -> reject to avoid duplicate model cost.
+        live = summary_repository.get_for_meeting_version(db, path_meeting_id, latest)
+        if live is not None and live.status == STATUS_GENERATING:
+            raise TranscriptConflictError(
+                path_meeting_id,
+                f"summary-v{latest}",
+                message=f"summary v{latest} for meeting {path_meeting_id} is still GENERATING — "
+                        f"wait for a terminal state before regenerating",
+            )
+        next_version = latest + 1
+
+    return _run_generation(
+        db, path_meeting_id, provider=provider, version=next_version, allow_completed=True
+    )
+
+
+def create_regeneration(
+    db: "Session",
+    path_meeting_id: str,
+    *,
+    provider: LLMProvider | None = None,
+) -> models.MeetingSummary:
+    """Regeneration, sync part for the HTTP layer (Step 7B §18/§22).
+
+    Allocates the NEXT version (vN+1), persists a GENERATING row, emits
+    `summary.started`, and returns the row. Does NOT call the LLM — that happens
+    later in `complete_generation` (background). The HTTP route therefore never
+    blocks on DeepSeek (202 semantics, §22).
+
+    Rules:
+      - meeting must exist (404) and be FINALIZING or COMPLETED (409 otherwise)
+        — regeneration never moves the meeting out of COMPLETED (§19).
+      - latest version GENERATING -> 409 (a regeneration is in flight; avoid
+        duplicate model cost, §18).
+      - append version only; v1..vN NEVER overwritten / deleted.
+    """
+    from app.services import sse_service
+
+    with meeting_lock(path_meeting_id):
+        meeting = db.get(models.Meeting, path_meeting_id)
+        if meeting is None:
+            raise MeetingNotFoundError(path_meeting_id)
+        if meeting.status not in {"FINALIZING", "COMPLETED"}:
+            raise InvalidMeetingStateTransition(
+                f"meeting {path_meeting_id} status {meeting.status} cannot regenerate "
+                f"(needs FINALIZING or COMPLETED)"
+            )
+        latest = summary_repository.max_version(db, path_meeting_id) or 0
+        live = summary_repository.get_for_meeting_version(db, path_meeting_id, latest)
+        if live is not None and live.status == STATUS_GENERATING:
+            raise TranscriptConflictError(
+                path_meeting_id,
+                f"summary-v{latest}",
+                message=f"summary v{latest} for meeting {path_meeting_id} is still GENERATING — "
+                        f"wait for a terminal state before regenerating",
+            )
+        next_version = latest + 1
+        item = models.MeetingSummary(
+            meeting_id=path_meeting_id,
+            version=next_version,
+            status=STATUS_GENERATING,
+        )
+        db.add(item)
+        db.commit()
+        db.refresh(item)
+
+    # summary.started AFTER the GENERATING row committed (Step 7B §11/B18).
+    sse_service.publish_summary_started(path_meeting_id, version=next_version)
+    return item
+
+
+def complete_generation(
+    db: "Session",
+    path_meeting_id: str,
+    version: int,
+    *,
+    provider: LLMProvider | None = None,
+) -> models.MeetingSummary:
+    """Regeneration, async part (background, Step 7B §22).
+
+    Runs the Phase B/C pipeline (LLM + validation + terminal persistence) for
+    an ALREADY-created GENERATING row. Idempotent: if the row is already
+    terminal (shouldn't happen for a fresh version) this is a no-op.
+
+    NOTE: only called from a background thread with its own DB session, never
+    from the HTTP request thread (session lifecycle, §23).
+    """
+    return _run_generation(
+        db, path_meeting_id, provider=provider, version=version, allow_completed=True
+    )
+
+
+def _run_generation(
+    db: "Session",
+    path_meeting_id: str,
+    *,
+    provider: LLMProvider | None = None,
+    version: int = 1,
+    allow_completed: bool,
+) -> models.MeetingSummary:
+    """Core generation pipeline (Phase A / B / C).
 
     On success returns the COMPLETED summary row; on any failure the summary
     row is FAILED (terminal) and the exception is NOT re-raised to the caller —
-    the API never sees an LLM error. meeting.status stays FINALIZING.
+    the API never sees an LLM error. meeting.status is not touched here
+    (the Finalizer owns the Meeting transition in Step 7B).
 
     Steps:
-      Phase A (locked, short): existence + FINALIZING + freeze readiness +
+      Phase A (locked, short): existence + state gate + freeze readiness +
         existing-row idempotency (COMPLETED/FAILED at same version -> no-op).
         Marks the row GENERATING so a concurrent double-call is serialized.
       Phase B (NO lock, outside worker loop): build prompt from persisted FINAL
@@ -248,12 +390,20 @@ def generate(
         meeting = db.get(models.Meeting, path_meeting_id)
         if meeting is None:
             raise MeetingNotFoundError(path_meeting_id)
-        if meeting.status != "FINALIZING":
-            raise InvalidMeetingStateTransition(
-                f"meeting {path_meeting_id} status {meeting.status} cannot generate summary "
-                f"(must be FINALIZING; COMPLETED is Step 7B)"
-            )
-        if not stream_service.is_finalization_ready(db, path_meeting_id):
+        if not allow_completed:
+            if meeting.status != "FINALIZING":
+                raise InvalidMeetingStateTransition(
+                    f"meeting {path_meeting_id} status {meeting.status} cannot generate summary "
+                    f"(must be FINALIZING; COMPLETED is Step 7B)"
+                )
+        else:
+            # regenerate: FINALIZING or COMPLETED only (CREATED/IN_PROGRESS 409).
+            if meeting.status not in {"FINALIZING", "COMPLETED"}:
+                raise InvalidMeetingStateTransition(
+                    f"meeting {path_meeting_id} status {meeting.status} cannot regenerate "
+                    f"(needs FINALIZING or COMPLETED)"
+                )
+        if not stream_service.is_frozen(db, path_meeting_id):
             raise InvalidMeetingStateTransition(
                 f"meeting {path_meeting_id} transcripts not frozen yet — "
                 f"wait for TRANSCRIPT_STREAM_END + integrity confirm (D6, no fixed sleep)"
@@ -269,6 +419,7 @@ def generate(
 
         # Build the row (or reuse a half-written GENERATING row from a previous
         # crashed attempt). The UNIQUE(meeting_id, version) makes this safe.
+        created = existing is None
         if existing is None:
             item = models.MeetingSummary(
                 meeting_id=path_meeting_id,
@@ -280,6 +431,16 @@ def generate(
             db.refresh(item)
         else:  # existing GENERATING (crashed prior attempt) — resume it
             item = existing
+
+    # summary.started — AFTER the GENERATING row commit succeeded (Step 7B
+    # §11/B18). Non-blocking publish; failure never rolls back the DB. We
+    # publish on a fresh generation OR on a resume of a crashed attempt (the
+    # frontend should see the lifecycle is in flight again). NOT on an
+    # idempotent no-op (returned above).
+    if created or item.status == STATUS_GENERATING:
+        from app.services import sse_service
+
+        sse_service.publish_summary_started(path_meeting_id, version=version)
 
     # --- Phase B: LLM call — NO lock, NO transaction ------------------------
     # The transcript is read AFTER Phase A released the lock, on a FRESH
@@ -382,10 +543,17 @@ def _build_prompt_outside_lock(
 
 
 def _call_provider(comp: LLMProvider, prompt: str) -> str:
-    """Provider call with a hard cap on raw output; raises SummaryErrorBase."""
+    """Provider call with a hard cap on raw output; raises SummaryErrorBase.
+
+    `LLMConfigurationError` (fail-closed unknown provider) is folded into
+    SummaryErrorBase so the pipeline treats it as a provider-level failure —
+    which the Finalizer maps to `summary.status = FAILED` (never silently fake).
+    """
+    from app.services.llm.base import LLMConfigurationError
+
     try:
         raw = comp.complete(prompt)
-    except SummaryGenerationError as exc:
+    except (SummaryGenerationError, LLMConfigurationError) as exc:
         raise SummaryErrorBase(str(exc)) from exc
     if not raw or not raw.strip():
         raise SummaryErrorBase("provider returned empty output")
@@ -414,6 +582,9 @@ def _describe_parse_error(exc: Exception, raw_output: str | None) -> str:
 
 __all__ = [
     "generate",
+    "regenerate",
+    "create_regeneration",
+    "complete_generation",
     "build_summary_prompt",
     "build_repair_prompt",
     "parse_and_validate",

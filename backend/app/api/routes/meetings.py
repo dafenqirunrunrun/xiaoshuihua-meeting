@@ -9,16 +9,16 @@ PRD §48:
   GET    /api/meetings/{meeting_id}/events
   GET    /api/meetings/{meeting_id}/summary
   POST   /api/meetings/{meeting_id}/summary/regenerate
-
-Step 1: only POST create + GET one. Others implemented in later steps.
 """
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 
 from app.db import get_db
+from app.repositories import summary_repository as summary_repo
 from app.schemas import meeting as meeting_schemas
+from app.schemas import summary as summary_schemas
 from app.schemas import transcript as transcript_schemas
 from app.services import meeting_service, sse_service, transcript_service
 
@@ -101,4 +101,57 @@ async def get_events(
             "Connection": "keep-alive",
             "X-Accel-Buffering": "no",
         },
+    )
+
+
+@router.get("/{meeting_id}/summary", response_model=summary_schemas.SummaryOut)
+def get_summary(meeting_id: str, db: Session = Depends(get_db)):
+    """Latest-version Summary snapshot — durable recovery fact-source (Step 7B §15/§16).
+
+    Frontend recovery model: GET Meeting + GET Summary + Transcript Snapshot +
+    SSE. Summary SSE events are NON-durable (not replayed on reconnect); this
+    endpoint is how a reconnecting client sees the current state:
+
+      - GENERATING / COMPLETED / FAILED -> 200 with the latest version's row
+      - meeting does not exist            -> 404
+      - meeting exists but no summary yet -> 404 ("summary not found")
+    """
+    # Meeting existence is checked by the repository lookup below (summary rows
+    # are FK'd to meeting), but we want a precise 404 "meeting not found" when
+    # the meeting itself is missing vs "summary not found" when it has none.
+    meeting_service.get_meeting(db, meeting_id)  # raises MeetingNotFoundError -> 404
+    item = summary_repo.get_latest(db, meeting_id)
+    if item is None:
+        raise HTTPException(status_code=404, detail="summary not found")
+    return item
+
+
+@router.post(
+    "/{meeting_id}/summary/regenerate",
+    response_model=summary_schemas.RegenerationAccepted,
+    status_code=202,
+)
+def regenerate_summary(
+    meeting_id: str,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+) -> summary_schemas.RegenerationAccepted:
+    """Explicit human regeneration (Step 7B §17-§22).
+
+    202 Accepted (does NOT block on DeepSeek):
+      1. synchronously allocate vN+1 + create a GENERATING row
+         (create_regeneration; 409 if the latest is already GENERATING)
+      2. schedule the background Phase B/C completion on OUR OWN DB session
+      3. return {meeting_id, version, status: "GENERATING"}
+
+    The meeting may be COMPLETED — regeneration is a Summary-lifecycle concern
+    and never moves the Meeting out of COMPLETED (§19). Version always appends.
+    """
+    from app.services.finalizer_service import run_regenerate_background
+    from app.services.summary_service import create_regeneration
+
+    item = create_regeneration(db, meeting_id)
+    background_tasks.add_task(run_regenerate_background, meeting_id)
+    return summary_schemas.RegenerationAccepted(
+        meeting_id=item.meeting_id, version=item.version, status=item.status
     )

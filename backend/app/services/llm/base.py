@@ -41,4 +41,17 @@ class SummaryGenerationError(Exception):
         super().__init__(message)
 
 
-__all__ = ["LLMProvider", "SummaryGenerationError"]
+class LLMConfigurationError(Exception):
+    """The LLM provider configuration is invalid / unknown (fail-closed).
+
+    Raised by `get_provider()` when `settings.llm_provider` is not one of the
+    known values ("fake" / "deepseek"). A typo must NEVER silently fall back to
+    FakeProvider — that would let a production misconfiguration pass as a
+    working offline pipeline and generate a fake summary.
+    """
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message)
+
+
+__all__ = ["LLMProvider", "SummaryGenerationError", "LLMConfigurationError"]

@@ -116,6 +116,43 @@ existing implementation
     Celery / Redis / Kafka 队列、无真实 ASR。
   - 测试：`backend/scripts/test_summary_step7a.py` 28/28 PASS；
     Step 6 regression 21/21 PASS；Step 5 regression 21/21 PASS；parser 2/2 PASS。
+- **Step 7B 已完成**：Finalizer + Summary API + Summary SSE + Meeting Completion（后端）。
+  - **触发链**：首个 accepted STREAM_END（`newly_accepted=True`）→ FastAPI
+    **BackgroundTasks** 调 `finalizer_service.run_finalizer_background`（**进程内 MVP
+    触发，≠ durable job queue**；durable 事实在 DB，可重跑恢复，无启动期全库扫描）。
+    相同 STREAM_END retry → `newly_accepted=False`，**绝不重跑 LLM（不重付模型成本）**。
+  - **Finalizer**（`finalizer_service.finalize_for_meeting`）：不重实现 Summary
+    管线（调用 Step 7A `summary_service`）；幂等（COMPLETED 早退 / 终态 v1 no-op /
+    `complete_after_summary` 幂等）；**崩溃缺口可恢复**（显式含"summary 终态 +
+    meeting FINALIZING"= 合法可恢复状态，重跑零 LLM）。
+  - **Meeting COMPLETED 只在 Summary 终态后驱动**（COMPLETED **或 FAILED** 都驱动；
+    绝不新增 Meeting FAILED / FINALIZING_FAILED，D1）。`meeting_service.complete_after_summary`
+    是**唯一**完成路径（FINALIZING→COMPLETED / COMPLETED 幂等 / CREATED·IN_PROGRESS 409）；
+    路由层永不直接写 `status=COMPLETED`。
+  - **Provider 工厂 fail-closed（§1/§24）**：未知 `LLM_PROVIDER` → `LLMConfigurationError`
+    （`app/services/llm/base.py`），**绝不回落 FakeProvider**；生成管线当作 provider 级
+    失败 → summary FAILED（零 fake 纪要）。
+  - **GET /api/meetings/{id}/summary**：最新版本 durable 恢复快照
+    （GENERATING/COMPLETED/FAILED 200；meeting 缺失 404 / 无 summary 404）。
+  - **POST /api/meetings/{id}/summary/regenerate** → **202** `{version:vN+1, status:
+    GENERATING}`；同步分配 GENERATING 行 + `summary.started`，BackgroundTasks 后台跑
+    Phase B/C（**自有 session**）；latest GENERATING → 409；版本 **append-only**
+    （v1→v2→v3，never overwrite）；**meeting 永不退出 COMPLETED**；输入仍只用持久化
+    FINAL ASC（`stream_service.is_frozen` 状态无关门控，D6 在 COMPLETED 仍成立）。
+  - **Summary SSE**：`summary.started / completed / failed`（既有 EventBroker）；
+    payload 仅 `{version,status}`（**绝不含** raw_model_output/堆栈/API key/prompt）；
+    稳定 id `summary:<meeting_id>:<version>:<started|completed|failed>`；
+    **非 durable、不回放**（重连用 GET /summary）；commit-before-publish（SSE 失败
+    不回滚 DB）；顺序 `summary.started → summary.completed|failed → meeting.status(COMPLETED)`。
+  - **canonical FINAL retry 跨 COMPLETED 边界仍 200**（幂等重发 ≠ append；
+    新 FINAL / PARTIAL 在 COMPLETED 仍 409）——`transcript_service` 的 `_existing_final`
+    短路。
+  - 不改 Step 5 恢复协议（Snapshot + `after_segment_seq` 原样；无
+    after_summary_version / durable SSE replay / Last-Event-ID）。
+  - 明确不做：React/Zustand/Result Page/真实 ASR/Celery/Redis/Kafka/启动期调度。
+  - 测试：`backend/scripts/test_summary_step7b.py` 36/36 PASS；
+    Step 7A regression 28/28 PASS；Step 6 regression 21/21 PASS（H06 更新为
+    "Freeze 后经 Finalizer 终态 COMPLETED"）；Step 5 regression 21/21 PASS；parser 2/2 PASS。
 
 
 ## 常用命令

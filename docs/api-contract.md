@@ -157,7 +157,8 @@ Receive → Validate(status/meeting/seq) → Idempotency Check → Persist → C
 - **帧（envelope）**：`{sse_id?, event_type, meeting_id, emitted_at, payload}`；
   每帧包含可选的 `id:`、`event:`、`data:` 行 + 空行。
 - **事件类型**（本 Step 产出）：`transcript.partial`、`transcript.final`、
-  `meeting.status`、`heartbeat`。`summary.*` 仅保留（后续 Step）。
+  `meeting.status`、`heartbeat`。`summary.*`（started/completed/failed）在 Step 7B
+  产出（见 §4 Step 状态；payload 仅 `{version,status}`，非 durable，不回放）。
 - **稳定 SSE id（Part 13）**：FINAL = `final:<meeting_id>:<segment_seq>`。
 - **PARTIAL 不重放**（Part 12）：只 live 推送，断线后不补。
 - `TRANSCRIPT_STREAM_END` **不广播**（PRD §30 未列出，契约不可扩展）。
@@ -264,19 +265,47 @@ FINAL after Stream End（Part 8）：
 
 ---
 
-## 4. 尚未实现（后续 Step）
-
-- `GET /api/meetings/{meeting_id}/summary`
-- `POST /api/meetings/{meeting_id}/summary/regenerate`
-- Summary Pipeline / LLM / FINALIZING → COMPLETED（Step 7：`summary.status` 进入终态
-  COMPLETED 或 FAILED 后驱动 `meeting.status = COMPLETED`）
-- Mock Producer 的 `--phase` 分阶段能力（当前单次全流）
+## 4. Step 状态
 
 > Step 6 已完成：Transcript Freeze（durable 边界）+ Finalization Readiness
 > （service 层派生，无公开 API）—— 见 `architecture.md §7.0/§7.3` 与 `ADR-001 D13`。
 
 > Step 7A 已完成：LLMProvider + DeepSeekProvider + Summary Generation Pipeline
 > （`summary_service.generate`：Freeze → LLM → Schema 校验 → Summary 持久化）。
-> 均为 **service 层内部生成**，**无新增 HTTP 端点**、无 SSE `summary.*`、
-> Meeting 保持 FINALIZING —— 见 `architecture.md §9` 与 `ADR-001 D14`。
-> 前端读取（GET /summary）与重新生成（POST regenerate）留待 Step 7B。
+> 均**已实现**：service 层内部生成、无 HTTP 端点 / 无 SSE `summary.*`、Meeting 保持
+> FINALIZING —— 见 `architecture.md §9` 与 `ADR-001 D14`。
+
+> **Step 7B 已完成**：Finalizer + Summary API + Summary SSE + Meeting Completion。
+> 本步新增 / 变更的契约：
+>
+> - **`GET /api/meetings/{meeting_id}/summary`** —— 最新版本 Summary 快照
+>   （`SummaryOut`：id / meeting_id / version / status / overview / key_topics /
+>   conclusions / open_questions / model_name / raw_model_output / created_at）。
+>   - `meeting` 不存在 → **404 "meeting not found"**；存在但无 summary → **404
+>     "summary not found"**；有（GENERATING / COMPLETED / FAILED）→ **200**。
+>   - 是前端重连的 **durable 恢复事实源**（Summary SSE **非 durable、不回放**）。
+> - **`POST /api/meetings/{meeting_id}/summary/regenerate`** → **202**
+>   `{meeting_id, version, status: "GENERATING"}`（不阻塞 LLM）。
+>   - 同步分配 vN+1 + 持久化 GENERATING 行 + 发 `summary.started`，然后
+>     BackgroundTasks（自己的 DB session）后台跑 Phase B/C。
+>   - meeting 必须 FINALIZING **或 COMPLETED**（regenerate 永不把 Meeting 移出
+>     COMPLETED）；CREATED / IN_PROGRESS → **409**。
+>   - latest 已是 GENERATING → **409**（避免重复模型成本）。
+>   - 版本只 **append**（v1→v2→v3），终态不覆盖；输入仅持久化 FINAL ASC
+>     （`is_frozen` 门控，COMPLETED 会议同样满足 D6）。
+> - **SSE `summary.*`**（`GET /events` 同一连接）：
+>   - `summary.started` / `summary.completed` / `summary.failed`；
+>   - payload 仅 `{version, status}`（**绝不含** raw_model_output / 堆栈 / API key / prompt）；
+>   - 稳定 id `summary:<meeting_id>:<version>:<started|completed|failed>`；
+>   - **非 durable**：不随 `after_segment_seq` 回放，重连用 GET /summary 恢复；
+>   - 顺序：`summary.started → summary.completed|failed → meeting.status(COMPLETED)`。
+> - **首个 accepted STREAM_END auto-triggers Finalizer**（BackgroundTasks，进程内
+>   MVP 触发，≠ durable job queue）；相同 STREAM_END retry → `newly_accepted=False`，
+>   **绝不**重跑 LLM（见 `architecture.md §11` 与 `ADR-001 D15`）。
+> - **Meeting 状态**：Summary 终态（COMPLETED / FAILED）**之后**才
+>   FINALIZING → COMPLETED（`complete_after_summary`，唯一的完成路径）；
+>   无 Meeting FAILED / FINALIZING_FAILED。
+> - **canonical FINAL retry 跨 COMPLETED 边界仍 200**（幂等重发不是 append；
+>   新 FINAL / PARTIAL 在 COMPLETED 仍 409）——见 §Transcript 幂等。
+
+> 仍留待后续：Mock Producer 的 `--phase` 分阶段能力（当前单次全流）。

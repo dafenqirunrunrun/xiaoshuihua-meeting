@@ -75,15 +75,22 @@ def handle_event(
         )
 
     with meeting_lock(path_meeting_id):
-        # --- Meeting existence + accepting state -----------------------------
-        _require_meeting_accepting(db, path_meeting_id)
-
         if event.status == "PARTIAL":
+            # --- Meeting existence + accepting state -------------------------
+            _require_meeting_accepting(db, path_meeting_id)
             # Freeze hard gate FIRST: once the transcript is frozen, no PARTIAL
             # may even touch the live cache (constraint 3).
             _ensure_transcript_not_frozen(db, path_meeting_id)
             handle_partial(db, path_meeting_id, event)
         else:  # FINAL
+            # Idempotent canonical retries bypass the accepting-state gate: a
+            # client may replay an already-persisted FINAL AFTER the meeting has
+            # been completed (Step 7B Finalizer auto-finalizes on first accepted
+            # STREAM_END). A retry is the SAME content — not an append — so it
+            # must still return 200, mirroring how STREAM_END retries allow a
+            # COMPLETED meeting (stream_service). Only NEW FINAL is gated.
+            if not _existing_final(db, path_meeting_id, event):
+                _require_meeting_accepting(db, path_meeting_id)
             handle_final(db, path_meeting_id, event)
 
 
@@ -155,6 +162,23 @@ def _ensure_stream_not_ended(meeting_id: str, segment_seq: int):
             "",
             message=f"stream already ended for meeting {meeting_id}, cannot append FINAL seq={segment_seq}",
         )
+
+
+def _existing_final(
+    db: Session, meeting_id: str, event: transcript_schemas.TranscriptEvent
+) -> bool:
+    """True iff this FINAL event is a retry of an already-persisted segment.
+
+    Matches the idempotency lookup inside handle_final (Case A: same event_id,
+    Case C: same (meeting_id, segment_seq)). Used to let canonical retries pass
+    the accepting-state gate after the meeting is COMPLETED.
+    """
+    if event.segment_seq is None:
+        return False
+    return (
+        transcript_repository.get_by_event_id(db, meeting_id, event.event_id) is not None
+        or transcript_repository.get_by_seq(db, meeting_id, event.segment_seq) is not None
+    )
 
 
 def handle_final(
