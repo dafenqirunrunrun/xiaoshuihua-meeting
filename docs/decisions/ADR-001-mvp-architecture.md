@@ -38,6 +38,9 @@ CREATED → IN_PROGRESS → FINALIZING → COMPLETED
 ### D4. PARTIAL / FINAL 严格分离
 
 - PARTIAL：进程内 cache（key = meeting_id + utterance_id），不落正式表，可覆盖。
+  - 生命周期为 **Backend Process Scoped Temporary State**，与 Frontend / Browser Session /
+    SSE Connection 完全解耦。没有 SSE 连接时 Backend 依然持续接收并维护 PARTIAL。
+  - 进程重启后 PARTIAL 丢失可接受（非 Source of Truth）。
 - FINAL：唯一允许持久化的正式事实。
 - 处理顺序固定：Receive → Validate → Idempotency → Persist → Commit Success → (SSE 后续)。
   禁止先广播后落库。
@@ -72,6 +75,23 @@ CREATED → IN_PROGRESS → FINALIZING → COMPLETED
 
 Agent / Multi-Agent / Memory / RAG / Discussion Node / Todo / Decision / 向量库 /
 跨会议检索 / 声纹映射 / 自动议题 / 真实音频链路 / 复杂权限 / AI Chat / 知识库。
+
+### D10. PARTIAL cache 生命周期 = Backend Process Scoped
+
+- `live_utterance_cache` 生命周期与 Frontend / Browser Session / SSE Connection 完全解耦。
+- 没有任何 SSE 连接时 Backend 依然持续接收 PARTIAL、更新 cache、接收 FINAL、持久化 FINAL。
+- 进程重启 PARTIAL 丢失可接受（非 Source of Truth）。多实例 → Redis。
+
+### D11. STREAM_END 必须持久化 + 共享锁（Step 4）
+
+- STREAM_END 落盘 `transcript_stream`（重启后幂等 retry 仍 200，Case 12 实证）。
+- FINAL ingest 与 STREAM_END 完整性检查共享同一 per-meeting RLock
+  （`lock_registry.meeting_lock`），互斥于同一个同步边界。
+- 一个 Stream 只有一个确定终点：接受 `last=3` 后 `last=4` → 409。
+- 缺 `last_segment_seq` 必须不是 append-only 起点：新 FINAL after end → 409；
+  已存在 FINAL 幂等 retry → 200。
+- 当前为 single-process 方案；multi-worker / multi-instance / PostgreSQL 必须升级为
+  数据库级并发控制（见 D8）。不得把进程内锁当作跨进程锁。
 
 ## 后果
 

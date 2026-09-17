@@ -24,6 +24,7 @@ from app.exceptions import (
 from app.repositories import transcript_repository
 from app.schemas import transcript as transcript_schemas
 from app.services.live_utterance_cache import live_utterance_cache
+from app.services.lock_registry import meeting_lock
 
 # Meeting statuses that are allowed to receive transcript events (arch §4).
 # IN_PROGRESS: normal receive. FINALIZING: ASR may still emit last few FINALs.
@@ -52,21 +53,27 @@ def handle_event(
     path_meeting_id: str,
     event: transcript_schemas.TranscriptEvent,
 ) -> None:
-    """Validate, gate, and apply a single transcript event."""
+    """Validate, gate, and apply a single transcript event.
 
+    Both PARTIAL and FINAL run under the meeting's shared lock (lock_registry)
+    so they are atomic w.r.t. the STREAM_END integrity check for the same
+    meeting (Step 4 §9). PARTIAL has no DB side effects but we still serialize
+    for determinism of the FINAL/STREAM_END boundary.
+    """
     # --- Path/payload meeting_id consistency (PRD §49.1, arch §3) ---------
     if event.meeting_id != path_meeting_id:
         raise TranscriptValidationError(
             f"path meeting_id {path_meeting_id} != payload meeting_id {event.meeting_id}"
         )
 
-    # --- Meeting existence + accepting state -------------------------------
-    _require_meeting_accepting(db, path_meeting_id)
+    with meeting_lock(path_meeting_id):
+        # --- Meeting existence + accepting state -----------------------------
+        _require_meeting_accepting(db, path_meeting_id)
 
-    if event.status == "PARTIAL":
-        handle_partial(db, path_meeting_id, event)
-    else:  # FINAL
-        handle_final(db, path_meeting_id, event)
+        if event.status == "PARTIAL":
+            handle_partial(db, path_meeting_id, event)
+        else:  # FINAL
+            handle_final(db, path_meeting_id, event)
 
 
 def handle_partial(
@@ -86,6 +93,22 @@ def handle_partial(
     )
 
 
+def _ensure_stream_not_ended(meeting_id: str, segment_seq: int):
+    """Reject FINAL after an accepted STREAM_END (Part 8; no silent append).
+
+    Must be called under the meeting lock (both FINAL and stream-end paths use
+    meeting_lock), so this read is consistent with the STREAM_END write.
+    """
+    from app.services.stream_service import stream_has_ended
+
+    if stream_has_ended(meeting_id):
+        raise TranscriptConflictError(
+            meeting_id,
+            "",
+            message=f"stream already ended for meeting {meeting_id}, cannot append FINAL seq={segment_seq}",
+        )
+
+
 def handle_final(
     db: Session,
     meeting_id: str,
@@ -97,7 +120,14 @@ def handle_final(
             f"FINAL event {event.event_id} missing segment_seq"
         )
 
+    # After an accepted STREAM_END, no new FINAL may be appended (Part 8).
+    # Idempotent re-sends of an EXISTING FINAL are perfectly fine and handled
+    # by the checks below, but a NEW segment must be rejected.
     existing_by_event = transcript_repository.get_by_event_id(db, meeting_id, event.event_id)
+    existing_by_seq = transcript_repository.get_by_seq(db, meeting_id, event.segment_seq)
+    is_existing = existing_by_event is not None or existing_by_seq is not None
+    if not is_existing:
+        _ensure_stream_not_ended(meeting_id, event.segment_seq)
 
     # Case A: same event_id already persisted.
     if existing_by_event is not None:
@@ -105,7 +135,6 @@ def handle_final(
         return  # idempotent retry, no re-INSERT (PRD §24 / Case A)
 
     # Case C: same (meeting_id, segment_seq) already persisted (different event_id).
-    existing_by_seq = transcript_repository.get_by_seq(db, meeting_id, event.segment_seq)
     if existing_by_seq is not None:
         _ensure_identical(existing_by_seq, event, event_id_conflict=False)
         return  # same seq + same canonical content -> idempotent

@@ -52,3 +52,11 @@ class TranscriptSnapshot(BaseModel):
 
     meeting_id: str
     segments: list[TranscriptSegmentOut]
+
+
+class StreamEndOut(BaseModel):
+    """POST stream-end response (Step 4 §11)."""
+
+    meeting_id: str
+    last_segment_seq: int | None
+    transcript_complete: bool

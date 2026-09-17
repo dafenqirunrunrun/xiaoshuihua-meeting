@@ -3,7 +3,7 @@
 Insert / query only. Idempotency decisions live in transcript_service.
 """
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app import models
@@ -43,3 +43,28 @@ def list_sorted(db: Session, meeting_id: str) -> list[models.TranscriptSegment]:
             .order_by(models.TranscriptSegment.segment_seq.asc())
         )
     )
+
+
+def max_seq(db: Session, meeting_id: str) -> int | None:
+    """Max segment_seq for a meeting (None if empty)."""
+    return db.scalar(select(func.max(models.TranscriptSegment.segment_seq)).where(
+        models.TranscriptSegment.meeting_id == meeting_id
+    ))
+
+
+# --- Transcript stream end ---------------------------------------------
+
+def get_stream_end(db: Session, meeting_id: str) -> models.TranscriptStream | None:
+    return db.get(models.TranscriptStream, meeting_id)
+
+
+def insert_stream_end(
+    db: Session, meeting_id: str, last_segment_seq: int
+) -> models.TranscriptStream:
+    stream = models.TranscriptStream(
+        meeting_id=meeting_id, last_segment_seq=last_segment_seq, status="ACCEPTED"
+    )
+    db.add(stream)
+    db.commit()
+    db.refresh(stream)
+    return stream

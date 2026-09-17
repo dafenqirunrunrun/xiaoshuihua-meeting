@@ -1,15 +1,15 @@
-"""live_utterance_cache: process-local PARTIAL store.
+"""live_utterance_cache: process-local, Backend-Process-scoped PARTIAL store.
 
-PARTIAL events never touch the DB. They are UI-only transient state,
-keyed by meeting_id + utterance_id. PRD §22, ADR D4, architecture §5.1.
+PARTIAL events never touch the DB. keyed by meeting_id + utterance_id.
+PRD §22, ADR D4, architecture §5.1.
 
-Lifecycle / limits (documented in reporting, see also architecture §5.1):
-  - In-memory only: entries are lost on process restart; that's acceptable
-    because PARTIAL is never source-of-truth. On Frontend recovery the page
-    re-syncs via Snapshot (FINAL) + SSE; PARTIAL only exists while the SSE
-    connection is alive and emitting.
-  - Process-local: NOT shared across uvicorn workers / instances.
-    Multi-instance / Redis upgrade noted in ADR D3/D8.
+Lifecycle semantics: **Backend Process Scoped Temporary State**.
+  - Fully decoupled from Frontend / Browser Session / SSE Connection lifecycle:
+    the Backend keeps receiving PARTIAL and updating this cache even when there
+    is NO SSE client connected. Downstream connections never gate ingesting.
+  - Entries are lost on process restart; acceptable because PARTIAL is never
+    Source-of-Truth (ADR D3/D4). Future: Redis for multi-instance.
+  - FINAL ingestion deletes the matching PARTIAL entry (PRD §23).
 """
 
 from dataclasses import dataclass, field

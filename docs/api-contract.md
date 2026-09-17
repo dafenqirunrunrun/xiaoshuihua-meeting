@@ -141,6 +141,84 @@ Receive → Validate(status/meeting/seq) → Idempotency Check → Persist → C
 - `UNIQUE(event_id)`（全局，PRD §16）；`UNIQUE(meeting_id, segment_seq)`。
 - 必须先持久化成功（Commit），未来才能广播 SSE（ADR D4）。
 
+### POST /api/internal/meetings/{meeting_id}/stream-end
+
+> 终端 STREAM_END；**持久化落盘**（`transcript_stream` 表），重启不丢失。Step 4。
+
+Request（PRD §25，event_id/meeting_id 必须）：
+
+```json
+{
+  "event_id": "evt_end_001",
+  "meeting_id": "meeting_001",
+  "event_type": "TRANSCRIPT_STREAM_END",
+  "last_segment_seq": 128
+}
+```
+
+- `event_type` 严格要求为 `"TRANSCRIPT_STREAM_END"`（常量），否则 400。
+- `path meeting_id == payload meeting_id`，否则 400（§49.1 精神）。
+
+Response `200 / StreamEndOut`：
+
+```json
+{
+  "meeting_id": "meeting_001",
+  "last_segment_seq": 128,
+  "transcript_complete": true
+}
+```
+
+状态码：
+
+- `200` — 首次接受（已落盘 & 完整性通过），或幂等命中
+- `400` — event_type 非法 / last_segment_seq 缺失 / path≠payload meeting_id
+- `404` — meeting 不存在
+- `409` —
+  - meeting 状态不允许（必须 FINALIZING；CREATED/IN_PROGRESS 拒绝）
+  - Transcript 不完整，存在缺口（`missing segments: [2]`）
+  - DB 已存在比 last 更大的 seq（overrun，禁止静默忽略）
+  - 已经接受过一个不同的 `last_segment_seq`（一个 Stream 只有一个终点）
+
+状态约束（Part 4）：
+
+| 状态 | STREAM_END |
+|---|---|
+| CREATED | 409 |
+| IN_PROGRESS | 409 |
+| FINALIZING | 正常处理（首个） |
+| COMPLETED | 仅幂等 retry（相同 last）返回 200 |
+
+幂等（Part 7）：
+
+- 相同 `last_segment_seq` 已接受 → 再次发送同值 → `200`，不改变首次 `received_at`，不重复后续动作。
+- 已接受 `last=3` 又发 `last=4` → `409`。
+
+完整性检查算法（Part 6）：
+
+```text
+DB FINAL seq 集合  必须 == {1,2,...,last_segment_seq}
+缺口（如 [1,2,4,5] & last=5）→ 409 missing=[3]
+max(DB) > last（如 [1,2,3,4] & last=3）→ 409 overrun
+```
+
+FINAL after Stream End（Part 8）：
+
+- 已存在且内容完全相同的 FINAL retry → `200` 幂等，不增 DB。
+- 新 FINAL（seq 不在 DB）→ `409`，禁止 silent append。
+
+### FINAL 与 STREAM_END 同步边界（Part 9）
+
+- `POST transcript-events`（PARTIAL/FINAL）和 `POST stream-end` 对同一 meeting
+  共享同一个进程内 per-meeting `RLock`（`app/services/lock_registry.py`）。
+- 保证：FINAL 写入与完整性检查互斥；STREAM_END 成功后再不会并发写入新 FINAL。
+- **单进程 MVP 才有效**；多进程/多实例/PostgreSQL 需升级为数据库级并发控制（ADR D8）。
+
+### 持久化（Part 5）
+
+- `transcript_stream` 表：`meeting_id (PK), last_segment_seq, status, received_at`。
+- 重启后再次发送相同 STREAM_END → 仍 `200 幂等`（Case 12 实证）。
+
 ---
 
 ## 3. 领域异常 → HTTP 映射
@@ -159,4 +237,5 @@ Receive → Validate(status/meeting/seq) → Idempotency Check → Persist → C
 - `GET /api/meetings/{meeting_id}/events`（SSE）
 - `GET /api/meetings/{meeting_id}/summary`
 - `POST /api/meetings/{meeting_id}/summary/regenerate`
-- `POST /api/internal/meetings/{meeting_id}/stream-end`
+- Transcript Freeze / FINALIZING → COMPLETED / Summary Pipeline / LLM
+- Mock Producer 的 `--phase` 分阶段能力（当前单次全流）

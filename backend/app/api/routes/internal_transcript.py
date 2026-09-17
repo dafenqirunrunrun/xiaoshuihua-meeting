@@ -12,9 +12,8 @@ from fastapi import APIRouter, Depends, Response, status
 from sqlalchemy.orm import Session
 
 from app.db import get_db
-from app.exceptions import InvalidMeetingStateTransition, MeetingNotFoundError, TranscriptConflictError, TranscriptValidationError
 from app.schemas import transcript as transcript_schemas
-from app.services import transcript_service
+from app.services import stream_service, transcript_service
 
 router = APIRouter(tags=["internal"])
 
@@ -28,3 +27,18 @@ def ingest_transcript_event(
     """Ingest a single PARTIAL / FINAL transcript event (idempotent for FINAL)."""
     transcript_service.handle_event(db, meeting_id, event)
     return Response(status_code=status.HTTP_200_OK)
+
+
+@router.post("/internal/meetings/{meeting_id}/stream-end", response_model=transcript_schemas.StreamEndOut)
+def ingest_stream_end(
+    meeting_id: str,
+    payload: transcript_schemas.StreamEndEvent,
+    db: Session = Depends(get_db),
+) -> transcript_schemas.StreamEndOut:
+    """Accept the terminal TRANSCRIPT_STREAM_END after integrity check (durable)."""
+    meeting, stream, complete = stream_service.handle_stream_end(db, meeting_id, payload)
+    return transcript_schemas.StreamEndOut(
+        meeting_id=meeting.id,
+        last_segment_seq=stream.last_segment_seq,
+        transcript_complete=complete,
+    )

@@ -79,8 +79,20 @@ MVP：进程内 live_utterance_cache（key: meeting_id + utterance_id）
 后续可替换 Redis（跨实例）
 ```
 
+**生命周期语义：`Backend Process Scoped Temporary State`**
+
+```text
+与 Frontend / Browser Session / SSE Connection 生命周期完全解耦
+```
+
+- 即使当前没有任何 SSE 连接，Backend 依然可继续接收 PARTIAL、更新 cache、接收 FINAL、持久化 FINAL。
+- cache 只为 Backend 自己服务：临时保存最新 PARTIAL，供（未来 SSE）推送给订阅者时使用——它不依赖任何下游连接存在。
+- 进程重启后 PARTIAL 丢失可接受：PARTIAL 不是 Source of Truth（ADR D3/D4）。
+
+规则：
+
 - 同一 utterance 的后续 PARTIAL 覆盖旧值，禁止无限 append。
-- 收到对应 utterance 的 FINAL 后，删除该 cache 条目。
+- 收到对应 utterance 的 FINAL 后，删除该 cache 条目（PRD §23，Step 3 Part 8）。
 
 ### 5.2 FINAL
 
@@ -126,6 +138,26 @@ Receive incremental events
   完整性确认（最后已保存 seq == last_segment_seq，且无显式缺口）→ Freeze。
 - **禁止** `sleep(3)` 等固定等待猜测 ASR 已结束。
 - Freeze 后不允许 silent append；COMPLETED 后收到 Transcript → 409。
+
+### 7.1 STREAM_END 持久化（Step 4）
+
+- STREAM_END 不能只存内存：重启会遗忘。落盘到 `transcript_stream` 表
+  （`meeting_id PK, last_segment_seq, status, received_at`）。
+- 幂等：同值重发 → 200 不改变首选 `received_at`；异值 → 409（一个 Stream 一个终点）。
+- 状态门：仅 `FINALIZING` 接受首个 STREAM_END；CREATED/IN_PROGRESS → 409；
+  COMPLETED 仅幂等 retry。
+- 完整性：FINAL seq 必须恰为 `1..last_segment_seq`；显式缺口 → 409 `missing=[...]`；
+  `max(seq) > last` → 409（overrun，不得静默忽略）。
+
+### 7.2 FINAL 与 STREAM_END 共享同步边界（Step 4）
+
+```text
+FINAL ingest  +  STREAM_END integrity check
+       二者共用同一个 per-meeting RLock（lock_registry.meeting_lock）
+```
+
+- 避免：FINAL 写入与完整性检查并发竞态、STREAM_END 成功后再并发写新 FINAL。
+- 单进程 MVP 有效；多进程/多实例必须升级为 DB 级并发控制（ADR D8）。
 
 ## 8. 分层与并发
 
