@@ -28,10 +28,15 @@ if _db_path.startswith("sqlite:///"):
     _file = _db_path.removeprefix("sqlite:///")
     pathlib.Path(os.path.dirname(_file) or ".").mkdir(parents=True, exist_ok=True)
 
-engine = create_engine(
-    settings.database_url,
-    connect_args={"check_same_thread": False} if _db_path.startswith("sqlite") else {},
-)
+_connect_args: dict = {}
+if _db_path.startswith("sqlite"):
+    # check_same_thread: FastAPI story threadpool + sync sessions.
+    # timeout: SQLite busy timeout (seconds) — lets concurrent writers wait for
+    # the write lock instead of failing with "database is locked". MVP single
+    # writer; see report for PostgreSQL hardening notes.
+    _connect_args = {"check_same_thread": False, "timeout": 30}
+
+engine = create_engine(settings.database_url, connect_args=_connect_args)
 
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
 

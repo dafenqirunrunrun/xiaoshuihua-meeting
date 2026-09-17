@@ -13,7 +13,7 @@ PRD §48:
 Step 1: only POST create + GET one. Others implemented in later steps.
 """
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends
 from sqlalchemy.orm import Session
 
 from app.db import get_db
@@ -30,7 +30,16 @@ def create_meeting(payload: meeting_schemas.MeetingCreate, db: Session = Depends
 
 @router.get("/{meeting_id}", response_model=meeting_schemas.MeetingOut)
 def get_meeting(meeting_id: str, db: Session = Depends(get_db)):
-    meeting = meeting_service.get_meeting(db, meeting_id)
-    if meeting is None:
-        raise HTTPException(status_code=404, detail=f"meeting not found: {meeting_id}")
-    return meeting
+    return meeting_service.get_meeting(db, meeting_id)
+
+
+@router.post("/{meeting_id}/start", response_model=meeting_schemas.MeetingOut)
+def start_meeting(meeting_id: str, db: Session = Depends(get_db)):
+    """CREATED → IN_PROGRESS. Idempotent; 409 if already FINALIZING/COMPLETED."""
+    return meeting_service.start_meeting(db, meeting_id)
+
+
+@router.post("/{meeting_id}/finish", response_model=meeting_schemas.MeetingOut)
+def finish_meeting(meeting_id: str, db: Session = Depends(get_db)):
+    """IN_PROGRESS → FINALIZING. Idempotent; 409 if still CREATED."""
+    return meeting_service.finish_meeting(db, meeting_id)
