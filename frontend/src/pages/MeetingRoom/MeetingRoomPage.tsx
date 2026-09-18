@@ -1,11 +1,13 @@
 import { useEffect, useState } from 'react'
 import { useNavigate, useParams } from 'react-router-dom'
-import { Button, Skeleton, Tag } from 'antd'
+import { Button, Skeleton, Tag, message, Popconfirm } from 'antd'
 import {
   ClockCircleOutlined,
   AudioOutlined,
   ReloadOutlined,
   ArrowLeftOutlined,
+  PlayCircleOutlined,
+  StopOutlined,
 } from '@ant-design/icons'
 import { EmptyPlaceholder } from '@/components/EmptyPlaceholder'
 import { InfoRow } from '@/components/InfoRow'
@@ -13,6 +15,7 @@ import { MeetingStatusTag } from '@/components/MeetingStatusTag'
 import { useMeetingStore } from '@/stores/meetingStore'
 import { useMeetingLoad } from '@/hooks/useMeetingLoad'
 import { formatDateTime, formatDuration, elapsedMs } from '@/utils/time'
+import { startMeeting, finishMeeting, normalizeApiError } from '@/api'
 import type { Meeting } from '@/types/meeting'
 
 /** 实时秒数刷新 hook：仅 active 时以 1s 步进更新，unmount 或 active 变 false 即清理。 */
@@ -57,7 +60,7 @@ function transcriptPlaceholder(status: Meeting['status']) {
   switch (status) {
     case 'IN_PROGRESS':
       return {
-        title: '实时记录将在 Step 8B-3/8B-4 接入',
+        title: '实时转写将在下一阶段接入',
         description: '会议进行中。实时转写与 AI 纪要将在后续步骤接入。',
       }
     case 'FINALIZING':
@@ -94,8 +97,11 @@ function transcriptTag(status: Meeting['status']) {
 }
 
 /**
- * Meeting Room —— Step 8B-1 真实 GET Meeting 驱动 + CREATED 会前准备状态。
- * 创建 ≠ 开始：CREATED 只展示「准备开始会议」信息，不自动记录 / 不显示记录态。
+ * Meeting Room —— Step 8B-1 真实 GET Meeting 驱动 + 8B-2 生命周期（start/finish）。
+ * 创建 ≠ 开始：CREATED 展示「准备开始会议」，点击「开始会议」→ POST /start → IN_PROGRESS；
+ * IN_PROGRESS 可「结束会议」→ POST /finish → FINALIZING。
+ * Server 是 Source of Truth：start/finish 均以 backend 返回的 Meeting 覆盖 store，
+ * 前端绝不自行写 status / started_at / COMPLETED。
  * 8B-3/8B-4 才接入 Snapshot + SSE 实时转写；此处不调用 transcript / summary 接口。
  */
 export function MeetingRoomPage() {
@@ -106,6 +112,7 @@ export function MeetingRoomPage() {
   const loading = useMeetingStore((s) => s.loading)
   const error = useMeetingStore((s) => s.error)
   const setError = useMeetingStore((s) => s.setError)
+  const setMeeting = useMeetingStore((s) => s.setMeeting)
 
   // 重试：bump reloadKey → hook 重新 GET 同一 meeting
   const [reloadKey, setReloadKey] = useState(0)
@@ -119,6 +126,38 @@ export function MeetingRoomPage() {
     meeting?.status === 'IN_PROGRESS' && meeting.started_at
       ? formatDuration(elapsedMs(meeting.started_at, new Date(now)))
       : '--'
+
+  // ---- 生命周期动作（Step 8B-2）：start / finish，仅经 API layer ----
+  const [startLoading, setStartLoading] = useState(false)
+  const [finishLoading, setFinishLoading] = useState(false)
+
+  const handleStart = async () => {
+    if (!meetingId) return
+    setStartLoading(true)
+    try {
+      const updated = await startMeeting(meetingId)
+      // Server 是 Source of Truth：用 backend 返回的 Meeting 覆盖 store
+      setMeeting(updated)
+    } catch (raw: unknown) {
+      // 失败：保留当前状态，展示后端语义（409 detail 等），按钮恢复可点
+      message.error(normalizeApiError(raw).message)
+    } finally {
+      setStartLoading(false)
+    }
+  }
+
+  const handleFinish = async () => {
+    if (!meetingId) return
+    setFinishLoading(true)
+    try {
+      const updated = await finishMeeting(meetingId)
+      setMeeting(updated)
+    } catch (raw: unknown) {
+      message.error(normalizeApiError(raw).message)
+    } finally {
+      setFinishLoading(false)
+    }
+  }
 
   // 首次加载（且尚未拿到 meeting 或错误）→ 轻量 Skeleton，不闪现 demo 值
   if (loading && !meeting && !error) {
@@ -185,14 +224,19 @@ export function MeetingRoomPage() {
 
   if (!meeting) return null
 
-  // ---- CREATED：会前准备（8B-1 不做 start，按钮 disabled 注明后续接入） ----
+  // ---- CREATED：会前准备 + 真实「开始会议」（Step 8B-2 启用） ----
   if (meeting.status === 'CREATED') {
     return (
       <div className="page page--wide" style={{ minHeight: 0 }}>
         <Header
           meeting={meeting}
           action={
-            <Button type="primary" disabled title="开始记录将在下一步接入">
+            <Button
+              type="primary"
+              icon={<PlayCircleOutlined />}
+              loading={startLoading}
+              onClick={handleStart}
+            >
               开始会议
             </Button>
           }
@@ -229,10 +273,25 @@ export function MeetingRoomPage() {
 
   // ---- 其它状态：IN_PROGRESS / FINALIZING / COMPLETED ----
   const placeholder = transcriptPlaceholder(meeting.status)
+  // 四态动作严格：只有 IN_PROGRESS 显示「结束会议」；FINALIZING / COMPLETED 无 start/finish
+  const headerAction =
+    meeting.status === 'IN_PROGRESS' ? (
+      <Popconfirm
+        title="结束会议后将进入收尾阶段，是否继续？"
+        okText="结束会议"
+        cancelText="取消"
+        okButtonProps={{ danger: true, loading: finishLoading }}
+        onConfirm={handleFinish}
+      >
+        <Button type="primary" danger icon={<StopOutlined />} loading={finishLoading}>
+          结束会议
+        </Button>
+      </Popconfirm>
+    ) : undefined
+
   return (
     <div className="page page--wide" style={{ minHeight: 0 }}>
-      {/* 8B-1：结束/开始动作在 8B-2 接入，此处不留误导性按钮 */}
-      <Header meeting={meeting} />
+      <Header meeting={meeting} action={headerAction} />
 
       <div className="room__body">
         <section className="room__transcript">
