@@ -210,6 +210,41 @@ existing implementation
   - `useAutoScroll`：底部附近跟随 / 向上查历史暂停 + 「回到底部」/ 首次 instant。
     纯 UI，不影响数据语义。PARTIAL 次级轻量（opacity），FINAL 正式稳定。
   - **Backend 零业务修改**；未处理 summary.* 事件（8C）。
+- **Step 8B-5 已完成**：Meeting Workspace UI Polish（`style(frontend): polish meeting workspace experience`，未 push）。
+  - **纯展示层**：不改变任何数据语义 / SSE 协议 / store 结构 / 四态机（8B-1~8B-4 逻辑原样保留）。
+    视觉体系 = 冰蓝工作台：Primary `#3478F6` / AI-Live Mint `#20B486` / Page BG `#F6F9FC` /
+    Card `#FFF` / Border `#E8EEF5` / Text `#172033·#48556A·#8A97AA`；radius 10/12/16；
+    内容 max 1200px；边框优先、阴影极弱（hover 略升）。
+  - **Design Tokens**（`designTokens.ts` 唯一数据源）：新增 `colorMint/colorMintLight`、
+    `shadowCard/shadowCardHover`、`motionFast/motionBase`、`railWidth`；`antdTheme`
+    Menu/Button/Card/Tabs 圆角对齐。CSS 变量见 `global.css :root`。
+  - **Home Hero**：左文右画 ——「小水华，让每一次会议更清晰」+ 唯一 Primary CTA「创建会议」
+    + 次级「查看会议」；`HeroIllustration.tsx`（inline SVG：浮起转写卡片 / 波形 live 线 /
+    呼吸圆点 / 植物，`pointer-events:none`，窄屏淡出）。最近会议保持真实空态。
+  - **Meeting Room 四态展示**（数据逻辑零改动）：CREATED = 圆形麦克风 + `ripple-ring`
+    呼吸环 +「开始会议」（真实 handleStart）；IN_PROGRESS = `● 实时记录` + hint
+    「AI 实时转写 · 自动保存」；FINALIZING =「正在整理会议」+ 三态指示条
+    （✓会议已结束 / ●转写收尾中 / ○AI纪要等待生成，无 fake 百分比）；COMPLETED =
+    「会议已完成」横幅 +「查看会议结果」CTA（`navigate(/meetings/:id/result)`）。
+  - **Transcript**：FINAL = meeting-notes（speaker 弱化小字 + 正文次行，非聊天气泡）；
+    PARTIAL = 次级轻量 + 小薄荷 live 点 +「识别中」+ 原地覆盖；FAB 悬浮右下。
+  - **微交互（CSS-only）**：按钮 hover -2px / active 0.98、卡片 hover 上升阴影增强、
+    侧栏选中浅蓝胶囊 + hover 图标轻推、FAB 出现轻升 / 点击微压、live-dot 2.2s 呼吸；
+    `@media (prefers-reduced-motion: reduce)` 全停 transform / 脉冲 / 平滑滚动。
+    无 Framer Motion / GSAP。
+  - **Responsive**：`≥1200` 双列 / `900–1199` 窄轨 260px / `<900` 单列 + 右轨下移；
+    hero 插画窄屏淡出；无横向滚动。
+  - **侧栏**：品牌 + 导航（选中浅蓝胶囊）+ 底部 tagline「让每一次会议，都有回响。」
+    （浅薄荷装饰板）。
+  - **Meetings / Settings / Result**：头部 + 副标题文案；Meetings 真实空态；Settings
+    分组入口（模型设置 / 数据管理 / 关于我们），无 API Key 输入；Result 双 Tab + 四区
+    纪要骨架原样。
+  - **验证**：`npm run typecheck` PASS + `npm run build` PASS；7 张截图（Home /
+    Meetings / Room-CREATED / IN_PROGRESS / FINALIZING / Result / Settings）通过
+    headless Chrome 生成；UI-01~UI-14 回归（创建 / 开始 / PARTIAL / FINAL / 结束 /
+    FINALIZING / COMPLETED / 结果页跳转）实测通过；**Backend 零修改**。
+  - 明确不做：fake 数据（无会议列表 / 头像 / 时间戳 / 摘要）、动画库、API Key 输入；
+    不进入 8C。
 
 
 ## 常用命令

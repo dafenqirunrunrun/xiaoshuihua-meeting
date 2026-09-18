@@ -5,7 +5,7 @@ import { EmptyPlaceholder } from '@/components/EmptyPlaceholder'
 const { Title } = Typography
 
 /**
- * Meeting Result —— Step 8A.1 视觉落地。
+ * Meeting Result —— Step 8A.1 视觉落地 + 8B-5 骨架打磨。
  * 双 Tab（会议纪要 / 会议内容）保留；纪要 tab 建立 Overview / Topics /
  * Conclusions / Open Questions 四区信息层级（8C 用真实数据填充）。
  */
@@ -17,17 +17,17 @@ export function MeetingResultPage() {
           会议结果
         </Title>
         <div className="result-head__meta">
-          <span>2026-09-17</span>
-          <span>·</span>
+          <span>会议纪要</span>
+          <span aria-hidden>·</span>
           <span>时长待计算</span>
-          <span>·</span>
+          <span aria-hidden>·</span>
           <span>已完成</span>
         </div>
       </div>
 
       <Card
         className="result-tabs"
-        style={{ borderRadius: 14, borderColor: '#EEF0F4' }}
+        style={{ borderRadius: 16, borderColor: '#E8EEF5' }}
         styles={{ body: { padding: '4px 24px 24px' } }}
       >
         <Tabs

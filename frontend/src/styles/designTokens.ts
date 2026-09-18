@@ -1,6 +1,6 @@
 /**
  * Design Tokens —— 视觉「轻量、克制、现代 AI Meeting Workspace」的唯一数据源。
- * （fronted_designer §47 色值 + 本次 Visual Polish）
+ * （fronted_designer §47 色值 + Step 8B-5 Visual Polish：冰蓝工作台 + 薄荷呼吸点）
  *
  * 规则：
  *  - 组件 / 页面禁止散落 magic color / radius / spacing；
@@ -9,34 +9,49 @@
  */
 export const designTokens = {
   // Brand —— 克制使用：主 CTA、激活态、live 指示
-  colorPrimary: '#2F6BFF',
-  colorPrimaryHover: '#4C7DFF',
-  colorPrimaryActive: '#1F5AE0',
-  colorPrimaryLight: '#EEF4FF',
+  colorPrimary: '#3478F6',
+  colorPrimaryHover: '#5592FF',
+  colorPrimaryActive: '#1F63E8',
+  colorPrimaryLight: '#EDF4FF',
+
+  // AI / Live —— 只在「实时 / AI / 就绪」信号使用，绝不用于纯 decoration
+  colorMint: '#20B486',
+  colorMintLight: '#E6F7F2',
 
   // Semantic
-  colorSuccess: '#22B573',
+  colorSuccess: '#20B486',
   colorWarning: '#F5A623',
   colorDanger: '#F04438',
 
-  // Neutrals —— 安静、高可读
-  colorBgPage: '#F7F9FC',
+  // Neutrals —— 冰蓝底、纯白卡片、蓝墨字
+  colorBgPage: '#F6F9FC',
   colorBgSurface: '#FFFFFF',
-  colorBgSubtle: '#F2F4F8',
-  colorTextPrimary: '#1F2937',
-  colorTextSecondary: '#5F6B7A',
-  colorTextTertiary: '#98A2B3',
-  colorBorder: '#E4E7EC',
-  colorBorderLight: '#EEF0F4',
+  colorBgSubtle: '#F1F5FA',
+  colorTextPrimary: '#172033',
+  colorTextSecondary: '#48556A',
+  colorTextTertiary: '#8A97AA',
+  colorBorder: '#E8EEF5',
+  colorBorderLight: '#EEF3F9',
 
-  // Radius —— 统一、收敛
-  radiusSm: 8,
-  radiusMd: 10,
-  radiusLg: 14,
+  // Radius —— 主卡 16 / 小组件 12 / 按钮 10
+  radiusSm: 10,
+  radiusMd: 12,
+  radiusLg: 16,
+
+  // Shadow —— 非常弱，hover 略升；边框优先于阴影
+  shadowCard:
+    '0 1px 2px rgba(23, 32, 51, 0.04), 0 4px 12px rgba(23, 32, 51, 0.04)',
+  shadowCardHover:
+    '0 2px 4px rgba(23, 32, 51, 0.05), 0 12px 28px rgba(23, 32, 51, 0.09)',
 
   // Layout
   sidebarWidth: 220,
-  contentMaxWidth: 1080,
+  contentMaxWidth: 1200,
+  railWidth: 300,
+
+  // Motion —— 统一时长，克制使用
+  motionFast: 160,
+  motionBase: 200,
 
   spacing: [4, 8, 12, 16, 24, 32, 40, 48] as const,
 } as const
@@ -77,15 +92,21 @@ export const antdTheme = {
       bodyBg: designTokens.colorBgPage,
     },
     Menu: {
-      itemBorderRadius: designTokens.radiusSm,
+      itemBorderRadius: designTokens.radiusMd,
       itemSelectedBg: designTokens.colorPrimaryLight,
       itemSelectedColor: designTokens.colorPrimary,
-      itemHeight: 38,
-      itemMarginInline: 8,
+      itemHoverBg: designTokens.colorBgSubtle,
+      itemHeight: 40,
+      itemMarginInline: 10,
       itemMarginBlock: 4,
     },
     Button: {
       fontWeight: 500,
+      borderRadius: designTokens.radiusSm,
+      contentFontSize: 14,
+    },
+    Card: {
+      borderRadiusLG: designTokens.radiusLg,
     },
     Tabs: {
       itemSelectedColor: designTokens.colorPrimary,

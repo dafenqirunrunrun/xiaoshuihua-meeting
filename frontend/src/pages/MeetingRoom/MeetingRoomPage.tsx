@@ -2,13 +2,15 @@ import { useEffect, useRef, useState } from 'react'
 import { useNavigate, useParams } from 'react-router-dom'
 import { Button, Skeleton, Tag, message, Popconfirm } from 'antd'
 import {
-  ClockCircleOutlined,
   AudioOutlined,
   ReloadOutlined,
   ArrowLeftOutlined,
   PlayCircleOutlined,
   StopOutlined,
   ArrowDownOutlined,
+  CheckOutlined,
+  CheckCircleFilled,
+  FileTextOutlined,
 } from '@ant-design/icons'
 import { EmptyPlaceholder } from '@/components/EmptyPlaceholder'
 import { InfoRow } from '@/components/InfoRow'
@@ -83,13 +85,13 @@ function transcriptPlaceholder(status: Meeting['status']) {
   }
 }
 
-/** 便于阅读的时长偏移：无起止时间则隐藏，不制造时间戳（8B-3 只展示真实字段）。 */
+/** 便于阅读的时长偏移：无起止时间则隐藏，不制造时间戳（只展示真实字段）。 */
 function timingText(startMs: number | null, endMs: number | null): string {
   if (startMs === null || endMs === null) return ''
   return `${(startMs / 1000).toFixed(1)}s`
 }
 
-/** 实时转写状态标签（8B-4）：meeting.status 与 streamStatus 是两个不同维度 */
+/** 实时转写状态标签：meeting.status 与 streamStatus 是两个不同维度。 */
 function streamStatusTag(
   meetingStatus: Meeting['status'],
   streamStatus: ReturnType<typeof useMeetingStore.getState>['streamStatus'],
@@ -98,12 +100,12 @@ function streamStatusTag(
     case 'CREATED':
       return <Tag color="default">等待会议开始</Tag>
     case 'IN_PROGRESS':
-      if (streamStatus === 'connected') return <Tag color="blue">实时转写已连接</Tag>
-      if (streamStatus === 'reconnecting') return <Tag color="warning">正在重新连接</Tag>
+      if (streamStatus === 'connected') return <Tag color="success">实时转写已连接</Tag>
+      if (streamStatus === 'reconnecting') return <Tag color="warning">重新连接中</Tag>
       if (streamStatus === 'connecting') return <Tag color="processing">连接中...</Tag>
       return <Tag color="default">等待实时连接</Tag>
     case 'FINALIZING':
-      if (streamStatus === 'connected') return <Tag color="processing">正在接收最后转写</Tag>
+      if (streamStatus === 'connected') return <Tag color="success">正在接收最后转写</Tag>
       return <Tag color="default">正在收尾</Tag>
     case 'COMPLETED':
       return <Tag>转写已结束</Tag>
@@ -114,7 +116,7 @@ function streamStatusTag(
 
 /**
  * 转写内容区：已持久化 FINAL（正式稳定）+ 实时 PARTIAL（次级轻量）+ 空态 / 失败态。
- * 8B-4 才做 PARTIAL 展示与自动滚动；不做大面积动画 / streaming 光标。
+ * meeting-notes 风格（非聊天气泡）：speaker 弱化小字，PARTIAL 带小薄荷 live 点。
  */
 function TranscriptBody({
   status,
@@ -199,6 +201,7 @@ function TranscriptBody({
         ))}
         {partials.map((p) => (
           <li key={p.utterance_id} className="transcript-segment transcript-segment--partial">
+            <span className="transcript-segment__live" aria-hidden />
             <span className="transcript-segment__speaker">{p.speaker_id}</span>
             <span className="transcript-segment__text">{p.text}</span>
             <span className="transcript-segment__time">识别中</span>
@@ -222,14 +225,15 @@ function summaryTag(status: Meeting['status']) {
 
 /**
  * Meeting Room —— Step 8B-1 真实 GET Meeting 驱动 + 8B-2 生命周期（start/finish）
- * + 8B-3 Transcript Snapshot（已持久化 FINAL 恢复展示）+ 8B-4 实时 SSE + 自动滚动。
- * 创建 ≠ 开始：CREATED 展示「准备开始会议」，点击「开始会议」→ POST /start → IN_PROGRESS；
- * IN_PROGRESS 可「结束会议」→ POST /finish → FINALIZING。
+ * + 8B-3 Transcript Snapshot（已持久化 FINAL 恢复展示）+ 8B-4 实时 SSE + 自动滚动
+ * + 8B-5 Visual Polish（结构 = Header → 主工作区(转写面板 + 右信息轨)）。
+ * 创建 ≠ 开始：CREATED 展示「准备开始会议」（圆形麦克风 + ripple），点击「开始会议」
+ * → POST /start → IN_PROGRESS；IN_PROGRESS 可「结束会议」→ POST /finish → FINALIZING。
  * Server 是 Source of Truth：start/finish 均以 backend 返回的 Meeting 覆盖 store，
  * 前端绝不自行写 status / started_at / COMPLETED。
  * 恢复模型：GET Meeting → GET Transcript Snapshot → maxSeq → SSE after_segment_seq。
  * SSE 只是实时通知通道，不是事实源（断 ≠ 丢；刷新走 Snapshot 恢复）。
- * 8B-4 不处理 summary.* 事件（留给 8C）。
+ * 8B-5 只改展示层：数据逻辑（hooks / store / SSE）原样保留。
  */
 export function MeetingRoomPage() {
   const { meetingId } = useParams<{ meetingId: string }>()
@@ -388,49 +392,53 @@ export function MeetingRoomPage() {
 
   if (!meeting) return null
 
-  // ---- CREATED：会前准备 + 真实「开始会议」（Step 8B-2 启用） ----
+  // ---- CREATED：会前准备（主工作区 + 右轨），真实「开始会议」（Step 8B-2 启用） ----
   if (meeting.status === 'CREATED') {
     return (
       <div className="page page--wide" style={{ minHeight: 0 }}>
-        <Header
-          meeting={meeting}
-          action={
-            <Button
-              type="primary"
-              icon={<PlayCircleOutlined />}
-              loading={startLoading}
-              onClick={handleStart}
-            >
-              开始会议
-            </Button>
-          }
-        />
+        <Header meeting={meeting} />
 
-        <div style={{ marginTop: 24 }}>
-          <EmptyPlaceholder
-            icon={<ClockCircleOutlined />}
-            title="准备开始会议"
-            description="开始会议后，小水华将实时记录会议内容，并在会议结束后自动生成纪要。"
-          />
+        <div className="room__body">
+          <section className="room__transcript">
+            <div className="room__prep">
+              <div className="prep-orb">
+                <AudioOutlined />
+              </div>
+              <div className="prep-title">准备开始会议</div>
+              <div className="prep-desc">
+                开始会议后，小水华将实时记录会议内容，并在会议结束后自动生成纪要。
+              </div>
+              <div style={{ marginTop: 14 }}>
+                <Button
+                  type="primary"
+                  size="large"
+                  icon={<PlayCircleOutlined />}
+                  loading={startLoading}
+                  onClick={handleStart}
+                >
+                  开始会议
+                </Button>
+              </div>
+            </div>
+          </section>
+
+          <aside className="room__rail">
+            <div className="rail-section">
+              <div className="rail-title">会议状态</div>
+              <InfoRow label="会议状态" value={<MeetingStatusTag status="CREATED" />} />
+              <InfoRow label="开始时间" value="--" />
+              <InfoRow label="持续时长" value="--" />
+            </div>
+            <div className="rail-section">
+              <div className="rail-title">AI 纪要</div>
+              <InfoRow label="纪要状态" value={<Tag>等待会议结束</Tag>} />
+            </div>
+            <div className="rail-section">
+              <div className="rail-title">会议信息</div>
+              <InfoRow label="Meeting ID" value={<span className="room__id">{meeting.id}</span>} />
+            </div>
+          </aside>
         </div>
-
-        <aside className="room__rail" style={{ marginTop: 24 }}>
-          <div className="rail-section">
-            <div className="rail-title">会议状态</div>
-            <InfoRow label="会议状态" value={<MeetingStatusTag status="CREATED" />} />
-            <InfoRow label="开始时间" value="--" />
-            <InfoRow label="持续时长" value="--" />
-          </div>
-          <div className="rail-section">
-            <div className="rail-title">转写与纪要</div>
-            <InfoRow label="转写状态" value={<Tag>等待会议开始</Tag>} />
-            <InfoRow label="AI 纪要" value={<Tag>等待会议结束</Tag>} />
-          </div>
-          <div className="rail-section">
-            <div className="rail-title">会议信息</div>
-            <InfoRow label="Meeting ID" value={<span className="room__id">{meeting.id}</span>} />
-          </div>
-        </aside>
       </div>
     )
   }
@@ -452,6 +460,21 @@ export function MeetingRoomPage() {
       </Popconfirm>
     ) : undefined
 
+  // section head 文案随状态变化（8B-5）。数据语义不变，仅展示文案。
+  const isLive = meeting.status === 'IN_PROGRESS' || meeting.status === 'FINALIZING'
+  const sectionTitle =
+    meeting.status === 'FINALIZING'
+      ? '正在整理会议'
+      : meeting.status === 'COMPLETED'
+        ? '会议记录'
+        : '实时记录'
+  const sectionHint =
+    meeting.status === 'FINALIZING'
+      ? '正在接收最后的转写内容，并准备生成 AI 纪要。'
+      : meeting.status === 'COMPLETED'
+        ? '转写已结束'
+        : 'AI 实时转写 · 自动保存'
+
   return (
     <div className="page page--wide" style={{ minHeight: 0 }}>
       <Header meeting={meeting} action={headerAction} />
@@ -459,19 +482,47 @@ export function MeetingRoomPage() {
       <div className="room__body">
         <section className="room__transcript">
           <div className="room__section-head">
-            <span className="live-dot" />
-            <span>实时记录</span>
-            {showJumpButton ? (
-              <Button
-                className="transcript-jump"
-                size="small"
-                icon={<ArrowDownOutlined />}
-                onClick={jumpToBottom}
-              >
-                有新内容 · 回到底部
-              </Button>
-            ) : null}
+            {isLive ? <span className="live-dot" aria-hidden /> : null}
+            <span>{sectionTitle}</span>
+            {sectionHint ? <span className="room__section-hint">{sectionHint}</span> : null}
           </div>
+
+          {/* FINALIZING：收尾三态指示（无 fake 百分比，均为真实阶段） */}
+          {meeting.status === 'FINALIZING' ? (
+            <div className="finish-steps">
+              <div className="finish-step">
+                <span className="finish-step__dot">
+                  <CheckOutlined />
+                </span>
+                <span>会议已结束</span>
+              </div>
+              <div className="finish-step finish-step--active">
+                <span className="finish-step__dot finish-step__dot--pulse" aria-hidden />
+                <span>转写收尾中</span>
+              </div>
+              <div className="finish-step finish-step--pending">
+                <span className="finish-step__dot finish-step__dot--ring" aria-hidden />
+                <span>AI 纪要等待生成</span>
+              </div>
+            </div>
+          ) : null}
+
+          {/* COMPLETED：完成横幅 + 查看结果 CTA（进入既有 Result 页，8C 前为骨架） */}
+          {meeting.status === 'COMPLETED' ? (
+            <div className="complete-banner">
+              <CheckCircleFilled className="complete-banner__icon" aria-hidden />
+              <span className="complete-banner__text">会议已完成</span>
+              <Button
+                type="primary"
+                size="small"
+                icon={<FileTextOutlined />}
+                onClick={() => navigate(`/meetings/${meetingId}/result`)}
+              >
+                查看会议结果
+              </Button>
+            </div>
+          ) : null}
+
           <TranscriptBody
             status={meeting.status}
             segments={finalSegments}
@@ -482,11 +533,23 @@ export function MeetingRoomPage() {
             onRetry={retryTranscript}
             listRef={segmentsRef}
           />
+
+          {/* 8B-4 FAB：悬浮于转写面板右下，出现时轻升起；hover 轻抬、点击微压 */}
+          {showJumpButton ? (
+            <Button
+              className="transcript-jump"
+              size="small"
+              icon={<ArrowDownOutlined />}
+              onClick={jumpToBottom}
+            >
+              有新内容 · 回到底部
+            </Button>
+          ) : null}
         </section>
 
         <aside className="room__rail">
           <div className="rail-section">
-            <div className="rail-title">状态</div>
+            <div className="rail-title">会议状态</div>
             <InfoRow label="会议状态" value={<MeetingStatusTag status={meeting.status} />} />
             <InfoRow
               label="开始时间"
@@ -501,7 +564,7 @@ export function MeetingRoomPage() {
             <InfoRow
               label="纪要说明"
               value={
-                <span style={{ fontSize: 12, color: '#98A2B3' }}>
+                <span style={{ fontSize: 12, color: '#8A97AA' }}>
                   结束会议后自动生成
                 </span>
               }

@@ -517,3 +517,34 @@ frontend/src/
 无 API Key 输入框（Browser 不收 DeepSeek Secret，PRD §45/arch §10）
 ```
 
+### 12.4 Meeting Workspace UI Polish（Step 8B-5 已实现）
+
+> 纯展示层打磨：不改变任何数据语义 / SSE 协议 / store 结构 / 四态机。
+> 视觉体系：冰蓝工作台（Primary `#3478F6` / AI-Live Mint `#20B486` /
+> Page BG `#F6F9FC` / Card `#FFF` / Border `#E8EEF5`），内容 max 1200px。
+> 8B-1~8B-4 的 JSX 若需位移，只移动 JSX，绝不重实现数据逻辑。
+
+- **Design Tokens**（`designTokens.ts` 唯一数据源）：新增 `colorMint/colorMintLight`、
+  `shadowCard/shadowCardHover`、`motionFast/motionBase`、`railWidth`；radius 升为
+  10/12/16，`contentMaxWidth 1200`；`antdTheme` 同步 Menu / Button / Card / Tabs 圆角。
+- **Home Hero**：左文右画 ——「小水华，让每一次会议更清晰」+ 唯一 Primary CTA
+  「创建会议」+ 次级「查看会议」；右侧 `HeroIllustration`（inline SVG：浮起转写卡片 /
+  波形 live 线 / 呼吸圆点 / 植物，纯装饰 `pointer-events:none`，窄屏淡出）。
+- **最近会议 / Meetings / Settings**：真实空态（无 fake 列表）；Settings 改为
+  分组入口（模型设置 / 数据管理 / 关于我们），明确「后续版本开放」，无 API Key 输入。
+- **Meeting Room 四态展示**（数据逻辑原样）：
+  - CREATED：圆形麦克风 + `ripple-ring` 呼吸环 +「准备开始会议」+ 真实「开始会议」；
+  - IN_PROGRESS：section head `● 实时记录` + hint「AI 实时转写 · 自动保存」；
+  - FINALIZING：section head「正在整理会议」+ 三态指示条（✓会议已结束 / ●转写收尾中 /
+    ○AI纪要等待生成，无 fake 百分比）；
+  - COMPLETED：section head「会议记录」+ 完成横幅「会议已完成」+「查看会议结果」
+    CTA（`navigate(/meetings/:id/result)`）。
+  - Transcript FINAL = meeting-notes（speaker 弱化小字、次行），PARTIAL = 次级轻量 +
+    小薄荷 live 点 +「识别中」，自动滚动 FAB 悬浮右下。
+- **微交互（CSS-only）**：按钮 hover 轻抬 2px / active scale(0.98)、卡片 hover
+  上升 + 阴影增强、侧栏选中浅蓝胶囊、FAB 出现轻升起 + 点击微压、live-dot 2.2s 呼吸。
+  `@media (prefers-reduced-motion: reduce)` 关闭全部 transform / 脉冲 / 平滑滚动。
+- **响应式**：`≥1200` 双列 / `900–1199` 窄轨（260px）/ `<900` 单列 + 右轨下移。
+- **明确不做**：Framer Motion / GSAP 等动画库；fake 数据（无会议列表 / 参会人头像 /
+  时间戳 / 摘要）；无 API Key 输入；Meeting 四态与 Summary 契约不变；不进入 8C。
+
