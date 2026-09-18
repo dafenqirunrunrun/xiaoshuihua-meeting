@@ -22,3 +22,15 @@ class MeetingOut(BaseModel):
     completed_at: datetime | None = None
     created_at: datetime | None = None
     updated_at: datetime | None = None
+
+
+class MeetingListOut(BaseModel):
+    """GET /api/meetings —— 列表响应（MVP §Step 8B-6，复用 MeetingOut 语义）。
+
+    不新增 activeMeeting / isResumable 等派生字段：状态 / 时间字段已可推导。
+    """
+
+    items: list[MeetingOut]
+    total: int
+    limit: int
+    offset: int
