@@ -32,6 +32,43 @@ Response `201 / Meeting`：
 
 ---
 
+### GET /api/meetings — 会议列表（Step 8B-6，Meeting Discovery）
+
+Query 参数（全部可选）：
+
+- `status`：`CREATED | IN_PROGRESS | FINALIZING | COMPLETED`（四态之一；非法值 → **422**）。
+- `limit`：`1..100`，默认 `20`（`LIST_DEFAULT_LIMIT`），最大 `100`（`LIST_MAX_LIMIT`）；越界 → 422。
+- `offset`：`>=0`，默认 `0`；负数 → 422。
+
+排序：`updated_at DESC, created_at DESC`（最近更新的在前）。不带 `status` 返回全部四态。
+
+Response `200 / MeetingListOut`（复用 `MeetingOut`，无新增派生字段）：
+
+```json
+{
+  "items": [
+    {
+      "id": "meeting_abc123",
+      "title": "小水华 MVP 方案讨论",
+      "description": null,
+      "status": "IN_PROGRESS",
+      "started_at": "2026-09-17T02:04:34",
+      "ended_at": null,
+      "completed_at": null,
+      "created_at": "2026-09-17T02:04:34",
+      "updated_at": "2026-09-17T02:04:34"
+    }
+  ],
+  "total": 3,
+  "limit": 20,
+  "offset": 0
+}
+```
+
+- `total` 为满足过滤条件的总条数（不计 limit/offset）。
+- 路由顺序：`GET /api/meetings` 必须先于 `GET /api/meetings/{meeting_id}` 注册。
+- 语义：Meeting Discovery / Resume 的**唯一**入口；`POST /resume` 不存在（见 architecture §13）。
+
 ### POST /api/meetings/{meeting_id}/start
 
 - `CREATED → IN_PROGRESS`，记录 `started_at`。

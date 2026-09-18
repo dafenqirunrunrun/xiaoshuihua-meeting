@@ -548,3 +548,57 @@ frontend/src/
 - **明确不做**：Framer Motion / GSAP 等动画库；fake 数据（无会议列表 / 参会人头像 /
   时间戳 / 摘要）；无 API Key 输入；Meeting 四态与 Summary 契约不变；不进入 8C。
 
+
+## 13. Meeting Discovery & Resume（Step 8B-6 已实现）
+
+> 解决产品断点：用户离开 Meeting Room 后，若不知道 `/meetings/:id` 就找不到进行中
+> 的会议。新增最小列表查询 + 首页/列表页发现，让任何状态的会议都能被重新找到并进入。
+
+### 13.1 后端：GET /api/meetings
+
+- 最小列表接口（service `list_meetings`）：`status?` 过滤 + `limit?/offset?` 分页；
+  默认 `limit=20`，最大 `100`；非法 `status` / 越界 `limit` / 负 `offset` → **422**。
+- 排序 `updated_at DESC, created_at DESC`（最近更新的在前）；`total` 为过滤后总数
+  （不计分页）。响应 `MeetingListOut{items,total,limit,offset}`，item 复用 `MeetingOut`
+  （**不新增派生字段**，不把逻辑塞进 schema）。
+- 路由顺序：`GET /api/meetings` 先于 `GET /api/meetings/{meeting_id}` 注册。
+- 无 user isolation：MVP 单租户仓库，Meet 全量可见（PRD 未引入用户体系）。
+
+### 13.2 Resume 语义：Resume = 导航，不是生命周期
+
+- **`Resume` 是 `GET /meetings/:id` 的页面导航**，不是新 endpoint：
+  `POST /resume` 不存在，Meeting **从不 Pause / Resume 状态跳转**。
+  进入页面 = 既有恢复模型（arch §6）：GET Meeting → GET Transcript Snapshot →
+  `maxSegmentSeq` → SSE `after_segment_seq` 增量。IN_PROGRESS / FINALIZING /
+  COMPLETED / CREATED 四态都能被重新进入。
+- **离开页面 ≠ 生命周期迁移**：用户点「返回会议列表」（纯导航 `navigate('/meetings')`，
+  页面 header 左上角）离开 Meeting Room，**不结束 / 不暂停会议**；会议继续 IN_PROGRESS，
+  后端照常接收并保存转写。绝不出现「退出会议 / 暂停录音」之类文案（**Pause 不是已实现
+  功能**，PRD §60 明确不做；无 PAUSED / RECORDING_PAUSED / MeetingStatus.PAUSED）。
+- 页面刷新同理：refresh = re-enter = 重跑恢复模型，Backend 状态不受影响（RES-15）。
+
+### 13.3 前端发现（Home / Meetings）
+
+- **Home**：真实 Meeting List 分区（无 fake）。`limit=50` 一次拉取：
+  - 正在进行（Active）：`IN_PROGRESS` / `FINALIZING`，最多 3 张卡片 +「查看全部会议」
+    （进入 `/meetings`）。这张卡片 = 离开 Meeting Room 后重新发现并 Resume 的入口。
+  - 最近的会议（Recent）：`CREATED`（继续准备）+ `COMPLETED`（查看结果）。
+  - loading / error / 真实空态均轻量；保留唯一 Primary CTA「创建会议」。
+- **Meetings**：真实列表页替代占位。状态 Tabs（全部 / 待开始 / 进行中 / 收尾中 /
+  已完成）→ 真实后端 `status=` 过滤；每页 20（与 `LIST_DEFAULT_LIMIT` 一致）。
+- **列表项 CTA（状态驱动，唯一语义）**：
+  - `CREATED → 继续准备`（`/meetings/:id` 会前准备页）
+  - `IN_PROGRESS → 继续会议`（`/meetings/:id`，Resume 主路径）
+  - `FINALIZING → 查看收尾`（`/meetings/:id`）
+  - `COMPLETED → 查看结果`（`/meetings/:id/result`，8C 前为骨架）
+  - 绝不出现「重新开始 / 继续录音」——这些语义不存在。
+- 时间文本全部来自真实后端字段（创建于 / 开始于 / 结束于 / 完成于 + 真实时长），
+  无 fake 时间戳。
+
+### 13.4 明确不做（8B-6）
+
+```text
+无 POST /resume / 无 Pause / 无 PAUSED / RECORDING_PAUSED / MeetingStatus.PAUSED
+无 user isolation 假逻辑（单租户全量可见）     无翻页 UI（limit=20 单页，可后续加）
+无 AI Chat / 无真实 ASR / 无 Redis / Kafka   不进入 8C（Result / Summary 渲染）
+```
