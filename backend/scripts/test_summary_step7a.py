@@ -54,18 +54,22 @@ os.environ["DATABASE_URL"] = f"sqlite:///{os.path.join(_TMP, 'summary.db')}"
 os.environ.setdefault("SSE_HEARTBEAT_INTERVAL", "1.0")
 os.environ.setdefault("SUMMARY_MAX_ATTEMPTS", "2")
 
-from app import models  # noqa: E402
+from app.agent.summary_model import MeetingSummary  # noqa: E402
+from app.meeting.meeting_model import Meeting  # noqa: E402
 from app.db import SessionLocal, create_all  # noqa: E402
-from app.exceptions import (  # noqa: E402
+from app.common.exceptions import (  # noqa: E402
     InvalidMeetingStateTransition,
     TranscriptConflictError,
 )
-from app.repositories import summary_repository, transcript_repository  # noqa: E402
-from app.schemas import transcript as transcript_schemas  # noqa: E402
-from app.services import meeting_service, stream_service, transcript_service  # noqa: E402
-from app.services import summary_service  # noqa: E402
-from app.services.llm.base import LLMProvider, SummaryGenerationError  # noqa: E402
-from app.services.llm.fake import FakeProvider  # noqa: E402
+from app.agent import summary_repository  # noqa: E402
+from app.transcript import repository as transcript_repository  # noqa: E402
+from app.transcript import schemas as transcript_schemas  # noqa: E402
+from app.meeting import service as meeting_service  # noqa: E402
+from app.transcript import service as transcript_service  # noqa: E402
+from app.transcript import stream_service  # noqa: E402
+from app.agent import summary_service  # noqa: E402
+from app.agent.llm.base import LLMProvider, SummaryGenerationError  # noqa: E402
+from app.agent.llm.fake import FakeProvider  # noqa: E402
 
 _RESULTS: list[tuple[str, bool, str]] = []
 
@@ -94,7 +98,7 @@ def _next_id() -> str:
 def seed_frozen(mid: str, *, title: str = "测试会议", seed_finals: int = 3) -> None:
     """Create a meeting that is FINALIZING + frozen (Step 6 readiness true)."""
     db = SessionLocal()
-    db.add(models.Meeting(id=mid, title=title, status="CREATED"))
+    db.add(Meeting(id=mid, title=title, status="CREATED"))
     db.commit()
     meeting_service.start_meeting(db, mid)
     meeting_service.finish_meeting(db, mid)
@@ -119,7 +123,7 @@ def _seed_big(mid: str, *, total: int, chunk: str) -> None:
     """Create a meeting frozen with `total` FINAL segments of len(chunk) each —
     enough to exceed MAX_TRANSCRIPT_CHARS without materialising it fully."""
     db = SessionLocal()
-    db.add(models.Meeting(id=mid, title="big", status="CREATED"))
+    db.add(Meeting(id=mid, title="big", status="CREATED"))
     db.commit()
     meeting_service.start_meeting(db, mid)
     meeting_service.finish_meeting(db, mid)
@@ -198,7 +202,7 @@ def part_b() -> int:
             f"calls={len(fake.calls)}")
 
     # --- S11 meeting stays FINALIZING after COMPLETED -----------------------
-    m = db.get(models.Meeting, mid)
+    m = db.get(Meeting, mid)
     _record("S11 meeting stays FINALIZING after COMPLETED summary",
             m is not None and m.status == "FINALIZING", f"status={m.status if m else None}")
 
@@ -221,7 +225,7 @@ def part_b() -> int:
             item_fail is not None and item_fail.status == "FAILED",
             f"status={item_fail.status if item_fail else None}")
     _record("S12 meeting stays FINALIZING after FAILED summary",
-            db.get(models.Meeting, mid2).status == "FINALIZING")
+            db.get(Meeting, mid2).status == "FINALIZING")
 
     # --- S07 provider timeout/HTTP-style error -> FAILED ---------------------
     mid3 = _next_id()
@@ -291,7 +295,7 @@ def part_b() -> int:
     # --- S03 not FINALIZING (IN_PROGRESS) -> 409 ------------------------------
     mid3_1 = _next_id()
     db3 = SessionLocal()
-    db3.add(models.Meeting(id=mid3_1, title="x", status="CREATED"))
+    db3.add(Meeting(id=mid3_1, title="x", status="CREATED"))
     db3.commit()
     meeting_service.start_meeting(db3, mid3_1)  # IN_PROGRESS
     try:
@@ -305,7 +309,7 @@ def part_b() -> int:
     # --- S04 FINALIZING but not frozen -> 409, no LLM call ---------------------
     mid4_1 = _next_id()
     db4 = SessionLocal()
-    db4.add(models.Meeting(id=mid4_1, title="x4", status="CREATED"))
+    db4.add(Meeting(id=mid4_1, title="x4", status="CREATED"))
     db4.commit()
     meeting_service.start_meeting(db4, mid4_1)
     meeting_service.finish_meeting(db4, mid4_1)
@@ -325,7 +329,7 @@ def part_b() -> int:
     seed_frozen(mid13)
     db13 = SessionLocal()
     # Simulate a crashed attempt: a GENERATING row already exists.
-    existing = models.MeetingSummary(meeting_id=mid13, version=1, status="GENERATING")
+    existing = MeetingSummary(meeting_id=mid13, version=1, status="GENERATING")
     db13.add(existing)
     db13.commit()
     item13 = generate(db13, mid13, provider=FakeProvider())
@@ -366,7 +370,7 @@ def part_b() -> int:
     mid15 = _next_id()
     seed_frozen(mid15)
     db15 = SessionLocal()
-    db15.get(models.Meeting, mid15).status = "COMPLETED"
+    db15.get(Meeting, mid15).status = "COMPLETED"
     db15.commit()
     try:
         generate(db15, mid15, provider=FakeProvider())
@@ -393,7 +397,7 @@ def part_b() -> int:
             f"status={r1.status if r1 else None}")
     saved_text = r1.overview
     # A second (illegal) v1 at the repository level hits UNIQUE constraint.
-    dup = models.MeetingSummary(meeting_id=mid18, version=1, status="NOT_STARTED")
+    dup = MeetingSummary(meeting_id=mid18, version=1, status="NOT_STARTED")
     try:
         db18.add(dup); db18.commit()
         _fail("S17 repository-level dup v1 should fail", "no exception")
@@ -429,3 +433,6 @@ if __name__ == "__main__":
         print(f"  [{'PASS' if ok else 'FAIL'}] {case}" + (f" — {detail}" if detail else ""))
     print(f"\nTOTAL {len(_RESULTS)} cases: {passed} PASS / {failed} FAIL")
     sys.exit(0 if rc == 0 and failed == 0 else 1)
+
+
+

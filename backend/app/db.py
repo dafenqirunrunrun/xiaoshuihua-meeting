@@ -43,7 +43,9 @@ SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
 
 def create_all() -> None:
     """Create tables (imports models first)."""
-    from app import models  # noqa: F401  (register models on Base)
+    from app.agent import summary_model  # noqa: F401
+    from app.meeting import meeting  # noqa: F401
+    from app.transcript import segment_model, stream_model  # noqa: F401
 
     Base.metadata.create_all(bind=engine)
 
@@ -55,3 +57,5 @@ def get_db() -> Generator[Session, None, None]:
         yield db
     finally:
         db.close()
+
+

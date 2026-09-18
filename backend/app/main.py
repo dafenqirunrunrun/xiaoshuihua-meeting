@@ -8,15 +8,20 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
-from app.api.routes import health, internal_transcript, meetings
 from app.config import settings
 from app.db import create_all
-from app.exceptions import (
+from app.common.exceptions import (
     InvalidMeetingStateTransition,
     MeetingNotFoundError,
     TranscriptConflictError,
     TranscriptValidationError,
 )
+from app.agent import router as agent_router
+from app.common import health_router
+from app.meeting import router as meeting_router
+from app.realtime import router as realtime_router
+from app.transcript import internal_router as transcript_internal_router
+from app.transcript import router as transcript_router
 
 
 @asynccontextmanager
@@ -24,7 +29,7 @@ async def lifespan(_app: FastAPI):
     create_all()  # ensure tables exist (PRD §46)
     yield
     # Close every SSE subscriber so generators end cleanly on shutdown.
-    from app.services.event_broker import event_broker
+    from app.realtime.event_broker import event_broker
 
     event_broker.disconnect_all()
 
@@ -57,6 +62,10 @@ async def _transcript_conflict_handler(_request: Request, exc: TranscriptConflic
     return JSONResponse(status_code=409, content={"detail": str(exc)})
 
 
-app.include_router(health.router, prefix="/api")
-app.include_router(meetings.router, prefix="/api")
-app.include_router(internal_transcript.router, prefix="/api")
+app.include_router(health_router.router, prefix="/api")
+app.include_router(meeting_router.router, prefix="/api")
+app.include_router(transcript_router.router, prefix="/api")
+app.include_router(realtime_router.router, prefix="/api")
+app.include_router(agent_router.router, prefix="/api")
+app.include_router(transcript_internal_router.router, prefix="/api")
+
