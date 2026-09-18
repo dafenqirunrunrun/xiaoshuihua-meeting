@@ -40,20 +40,29 @@ function useNowTick(active: boolean, startIso: string | null | undefined) {
 /**
  * Header strip：title + #id + 状态 Tag + timer（仅进行中），action 在右侧。
  * 详细字段（开始时间 / 持续时长 / 转写连接态）留给右 Rail —— 不在此重复状态。
+ * 左上角提供纯导航「返回会议列表」：离开页面 ≠ 结束/暂停会议（Step 8B-6 §16）。
  */
 function Header({
   meeting,
   action,
   timer,
+  onBack,
 }: {
   meeting: Meeting
   action?: React.ReactNode
   timer?: string
+  onBack?: () => void
 }) {
   const title = meeting.title?.trim() || '未命名会议'
   return (
     <header className="room__header">
       <div style={{ minWidth: 0 }}>
+        {onBack ? (
+          <button type="button" className="room__back" onClick={onBack}>
+            <ArrowLeftOutlined aria-hidden />
+            返回会议列表
+          </button>
+        ) : null}
         <h1 className="room__title h-m0" title={meeting.title || undefined}>
           {title}
         </h1>
@@ -408,7 +417,7 @@ export function MeetingRoomPage() {
   if (meeting.status === 'CREATED') {
     return (
       <div className="page page--wide" style={{ minHeight: 0 }}>
-        <Header meeting={meeting} />
+        <Header meeting={meeting} onBack={() => navigate('/meetings')} />
 
         <div className="room__body">
           <section className="room__transcript">
@@ -493,6 +502,7 @@ export function MeetingRoomPage() {
         meeting={meeting}
         action={headerAction}
         timer={meeting.status === 'IN_PROGRESS' ? durationText : undefined}
+        onBack={() => navigate('/meetings')}
       />
 
       <div className="room__body">
