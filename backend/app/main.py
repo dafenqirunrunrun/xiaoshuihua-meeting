@@ -17,6 +17,7 @@ from app.common.exceptions import (
     TranscriptValidationError,
 )
 from app.agent import router as agent_router
+from app.audio import router as audio_router
 from app.common import health_router
 from app.meeting import router as meeting_router
 from app.realtime import router as realtime_router
@@ -68,4 +69,5 @@ app.include_router(transcript_router.router, prefix="/api")
 app.include_router(realtime_router.router, prefix="/api")
 app.include_router(agent_router.router, prefix="/api")
 app.include_router(transcript_internal_router.router, prefix="/api")
+app.include_router(audio_router.router)
 

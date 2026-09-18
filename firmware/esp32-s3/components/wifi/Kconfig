@@ -1,0 +1,11 @@
+menu "ShuiHua Wi-Fi configuration"
+
+config SHUIHUA_WIFI_SSID
+    string "Wi-Fi SSID"
+    default ""
+
+config SHUIHUA_WIFI_PASSWORD
+    string "Wi-Fi password"
+    default ""
+
+endmenu

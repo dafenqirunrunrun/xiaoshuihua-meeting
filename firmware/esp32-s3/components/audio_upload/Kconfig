@@ -1,0 +1,19 @@
+menu "ShuiHua audio upload configuration"
+
+config SHUIHUA_SERVER_HOST
+    string "FastAPI server IPv4 address"
+    default "192.168.1.100"
+
+config SHUIHUA_SERVER_PORT
+    string "FastAPI server port"
+    default "8000"
+
+config SHUIHUA_AUDIO_WS_PATH
+    string "Audio WebSocket path"
+    default "/ws/audio"
+
+config SHUIHUA_DEVICE_ID
+    string "Device ID"
+    default "ESP32-001"
+
+endmenu

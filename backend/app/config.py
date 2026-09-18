@@ -50,5 +50,15 @@ class Settings(BaseSettings):
     # when false, the first Pydantic failure immediately marks FAILED.
     summary_parse_repair: bool = True
 
+    # Linear gain applied only to the ASR copy; raw PCM recordings are unchanged.
+    asr_audio_gain: float = 1.0
+
+    # Tencent ASR settings are read from the existing backend .env file.
+    tencent_asr_app_id: str = ""
+    tencent_asr_secret_id: str = ""
+    tencent_asr_secret_key: str = ""
+    tencent_asr_engine: str = "16k_zh_en_speaker_2.0"
+    tencent_asr_debug: bool = False
+
 
 settings = Settings()
