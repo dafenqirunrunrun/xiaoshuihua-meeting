@@ -294,6 +294,34 @@ existing implementation
     （新建 FINALIZING → Result 页停留 SSE 已连 + 「AI 纪要正在生成」→ 后台 stream-end
     → **无刷新**自动转真实摘要 COMPLETED + terminal 后 SSE 关闭）；COMPLETED 页不连
     SSE + 刷新恢复摘要；FAILED 页显示生成失败且不连 SSE。
+- **Step 8C-3 已完成 ✅**：Regenerate Summary（主动重新生成纪要）。
+  - 入口：Result 页会议纪要区标题行右侧「重新生成纪要」（secondary button +
+    Popconfirm「重新生成会创建一个新的纪要版本，当前纪要不会被删除。」/ 取消 / 重新生成）。
+  - **Meeting 全程 COMPLETED**：绝不 `COMPLETED → FINALIZING`，不改 lifecyle；
+    Transcript 不受影响（仍用已冻结的持久化 FINAL，不重传 / 不重连 live SSE）。
+  - **版本 append-only，唯一分配者是 Backend**：v1 → v2 → v3…，旧版永不覆盖；
+    前端**绝不** `version++`、不猜版本号。
+  - 两种 loading 严格分离：`submitting`（POST 在飞，「正在提交…」）vs
+    `generating`（latest=GENERATING，按钮禁用 + Banner）；GENERATING 期间**不清空**
+    旧纪要（`lastGood` 保留 + 「正在生成新版纪要」Banner）。
+  - **SSE 重建（§9 关键）**：v1 terminal 时 8C-2 已关流 → POST 后立刻 GET /summary
+    → 发现 latest=GENERATING → `terminal` 转 false → `useSummaryResultStream` 自动重连。
+  - 失败不传导：网络错误只表示"请求失败"（绝不置 Summary=FAILED）；409 →
+    「纪要正在生成中，请稍候。」+ GET /summary 同步；Meeting 仍 COMPLETED。
+  - 修复（后端最小修复，Step 7B 遗漏）：`run_regenerate_background` 原先**从不发**
+    `summary.completed|failed` → 重新生成完成后页面永远收不到终态。已按 Finalizer
+    同构补齐（终态 durable 后发布，commit-before-publish）。
+  - **修复（前端关键缺陷，影响 8B + 8C-2/8C-3）**：后端 `_render_frame` 发**具名帧**
+    （`event: <event_type>`），按 SSE 规范具名帧**不触发 `onmessage`**，而两个 hook
+    都只监听 `message` → 8B 实时字幕与 8C-2 summary.* 通知**全部静默失效**。
+    新增 `frontend/src/utils/sse.ts` `subscribeSseEnvelopes()` 逐事件名订阅，
+    `useMeetingStream` + `useSummaryResultStream` 改用它。**Backend 零改动**。
+  - 验证：8C-3 E2E 24/25（唯一"失败"为冷刷新下无旧内容可显示，符合 §19）；
+    边界 E2E 32/32 PASS（FAILED / 409 / 网络错误 / 导航离开回来 / Transcript 回归）；
+    8B 实时字幕回归 6/6 PASS；后端回归 7A 28/28 + 7B 36/36 + Step6 21/21 +
+    Step5 21/21 + list 17/17；typecheck + build PASS。
+- **Step 8C Summary Frontend Chain 完成 ✅**（8C-1 Snapshot + 8C-2 Realtime +
+  8C-3 Regenerate）。
 
 
 ## 常用命令

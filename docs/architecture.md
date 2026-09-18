@@ -707,3 +707,71 @@ frontend/src/
 无 Regenerate / 重新生成按钮（8C-3）   无版本切换 / 对比（8C-3）
 无 Transcript 实时流（Result 归档态）  无 Pause / ASR 控制
 ```
+
+## 16. Summary Regeneration（Step 8C-3 已实现）
+
+> Result 页在 8C-1/8C-2 基础上新增 **主动重新生成纪要**：把 Step 7B 已存在的
+> `POST /summary/regenerate` 接进前端。本 Step **不重新开发 Agent**，只做接线。
+
+### 16.1 不变式：Meeting 全程 COMPLETED
+
+```text
+regenerate 前后 Meeting 状态恒为 COMPLETED。
+绝不 COMPLETED -> FINALIZING（不重跑 Transcript Freeze、不重跑 Finalizer）。
+Transcript 不受影响：输入仍是已冻结的持久化 FINAL（ASC），
+    不重传 Transcript、不重连 Transcript live SSE、不改 FINAL 段。
+```
+
+### 16.2 版本 append-only（唯一分配者是 Backend）
+
+```text
+v1 COMPLETED --regenerate--> v2 GENERATING --> v2 COMPLETED | v2 FAILED
+旧版本永不覆盖 / 永不删除（UNIQUE(meeting_id, version)）。
+前端**绝不**自行 version++，**绝不**猜下一个版本号 —— 一律以 Backend 返回/GET 为准。
+```
+
+### 16.3 前端接线（最小扩展，复用 8C-2）
+
+- **入口**：会议纪要区标题行右侧「重新生成纪要」（secondary button + Popconfirm
+  「重新生成会创建一个新的纪要版本，当前纪要不会被删除。」/ 取消 / 重新生成；非 danger）。
+- **两种 loading 严格区分**：`submitting` = POST 在飞行中（按钮「正在提交…」）；
+  `generating` = Backend latest = GENERATING（按钮禁用 + Banner）。
+- **触发**：调用既有 `regenerateSummary(meetingId)`（页面禁止直接 axios/fetch）。
+- **不清空旧纪要**：保留最近一次 COMPLETED 快照（`lastGood`），GENERATING / FAILED
+  期间继续展示，配轻量 Banner（「正在生成新版纪要 / 当前纪要仍可查看，生成完成后将自动更新。」）。
+- **SSE 重建是关键**：v1 terminal 时 8C-2 已关闭 SSE；POST 成功 → 立刻 GET /summary
+  → 发现 latest = v2 GENERATING → `terminal` 转 false → `useSummaryResultStream` 重建 SSE。
+- **失败不传导**：HTTP 网络错误只表示"请求失败"，**绝不**把 Summary 置为 FAILED
+  （FAILED 只能来自 Backend 持久化状态）；409 → 「纪要正在生成中，请稍候。」+ GET /summary 同步。
+- 只展示 latest，无版本历史 / 切换 / 对比 / 删除。
+
+### 16.4 后端缺陷修复（Step 7B 遗漏，最小修复）
+
+`run_regenerate_background` 原先只发 `summary.started`，**从不发**
+`summary.completed|failed` —— 重新生成完成后 Result 页永远收不到终态通知
+（页面卡在「生成中」）。已按其 Finalizer 同构方式补齐：终态行 durable 提交后
+发布 `summary.completed|failed`（commit-before-publish；发布失败不回滚，SSE 不是事实源）。
+顺序契约不变：`summary.started → summary.completed|failed`。
+
+### 16.5 前端缺陷修复：具名 SSE 帧（关键，影响 8B + 8C-2/8C-3）
+
+后端 `_render_frame` 每帧写 `event: {event_type}`（具名帧，契约见
+`docs/api-contract.md` L194-195）。按 SSE 规范，**具名帧不触发 `onmessage`**，
+只有未具名帧才触发。而两个前端 hook 都只 `addEventListener('message')`：
+
+```text
+useMeetingStream.ts       -> 8B 实时字幕（PARTIAL / FINAL）被静默丢弃
+useSummaryResultStream.ts -> 8C-2/8C-3 summary.* 通知收不到（页面永不自动刷新）
+```
+
+修复：新增 `frontend/src/utils/sse.ts` 的 `subscribeSseEnvelopes(es, cb)`，
+按 `SSE_EVENT_TYPES` 逐事件名订阅（并兼容 `message`），两个 hook 改用它。
+**后端零改动**（协议按契约本就是具名帧）。
+
+### 16.6 明确不做（8C-3）
+
+```text
+无版本历史 / 版本切换 / 版本对比 / 删除版本
+无 Agent 重开发（复用既有 Summary pipeline）
+无 Time Travel / 无手动编辑纪要 / 无导出
+```

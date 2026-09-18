@@ -193,6 +193,10 @@ Receive → Validate(status/meeting/seq) → Idempotency Check → Persist → C
   （catch-up）、后注册订阅——与 FINAL ingest 同锁互斥，故无丢失 / 无重复窗口。
 - **帧（envelope）**：`{sse_id?, event_type, meeting_id, emitted_at, payload}`；
   每帧包含可选的 `id:`、`event:`、`data:` 行 + 空行。
+- **客户端订阅注意（具名帧）**：每帧都带 `event: {event_type}`，属于**具名帧**。
+  按 SSE 规范具名帧**不触发 `onmessage`**，必须
+  `es.addEventListener('<event_type>', h)` 逐事件名订阅（前端统一封装在
+  `frontend/src/utils/sse.ts` 的 `subscribeSseEnvelopes`）。
 - **事件类型**（本 Step 产出）：`transcript.partial`、`transcript.final`、
   `meeting.status`、`heartbeat`。`summary.*`（started/completed/failed）在 Step 7B
   产出（见 §4 Step 状态；payload 仅 `{version,status}`，非 durable，不回放）。
