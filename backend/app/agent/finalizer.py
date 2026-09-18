@@ -124,10 +124,18 @@ def run_regenerate_background(meeting_id: str) -> None:
     persistence) on OUR OWN DB session (never the request's). The meeting is
     already COMPLETED for a normal regenerate, so there is NO Finalizer
     meeting-step — only the summary becomes terminal.
+
+    Terminal SSE: like the Finalizer path, we publish `summary.completed` /
+    `summary.failed` AFTER the terminal row is durable (commit-before-publish).
+    `complete_generation` only emits `summary.started`, so without this the
+    Result page would never be notified that a regenerated version finished.
+    Publish failure must NEVER abort the durable result (SSE is not a fact
+    source) — the client recovers the truth via GET /summary on reconnect.
     """
     from app.db import SessionLocal
     from app.agent import summary_repository
     from app.agent.summary_service import complete_generation
+    from app.realtime import sse_service
 
     db = SessionLocal()
     try:
@@ -136,7 +144,22 @@ def run_regenerate_background(meeting_id: str) -> None:
         if item is None or item.status != "GENERATING":
             # nothing in flight (or an idempotent retry already finished)
             return
-        complete_generation(db, meeting_id, item.version)
+        result = complete_generation(db, meeting_id, item.version)
+
+        # Terminal SSE — only after the terminal summary is durable (Step 7B
+        # §11/B18: DB commit -> SSE publish). Same ordering contract as the
+        # Finalizer: summary.started ... then summary.completed|failed.
+        try:
+            if result.status == "COMPLETED":
+                sse_service.publish_summary_completed(meeting_id, version=result.version)
+            elif result.status == "FAILED":
+                sse_service.publish_summary_failed(meeting_id, version=result.version)
+        except Exception:  # pragma: no cover - defensive; never blocks durability
+            logger.exception(
+                "summary.%s SSE publish failed for regenerated meeting %s "
+                "(SSE is not a fact source; the durable summary already committed)",
+                result.status.lower(), meeting_id,
+            )
     except Exception:  # pragma: no cover - defensive
         logger.exception("regenerate background failed for meeting %s (retry-safe)", meeting_id)
     finally:

@@ -1,6 +1,6 @@
 import { useEffect, useRef } from 'react'
 import { getSummary } from '@/api'
-import type { SseEnvelope } from '@/types/sse'
+import { subscribeSseEnvelopes } from '@/utils/sse'
 
 /** 退避：1s → 2s → 4s → 8s → max 10s（与 useMeetingStream 对齐） */
 const BASE_DELAY = 1000
@@ -41,6 +41,8 @@ export interface UseSummaryResultStreamParams {
  * 与 useMeetingStream 的 Snapshot-recovery 同构）→ 若已 terminal 则不重连，否则重建 SSE。
  *
  * 硬约束：
+ *  - 后端发的是**具名帧**（`event: summary.completed`），不会触发 onmessage ——
+ *    必须逐事件名订阅（见 utils/sse.ts 的 subscribeSseEnvelopes）；
  *  - 不消费 transcript.partial / transcript.final —— Result 是归档阅读态
  *    （Transcript 已由 useTranscriptSnapshotResult 从 GET 恢复）；
  *  - 不调用 regenerateSummary —— 本钩子只 `listen`，不 `trigger`；
@@ -125,29 +127,33 @@ export function useSummaryResultStream({
       handleRecovery(mid)
     }
 
-    es.addEventListener('message', (e: MessageEvent) => {
+    // 后端发送**具名**帧（`event: summary.completed`），不会触发 onmessage；
+    // 必须逐事件名订阅（见 utils/sse.ts）。
+    const unsubscribe = subscribeSseEnvelopes(es, (env) => {
       if (genRef.current !== gen) return
-      try {
-        const env = JSON.parse(e.data as string) as SseEnvelope
-        if (env.meeting_id !== mid) return // 防御：只处理本会议帧
-        switch (env.event_type) {
-          // 通知通道：只触发回调，绝不当事实源。刷新由调用方 GET /summary 完成。
-          case 'summary.started':
-          case 'summary.completed':
-          case 'summary.failed':
-            onEventRef.current()
-            break
-          // Server 是状态事实源：调用方 GET /meeting 覆盖 store，不猜 payload
-          case 'meeting.status':
-            onEventRef.current()
-            break
-          default:
-            break // heartbeat / transcript.*（Result 是归档阅读态，不消费）
-        }
-      } catch {
-        /* 畸形帧：忽略，不打断流 */
+      if (env.meeting_id !== mid) return // 防御：只处理本会议帧
+      switch (env.event_type) {
+        // 通知通道：只触发回调，绝不当事实源。刷新由调用方 GET /summary 完成。
+        case 'summary.started':
+        case 'summary.completed':
+        case 'summary.failed':
+          onEventRef.current()
+          break
+        // Server 是状态事实源：调用方 GET /meeting 覆盖 store，不猜 payload
+        case 'meeting.status':
+          onEventRef.current()
+          break
+        default:
+          break // heartbeat / transcript.*（Result 是归档阅读态，不消费）
       }
     })
+
+    // close/重连时移除订阅，避免悬挂监听
+    const origClose = es.close.bind(es)
+    es.close = () => {
+      unsubscribe()
+      origClose()
+    }
   }
 
   // ---- 主生命周期：仅非 terminal 才建立 SSE；terminal 或离开 → 关闭 ----

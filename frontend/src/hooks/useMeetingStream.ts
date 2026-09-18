@@ -1,6 +1,7 @@
 import { useEffect, useRef } from 'react'
 import { getMeeting, getTranscriptSnapshot } from '@/api'
 import { useMeetingStore } from '@/stores/meetingStore'
+import { subscribeSseEnvelopes } from '@/utils/sse'
 import type { Meeting } from '@/types/meeting'
 import type { PartialUtterance, TranscriptSegment } from '@/types/transcript'
 import type { SseEnvelope } from '@/types/sse'
@@ -190,31 +191,26 @@ export function useMeetingStream({
       handleRecovery(mid)
     }
 
-    const onMessage = (e: MessageEvent) => {
+    // 后端发送**具名**帧（`event: transcript.final`），不会触发 onmessage；
+    // 必须逐事件名订阅（见 utils/sse.ts）。
+    subscribeSseEnvelopes(es, (env) => {
       if (genRef.current !== gen) return
-      try {
-        const env = JSON.parse(e.data as string) as SseEnvelope
-        if (env.meeting_id !== mid) return // 防御：只处理本会议帧
-        switch (env.event_type) {
-          case 'transcript.partial':
-            handlePartial(env)
-            break
-          case 'transcript.final':
-            handleFinal(env)
-            break
-          case 'meeting.status':
-            // eslint-disable-next-line @typescript-eslint/no-floating-promises
-            handleMeetingStatus(mid)
-            break
-          default:
-            break // heartbeat / summary.*（留给 8C）忽略
-        }
-      } catch {
-        /* 畸形帧：忽略，不打断流 */
+      if (env.meeting_id !== mid) return // 防御：只处理本会议帧
+      switch (env.event_type) {
+        case 'transcript.partial':
+          handlePartial(env)
+          break
+        case 'transcript.final':
+          handleFinal(env)
+          break
+        case 'meeting.status':
+          // eslint-disable-next-line @typescript-eslint/no-floating-promises
+          handleMeetingStatus(mid)
+          break
+        default:
+          break // heartbeat / summary.*（留给 8C）忽略
       }
-    }
-
-    es.addEventListener('message', onMessage)
+    })
   }
 
   // ---- 主生命周期：连接条件满足才建立，否则关闭 ----

@@ -1,6 +1,6 @@
-import { useCallback } from 'react'
+import { useCallback, useEffect, useState } from 'react'
 import { useNavigate, useParams } from 'react-router-dom'
-import { Button, Card, Skeleton, Tabs, Typography } from 'antd'
+import { Button, Card, Popconfirm, Skeleton, Tabs, Typography, message } from 'antd'
 import {
   ArrowLeftOutlined,
   ReloadOutlined,
@@ -8,6 +8,7 @@ import {
 } from '@ant-design/icons'
 import { EmptyPlaceholder } from '@/components/EmptyPlaceholder'
 import { MeetingStatusTag } from '@/components/MeetingStatusTag'
+import { regenerateSummary, normalizeApiError } from '@/api'
 import { useMeetingLoad } from '@/hooks/useMeetingLoad'
 import { useMeetingSummary } from '@/hooks/useMeetingSummary'
 import { useSummaryResultStream } from '@/hooks/useSummaryResultStream'
@@ -99,9 +100,6 @@ function SummarySections({ summary }: { summary: MeetingSummary }) {
           {b.body}
         </div>
       ))}
-      {summary.version ? (
-        <div className="summary__version">版本 v{summary.version}</div>
-      ) : null}
     </div>
   )
 }
@@ -125,7 +123,14 @@ function SummarySections({ summary }: { summary: MeetingSummary }) {
  *     时连接 SSE；terminal 后关闭；手动「刷新状态」仍是兜底 fallback。
  *   - Result 是归档阅读态：不消费 transcript.partial / final，不连 Transcript SSE。
  *
- * 本 Step 明确不做：Regenerate / 版本切换（留 8C-3）。
+ * 8C-3：Regenerate（重新生成纪要）。
+ *   - 入口在「会议纪要」区标题行右侧（secondary button + Popconfirm）。
+ *   - POST /summary/regenerate（202）→ Backend append-only 分配 vN+1 →
+ *     立刻 GET /summary 拿到 GENERATING → streamTerminal 转 false → SSE 自动重建。
+ *   - **不猜 version、不改 Meeting lifecycle**（全程 COMPLETED）。
+ *   - 生成/失败期间保留并继续展示上一次可用纪要（Banner 提示），不清空页面。
+ *
+ * 本 Step 明确不做：版本切换 / 版本历史 / 版本对比（8C-3 只展示 latest）。
  */
 export function MeetingResultPage() {
   const { meetingId } = useParams<{ meetingId: string }>()
@@ -145,33 +150,74 @@ export function MeetingResultPage() {
   const { segments, loading: transcriptLoading, error: transcriptError, retry: retryTranscript } =
     useTranscriptSnapshotResult(meetingId)
 
-  // ---- 8C-2 Summary 实时通知 ----
+  // ---- 8C-2/8C-3 Summary 实时通知 ----
   // 连接条件（spec：仅 summary 非 terminal 时连 SSE）：
   //   - meeting FINALIZING：纪要生成中 / 即将生成 → 连；
-  //   - meeting COMPLETED + summary GENERATING：重新生成中（8C-3 预留，天然兼容）→ 连；
+  //   - meeting COMPLETED + summary GENERATING：**重新生成中（8C-3）** → 连；
   //   - 其它（COMPLETED 且 summary 终态、CREATED/IN_PROGRESS、meeting 未加载）→ 不连。
   // meeting 未加载前（null）不连，避免在未知状态上挂流。
-  const summaryTerminal =
-    summary?.status === 'COMPLETED' || summary?.status === 'FAILED'
   const streamTerminal = !(
     meeting?.status === 'FINALIZING' ||
     (meeting?.status === 'COMPLETED' && summary?.status === 'GENERATING')
   )
   // onSummaryEvent：SSE 只是通知通道，只触发 GET（Server 是事实源），
   // 绝不把 SSE 的 {version,status} payload 直接当 Summary 渲染。
+  //
+  // 注意（8C-3）：这里**不能**用「summary 已 terminal 就跳过」做守卫 ——
+  // 重新生成时 v1 是 COMPLETED（terminal），但 v2 正在生成，守卫会让页面
+  // 永远停在 v1、SSE 也永不重连。真正的门控是 SSE 连接本身：terminal 时不连
+  // 流，也就收不到事件；能收到事件就说明有生成在飞行中，应当重取。
   const handleSummaryEvent = useCallback(() => {
-    if (summaryTerminal || !meetingId) return
+    if (!meetingId) return
     // GET /summary（useMeetingSummary）→ 成功后持久化快照覆盖 UI；
-    // 404 → not_found → 渲染「正在生成」；meeting.status(COMPLETED) 时
-    // 重复 GET 无害（already COMPLETED → 快照即最终态）。
+    // 404 → not_found → 渲染「正在生成」；重复 GET 幂等无害。
     retrySummary()
-  }, [summaryTerminal, meetingId, retrySummary])
+  }, [meetingId, retrySummary])
 
   useSummaryResultStream({
     meetingId,
     terminal: streamTerminal,
     onSummaryEvent: handleSummaryEvent,
   })
+
+  // ---- 8C-3 Regenerate ----
+  // 两种 loading 严格区分（spec §7）：
+  //   submitting = POST 请求在飞行中（按钮 loading「正在提交…」）
+  //   generating = Backend latest = GENERATING（LLM 在跑，按钮禁用 + Banner）
+  const [submitting, setSubmitting] = useState(false)
+  // generating：Backend latest 正在生成（LLM 在跑）——用于禁用 regenerate 入口。
+  const generating = summary?.status === 'GENERATING'
+  // 保留「上一次已知可渲染内容」：重新生成期间 latest 是 v2 GENERATING
+  // （overview=null），若直接渲染会清空旧纪要。这里缓存最近一次 COMPLETED
+  // 快照，生成/失败期间继续展示，避免整页消失（spec §8/§12）。
+  const [lastGood, setLastGood] = useState<MeetingSummary | null>(null)
+  useEffect(() => {
+    if (summary?.status === 'COMPLETED') setLastGood(summary)
+  }, [summary])
+
+  const handleRegenerate = useCallback(async () => {
+    if (!meetingId || submitting) return
+    setSubmitting(true)
+    try {
+      // 不猜 version、不改 meeting：Backend 同步分配 vN+1（append-only）。
+      await regenerateSummary(meetingId)
+      // 立刻 GET /summary 同步真实状态 —— 拿到 v2 GENERATING 后，
+      // streamTerminal 变 false → useSummaryResultStream 自动重建 SSE。
+      retrySummary()
+    } catch (raw: unknown) {
+      const err = normalizeApiError(raw)
+      if (err.kind === 'http' && err.status === 409) {
+        // latest 已 GENERATING：不重复触发，只同步真实状态让 SSE 接管
+        message.info('纪要正在生成中，请稍候。')
+        retrySummary()
+      } else {
+        // 网络/其它失败：只表示「请求失败」，绝不改 Summary 状态（§14）
+        message.error(err.message || '重新生成请求失败')
+      }
+    } finally {
+      setSubmitting(false)
+    }
+  }, [meetingId, submitting, retrySummary])
 
   const handleBack = () => {
     if (window.history.length > 1) {
@@ -237,13 +283,81 @@ export function MeetingResultPage() {
 
   const durationText = resultDurationText(meeting)
 
+  // ---- 8C-3：regenerate 入口的显示条件（严格按 actual contract §21）----
+  // Backend 允许 regenerate 当且仅当 meeting ∈ {FINALIZING, COMPLETED} 且
+  // latest summary 不是 GENERATING。另外 meeting 无 summary 时不显示 ——
+  // regenerate 是「重新生成」，首次生成由 Finalizer 自动触发，不用它代替（§20）。
+  const canRegenerate =
+    !submitting &&
+    !generating &&
+    summary !== null &&
+    (meeting.status === 'COMPLETED' || meeting.status === 'FINALIZING')
+
+  /** 纪要区标题行：左标题（可含版本），右「重新生成纪要」入口 */
+  const summaryHead = (versionText?: string) => (
+    <div className="summary-head">
+      <div className="summary-head__title">
+        AI 纪要
+        {versionText ? <span className="summary-head__version">{versionText}</span> : null}
+      </div>
+      {summary !== null || lastGood !== null ? (
+        <Popconfirm
+          title="重新生成纪要"
+          description="重新生成会创建一个新的纪要版本，当前纪要不会被删除。"
+          okText="重新生成"
+          cancelText="取消"
+          onConfirm={handleRegenerate}
+          disabled={!canRegenerate}
+        >
+          <Button size="small" loading={submitting} disabled={!canRegenerate}>
+            {submitting ? '正在提交…' : '重新生成纪要'}
+          </Button>
+        </Popconfirm>
+      ) : null}
+    </div>
+  )
+
+  /** 生成中 / 新版失败：轻量 Banner（旧内容仍展示在其下方） */
+  const summaryBanner = (() => {
+    if (summary?.status === 'GENERATING') {
+      // version > 1 → 重新生成（旧版仍可读）；v1 → 首次生成
+      const isNewVersion = summary.version > 1
+      return (
+        <div className="summary-banner summary-banner--live">
+          <span className="summary-banner__dot" aria-hidden />
+          <div className="summary-banner__body">
+            <div className="summary-banner__title">
+              {isNewVersion ? '正在生成新版纪要' : 'AI 纪要正在生成'}
+            </div>
+            <div className="summary-banner__hint">
+              {isNewVersion
+                ? '当前纪要仍可查看，生成完成后将自动更新。'
+                : '会议内容已经保存，纪要完成后即可查看。'}
+            </div>
+          </div>
+        </div>
+      )
+    }
+    if (summary?.status === 'FAILED' && lastGood) {
+      return (
+        <div className="summary-banner summary-banner--warn">
+          <div className="summary-banner__body">
+            <div className="summary-banner__title">新版纪要生成失败</div>
+            <div className="summary-banner__hint">下方仍为上一个可用版本的纪要内容。</div>
+          </div>
+        </div>
+      )
+    }
+    return null
+  })()
+
   const summaryTabContent = (() => {
-    // loading：section skeleton
-    if (summaryLoading) {
+    // loading：仅在没有可展示内容时给 skeleton（有旧版则保留旧版，不闪空）
+    if (summaryLoading && !summary && !lastGood) {
       return <Skeleton active paragraph={{ rows: 4 }} title={false} />
     }
     // 网络失败：独立重试，不影响其它域
-    if (summaryError && summaryError !== 'not_found') {
+    if (summaryError && summaryError !== 'not_found' && !summary && !lastGood) {
       return (
         <EmptyPlaceholder
           icon={<ReloadOutlined />}
@@ -260,8 +374,8 @@ export function MeetingResultPage() {
         />
       )
     }
-    // meeting 存在但 summary 未生成
-    if (summaryError === 'not_found' || !summary) {
+    // 待生成：meeting FINALIZING 且尚无任何版本 —— 首次生成（非 regenerate）
+    if (!summary && !lastGood) {
       return (
         <EmptyPlaceholder
           icon={<FileTextOutlined />}
@@ -280,34 +394,55 @@ export function MeetingResultPage() {
         />
       )
     }
-    // Summary 存在
-    if (summary.status === 'FAILED') {
+    // 有可渲染内容：COMPLETED 用当前版本；GENERATING/FAILED 退回上一次可用版本
+    // （F5 期间 lastGood 可能为空 —— 此时 summary 自身就是 GENERATING/FAILED）
+    const display = summary?.status === 'COMPLETED' ? summary : lastGood
+    if (display) {
       return (
+        <div className="summary-wrap">
+          {summaryHead(`v${display.version}`)}
+          {summaryBanner}
+          <SummarySections summary={display} />
+        </div>
+      )
+    }
+    // 无可用旧内容：
+    //  - 当前 GENERATING（如 F5 后 v2 正在生成，旧版未在本会话加载过）→ 只给 Banner
+    if (summary?.status === 'GENERATING') {
+      return (
+        <div className="summary-wrap">
+          {summaryHead(`v${summary.version}`)}
+          {summaryBanner}
+        </div>
+      )
+    }
+    //  - 首版就 FAILED（无旧版可退）→ 失败态 + 重新生成入口
+    return (
+      <div className="summary-wrap">
+        {summaryHead()}
         <EmptyPlaceholder
           icon={<ReloadOutlined />}
           title="AI 纪要生成失败"
-          description="该会议纪要生成时出现问题，稍后可重新生成。"
-          compact
-        />
-      )
-    }
-    if (summary.status === 'GENERATING' || summary.status === 'NOT_STARTED') {
-      return (
-        <EmptyPlaceholder
-          icon={<FileTextOutlined />}
-          title="AI 纪要正在生成"
-          description="会议内容已经保存，纪要完成后即可查看。"
+          description="该会议纪要生成时出现问题，可尝试重新生成。"
           action={
-            <Button size="small" icon={<ReloadOutlined />} onClick={retrySummary}>
-              刷新状态
-            </Button>
+            canRegenerate ? (
+              <Popconfirm
+                title="重新生成纪要"
+                description="重新生成会创建一个新的纪要版本，当前纪要不会被删除。"
+                okText="重新生成"
+                cancelText="取消"
+                onConfirm={handleRegenerate}
+              >
+                <Button size="small" loading={submitting} type="primary">
+                  {submitting ? '正在提交…' : '重新生成纪要'}
+                </Button>
+              </Popconfirm>
+            ) : undefined
           }
           compact
         />
-      )
-    }
-    // COMPLETED：真实分节
-    return <SummarySections summary={summary} />
+      </div>
+    )
   })()
 
   const transcriptTabContent = (() => {
