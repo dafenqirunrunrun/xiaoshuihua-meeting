@@ -14,9 +14,11 @@ import { InfoRow } from '@/components/InfoRow'
 import { MeetingStatusTag } from '@/components/MeetingStatusTag'
 import { useMeetingStore } from '@/stores/meetingStore'
 import { useMeetingLoad } from '@/hooks/useMeetingLoad'
+import { useTranscriptSnapshot } from '@/hooks/useTranscriptSnapshot'
 import { formatDateTime, formatDuration, elapsedMs } from '@/utils/time'
 import { startMeeting, finishMeeting, normalizeApiError } from '@/api'
 import type { Meeting } from '@/types/meeting'
+import type { TranscriptSegment } from '@/types/transcript'
 
 /** 实时秒数刷新 hook：仅 active 时以 1s 步进更新，unmount 或 active 变 false 即清理。 */
 function useNowTick(active: boolean, startIso: string | null | undefined) {
@@ -55,27 +57,110 @@ function Header({ meeting, action }: { meeting: Meeting; action?: React.ReactNod
   )
 }
 
-/** 主区占位文案（四态）：8B-3/8B-4 才挂真正的实时转写。 */
+/** 主区占位文案（四态）：8B-3 无 FINAL 时的中性空态，8B-4 才挂 PARTIAL 实时字幕。 */
 function transcriptPlaceholder(status: Meeting['status']) {
   switch (status) {
     case 'IN_PROGRESS':
       return {
-        title: '实时转写将在下一阶段接入',
-        description: '会议进行中。实时转写与 AI 纪要将在后续步骤接入。',
+        title: '等待语音输入...',
+        description: '',
       }
     case 'FINALIZING':
       return {
-        title: '正在收尾，会议结束中',
-        description: '正在等待最后的转写内容与会议纪要生成。',
+        title: '暂无已确认的转写内容',
+        description: '会议正在收尾，等待最后的转写内容确认。',
       }
     case 'COMPLETED':
       return {
-        title: '会议已结束',
-        description: '会议已结束，纪要将在后续步骤接入。',
+        title: '暂无可展示的转写内容',
+        description: '本次会议未流转写出已确认的 FINAL 内容。',
       }
     default:
       return { title: '', description: '' }
   }
+}
+
+/** 便于阅读的时长偏移：无起止时间则隐藏，不制造时间戳（8B-3 只展示真实字段）。 */
+function timingText(startMs: number | null, endMs: number | null): string {
+  if (startMs === null || endMs === null) return ''
+  return `${(startMs / 1000).toFixed(1)}s`
+}
+
+/**
+ * 转写内容区：展示已持久化 FINAL，或按状态的中性空态 / 轻量失败态。
+ * 8B-3 不做 PARTIAL / streaming 光标 / 自动滚动。
+ */
+function TranscriptBody({
+  status,
+  segments,
+  error,
+  loading,
+  onRetry,
+}: {
+  status: Meeting['status']
+  segments: TranscriptSegment[]
+  error: string
+  loading: boolean
+  onRetry: () => void
+}) {
+  const placeholder = transcriptPlaceholder(status)
+
+  if (loading && segments.length === 0) {
+    return (
+      <div className="transcript-surface transcript-surface--top">
+        <Skeleton active paragraph={{ rows: 3 }} title={false} />
+      </div>
+    )
+  }
+
+  if (error) {
+    return (
+      <div className="transcript-surface">
+        <EmptyPlaceholder
+          icon={<ReloadOutlined />}
+          title="转写记录加载失败"
+          description={error}
+          action={
+            <Button size="small" icon={<ReloadOutlined />} onClick={onRetry}>
+              重试
+            </Button>
+          }
+          compact
+        />
+      </div>
+    )
+  }
+
+  if (segments.length === 0) {
+    return (
+      <div className="transcript-surface">
+        <EmptyPlaceholder
+          icon={<AudioOutlined />}
+          title={placeholder.title}
+          description={placeholder.description}
+          compact
+        />
+      </div>
+    )
+  }
+
+  return (
+    <div className="transcript-surface transcript-surface--top">
+      <ol className="transcript-segments">
+        {segments.map((seg) => (
+          <li key={seg.segment_seq} className="transcript-segment">
+            <span className="transcript-segment__speaker">{seg.speaker_id}</span>
+            <span className="transcript-segment__text">{seg.text}</span>
+            {timingText(seg.start_ms, seg.end_ms) ? (
+              <span className="transcript-segment__time">
+                {timingText(seg.start_ms, seg.end_ms)}
+              </span>
+            ) : null}
+          </li>
+        ))}
+      </ol>
+    </div>
+  )
 }
 
 /** AI 纪要标签（仅展示，不请求 summary 接口） */
@@ -97,12 +182,14 @@ function transcriptTag(status: Meeting['status']) {
 }
 
 /**
- * Meeting Room —— Step 8B-1 真实 GET Meeting 驱动 + 8B-2 生命周期（start/finish）。
+ * Meeting Room —— Step 8B-1 真实 GET Meeting 驱动 + 8B-2 生命周期（start/finish）
+ * + 8B-3 Transcript Snapshot（已持久化 FINAL 恢复展示）。
  * 创建 ≠ 开始：CREATED 展示「准备开始会议」，点击「开始会议」→ POST /start → IN_PROGRESS；
  * IN_PROGRESS 可「结束会议」→ POST /finish → FINALIZING。
  * Server 是 Source of Truth：start/finish 均以 backend 返回的 Meeting 覆盖 store，
  * 前端绝不自行写 status / started_at / COMPLETED。
- * 8B-3/8B-4 才接入 Snapshot + SSE 实时转写；此处不调用 transcript / summary 接口。
+ * 8B-3：Meeting 成功后 GET /transcript Snapshot 恢复 FINAL 列表（ASC，仅历史事实）。
+ * 8B-4 才接入 SSE 实时转写；此处不调用 summary 接口。
  */
 export function MeetingRoomPage() {
   const { meetingId } = useParams<{ meetingId: string }>()
@@ -117,6 +204,18 @@ export function MeetingRoomPage() {
   // 重试：bump reloadKey → hook 重新 GET 同一 meeting
   const [reloadKey, setReloadKey] = useState(0)
   useMeetingLoad(meetingId, reloadKey)
+
+  // 8B-3：Meeting 成功存在后再加载 Transcript Snapshot（仅持久化 FINAL，ASC）
+  const finalSegments = useMeetingStore((s) => s.finalSegments)
+  const {
+    transcriptError,
+    transcriptLoading,
+    retryTranscript,
+  } = useTranscriptSnapshot(
+    meetingId,
+    !!meeting && meeting.status !== 'CREATED',
+    meeting?.status,
+  )
 
   const now = useNowTick(
     meeting?.status === 'IN_PROGRESS',
@@ -272,7 +371,6 @@ export function MeetingRoomPage() {
   }
 
   // ---- 其它状态：IN_PROGRESS / FINALIZING / COMPLETED ----
-  const placeholder = transcriptPlaceholder(meeting.status)
   // 四态动作严格：只有 IN_PROGRESS 显示「结束会议」；FINALIZING / COMPLETED 无 start/finish
   const headerAction =
     meeting.status === 'IN_PROGRESS' ? (
@@ -299,14 +397,13 @@ export function MeetingRoomPage() {
             <span className="live-dot" />
             <span>实时记录</span>
           </div>
-          <div className="transcript-surface">
-            <EmptyPlaceholder
-              icon={<AudioOutlined />}
-              title={placeholder.title}
-              description={placeholder.description}
-              compact
-            />
-          </div>
+          <TranscriptBody
+            status={meeting.status}
+            segments={finalSegments}
+            error={transcriptError}
+            loading={transcriptLoading}
+            onRetry={retryTranscript}
+          />
         </section>
 
         <aside className="room__rail">

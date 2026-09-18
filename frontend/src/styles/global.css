@@ -270,6 +270,55 @@ body {
   place-items: center;
   min-height: 320px;
 }
+/* 有内容时：列表靠左对齐从顶部开始，不再居中 */
+.transcript-surface--top {
+  display: block;
+  place-items: initial;
+}
+
+/* 8B-3 已持久化 FINAL 列表 —— 简单稳定，不做 PARTIAL 浅色动画 / 自动滚动 */
+.transcript-segments {
+  list-style: none;
+  margin: 0;
+  padding: 8px 20px 16px;
+  max-height: 420px;
+  overflow-y: auto;
+}
+.transcript-segment {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  padding: 9px 0;
+  border-bottom: 1px solid var(--color-border-light);
+  font-size: 14px;
+  line-height: 1.55;
+  color: var(--color-text-primary);
+}
+.transcript-segment:last-child {
+  border-bottom: none;
+}
+.transcript-segment__speaker {
+  flex-shrink: 0;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--color-primary);
+  min-width: 72px;
+  max-width: 120px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.transcript-segment__text {
+  flex: 1;
+  min-width: 0;
+  word-break: break-word;
+}
+.transcript-segment__time {
+  flex-shrink: 0;
+  font-size: 12px;
+  color: var(--color-text-tertiary);
+  font-variant-numeric: tabular-nums;
+}
 
 /* live 指示：平缓呼吸点，克制不喧哗 */
 .live-dot {
