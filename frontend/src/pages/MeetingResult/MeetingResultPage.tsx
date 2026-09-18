@@ -1,33 +1,87 @@
-import { Card, Empty, Tabs, Typography } from 'antd'
+import { Card, Tabs, Typography } from 'antd'
+import { FileTextOutlined } from '@ant-design/icons'
+import { EmptyPlaceholder } from '@/components/EmptyPlaceholder'
 
-const { Title, Text } = Typography
+const { Title } = Typography
 
 /**
- * Meeting Result —— Step 8A 仅 UI 骨架（fronted_designer §29-§35）。
- * 提供「会议内容 / 会议纪要」两个 Tab；内容先用 Empty 占位，不伪造数据。
- * 真实 Transcript / Summary 渲染在 Step 8C 接入。
+ * Meeting Result —— Step 8A.1 视觉落地。
+ * 双 Tab（会议纪要 / 会议内容）保留；纪要 tab 建立 Overview / Topics /
+ * Conclusions / Open Questions 四区信息层级（8C 用真实数据填充）。
  */
 export function MeetingResultPage() {
   return (
-    <div style={{ maxWidth: 960, margin: '0 auto' }}>
-      <Title level={2} style={{ marginBottom: 4 }}>
-        会议结果
-      </Title>
-      <Text type="secondary">2026-09-17 · 会议时长待计算</Text>
+    <div className="page result">
+      <div className="result-head">
+        <Title level={1} className="result-head__title h-m0">
+          会议结果
+        </Title>
+        <div className="result-head__meta">
+          <span>2026-09-17</span>
+          <span>·</span>
+          <span>时长待计算</span>
+          <span>·</span>
+          <span>已完成</span>
+        </div>
+      </div>
 
-      <Card style={{ marginTop: 16, borderRadius: 16 }}>
+      <Card
+        className="result-tabs"
+        style={{ borderRadius: 14, borderColor: '#EEF0F4' }}
+        styles={{ body: { padding: '4px 24px 24px' } }}
+      >
         <Tabs
           defaultActiveKey="summary"
           items={[
             {
               key: 'summary',
               label: '会议纪要',
-              children: <Empty description={<Text type="secondary">暂无可展示的会议纪要</Text>} />,
+              children: (
+                <div className="summary">
+                  {/* 会议概述 */}
+                  <div className="summary__block">
+                    <div className="summary__label">会议概述</div>
+                    <p className="summary__placeholder">
+                      AI 纪要将在会议结束后在此生成。
+                    </p>
+                  </div>
+                  {/* 核心议题 */}
+                  <div className="summary__block">
+                    <div className="summary__label">核心议题</div>
+                    <p className="summary__placeholder">
+                      暂无议题 —— 待纪要生成后列出本次会议的核心话题。
+                    </p>
+                  </div>
+                  {/* 主要结论 */}
+                  <div className="summary__block">
+                    <div className="summary__label">主要结论</div>
+                    <p className="summary__placeholder">
+                      暂无结论 —— 待纪要生成后汇总本场达成的共识。
+                    </p>
+                  </div>
+                  {/* 未决问题 */}
+                  <div className="summary__block">
+                    <div className="summary__label">未决问题</div>
+                    <p className="summary__placeholder">
+                      暂无明确未决问题
+                    </p>
+                  </div>
+                </div>
+              ),
             },
             {
               key: 'transcript',
               label: '会议内容',
-              children: <Empty description={<Text type="secondary">暂无可展示的会议内容</Text>} />,
+              children: (
+                <div style={{ paddingTop: 12 }}>
+                  <EmptyPlaceholder
+                    icon={<FileTextOutlined />}
+                    title="暂无会议内容"
+                    description="完整 FINAL Transcript 将在这里按时间顺序展示。"
+                    compact
+                  />
+                </div>
+              ),
             },
           ]}
         />

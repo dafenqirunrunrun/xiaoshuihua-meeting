@@ -1,27 +1,31 @@
-import { Card, Empty, Typography } from 'antd'
+import { Typography } from 'antd'
+import { CalendarOutlined } from '@ant-design/icons'
+import { EmptyPlaceholder } from '@/components/EmptyPlaceholder'
 
-const { Title, Text } = Typography
+const { Title } = Typography
 
 /**
- * 会议列表页（fronted_designer §13）。
- * 后端目前没有 GET /meetings 列表接口 —— 不为页面擅自新增后端 API。
- * 明确展示 MVP 占位，不伪造会议历史。
+ * 会议列表页（Visual Polish）。
+ * 后端当前无 GET /meetings 列表接口 —— 不为页面擅自新增后端 API。
+ * 用轻量信息区块替代巨型 Empty Card，明确 MVP 占位。
  */
 export function MeetingsPage() {
   return (
-    <div style={{ maxWidth: 960, margin: '0 auto' }}>
-      <Title level={2} style={{ marginBottom: 4 }}>
-        会议
-      </Title>
-      <Card style={{ borderRadius: 16 }}>
-        <Empty
-          description={
-            <span>
-              <Text type="secondary">会议列表将在后续版本提供</Text>
-            </span>
-          }
+    <div className="page">
+      <div className="section-header" style={{ marginBottom: 16 }}>
+        <Title level={3} className="h-m0">
+          会议
+        </Title>
+      </div>
+
+      <div className="panel">
+        <EmptyPlaceholder
+          icon={<CalendarOutlined />}
+          title="会议列表即将上线"
+          description="后续版本会在这里列出你的全部会议记录，支持继续查看实时记录与 AI 纪要。"
+          compact
         />
-      </Card>
+      </div>
     </div>
   )
 }

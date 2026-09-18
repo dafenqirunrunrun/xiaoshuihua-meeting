@@ -1,5 +1,5 @@
 import { Outlet, useLocation, useNavigate } from 'react-router-dom'
-import { Layout, Menu, Typography } from 'antd'
+import { Layout, Menu } from 'antd'
 import {
   HomeOutlined,
   CalendarOutlined,
@@ -15,8 +15,8 @@ const NAV_ITEMS = [
 ]
 
 /**
- * AppShell —— 全局侧栏骨架（fronted_designer §6）。
- * MVP 一级导航：首页 / 会议 / 设置。不做复杂视觉动画。
+ * AppShell —— 全局侧栏 + 内容骨架（fronted_designer §6，Visual Polish）。
+ * 安静白侧栏 + 细边框 + 波形 logo mark；内容区统一 32/40 间距。
  */
 export function AppShell() {
   const navigate = useNavigate()
@@ -24,19 +24,42 @@ export function AppShell() {
 
   // 选中项：当前路径映射到一级导航（/meetings/:id 归入「会议」）
   const selectedKey =
-    location.pathname === '/' ? '/' : location.pathname.startsWith('/meetings') ? '/meetings' : location.pathname
+    location.pathname === '/'
+      ? '/'
+      : location.pathname.startsWith('/meetings')
+        ? '/meetings'
+        : location.pathname
 
   return (
     <Layout style={{ minHeight: '100vh' }}>
-      <Sider width={220} theme="light" style={{ borderRight: '1px solid #E4E7EC' }}>
-        <div style={{ padding: '20px 20px 12px' }}>
-          <Typography.Title level={4} style={{ margin: 0, color: '#1F2937' }}>
-            小水华
-          </Typography.Title>
-          <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-            会议助手
-          </Typography.Text>
+      <Sider
+        width={220}
+        theme="light"
+        style={{ borderRight: '1px solid #EEF0F4' }}
+      >
+        <div className="app-brand">
+          <svg
+            className="app-brand__mark"
+            width="26"
+            height="26"
+            viewBox="0 0 26 26"
+            aria-hidden
+          >
+            <rect width="26" height="26" rx="7" fill="#2F6BFF" />
+            <path
+              d="M6 16.5c1.6-5 3.2-7.5 4.7-7.5s2 3.4 3.4 3.4 2.6-8.4 4.2-8.4c1.3 0 1.3 8 1.9 12.5"
+              stroke="#fff"
+              strokeWidth="1.8"
+              strokeLinecap="round"
+              fill="none"
+            />
+          </svg>
+          <span>
+            <span className="app-brand__name">小水华</span>
+            <span className="app-brand__subtitle">会议助手</span>
+          </span>
         </div>
+
         <Menu
           mode="inline"
           selectedKeys={[selectedKey]}
@@ -45,9 +68,12 @@ export function AppShell() {
           style={{ borderInlineEnd: 'none' }}
         />
       </Sider>
+
       <Layout>
-        <Content style={{ padding: 24 }}>
-          <Outlet />
+        <Content>
+          <div className="app-content">
+            <Outlet />
+          </div>
         </Content>
       </Layout>
     </Layout>

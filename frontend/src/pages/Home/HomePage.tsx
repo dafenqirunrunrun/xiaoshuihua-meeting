@@ -1,47 +1,60 @@
 import { useState } from 'react'
-import { Button, Card, Typography, Empty } from 'antd'
-import { PlusOutlined } from '@ant-design/icons'
+import { Button, Typography } from 'antd'
+import { PlusOutlined, CalendarOutlined } from '@ant-design/icons'
 import { CreateMeetingModal } from '@/components/CreateMeetingModal'
+import { EmptyPlaceholder } from '@/components/EmptyPlaceholder'
 
-const { Title, Paragraph, Text } = Typography
+const { Title, Paragraph } = Typography
 
 /**
- * 首页（fronted_designer §8-§10）。
- * 产品名 + 一句话说明 + 「开始新会议」+ 最近会议（MVP 先空态）。
- * 不做加入会议 —— 后端无多人能力，不做无法工作的入口。
+ * 首页（fronted_designer §8-§10，Visual Polish）。
+ * Hero 文案层级 + 唯一 Primary CTA「开始新会议」+ 紧凑最近会议空态。
+ * 保持产品感（会议工具），不做后台仪表盘。
  */
 export function HomePage() {
   const [modalOpen, setModalOpen] = useState(false)
 
   return (
-    <div style={{ maxWidth: 960, margin: '0 auto' }}>
-      <div style={{ marginBottom: 32 }}>
-        <Title level={2} style={{ marginBottom: 4 }}>
-          早上好 👋
-        </Title>
-        <Paragraph type="secondary" style={{ marginBottom: 24, fontSize: 16 }}>
-          让每一次会议都有回响
-        </Paragraph>
-        <Button type="primary" size="large" icon={<PlusOutlined />} onClick={() => setModalOpen(true)}>
-          开始新会议
-        </Button>
+    <div className="page">
+      {/* Hero：标题层级，CTA 唯一主按钮 */}
+      <div className="home-hero">
+        <div>
+          <Title level={1} className="home-hero__title h-m0">
+            让每一次会议都有回响
+          </Title>
+          <Paragraph
+            type="secondary"
+            className="home-hero__subtitle"
+          >
+            小水华为你实时记录发言，并在会议结束后自动生成 AI 纪要。
+          </Paragraph>
+        </div>
       </div>
 
-      <Card title="最近的会议" style={{ borderRadius: 16 }}>
-        <Empty
-          description={
-            <span>
-              还没有会议记录
-              <br />
-              <Text type="secondary">开始你的第一场会议吧</Text>
-            </span>
-          }
-        >
-          <Button type="primary" onClick={() => setModalOpen(true)}>
-            开始新会议
-          </Button>
-        </Empty>
-      </Card>
+      {/* 最近会议 */}
+      <section>
+        <div className="section-header">
+          <span className="section-title">最近的会议</span>
+        </div>
+
+        <div className="panel">
+          <EmptyPlaceholder
+            icon={<CalendarOutlined />}
+            title="还没有会议记录"
+            description="开始你的第一场会议，实时转写与 AI 纪要将自动接续。"
+            action={
+              <Button
+                type="primary"
+                icon={<PlusOutlined />}
+                onClick={() => setModalOpen(true)}
+              >
+                开始新会议
+              </Button>
+            }
+            compact
+          />
+        </div>
+      </section>
 
       <CreateMeetingModal open={modalOpen} onClose={() => setModalOpen(false)} />
     </div>
