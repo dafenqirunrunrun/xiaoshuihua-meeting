@@ -71,12 +71,14 @@ def _fail(case: str, detail: str = ""):
 
 
 def _part_a() -> int:
-    from app import models
+    from app.meeting.meeting_model import Meeting
     from app.db import SessionLocal, create_all
-    from app.repositories import transcript_repository
-    from app.schemas import transcript as schemas
-    from app.services import meeting_service, stream_service, transcript_service
-    from app.services.live_utterance_cache import live_utterance_cache
+    from app.transcript import repository as transcript_repository
+    from app.transcript import schemas
+    from app.meeting import service as meeting_service
+    from app.transcript import service as transcript_service
+    from app.transcript import stream_service
+    from app.transcript.live_cache import live_utterance_cache
 
     create_all()
     db = SessionLocal()
@@ -85,7 +87,7 @@ def _part_a() -> int:
         return f"meeting_step6_{n}"
 
     def seed(n: int, title: str) -> None:
-        db.add(models.Meeting(id=mk(n), title=title, status="CREATED"))
+        db.add(Meeting(id=mk(n), title=title, status="CREATED"))
         db.commit()
 
     def final(mid: str, seq: int, text: str, event_id: str, *, expect_conflict: bool = False) -> bool:
@@ -162,7 +164,7 @@ def _part_a() -> int:
             f"rd={rd}")
 
     # meeting stays FINALIZING (F10)
-    m = db.get(models.Meeting, mid)
+    m = db.get(Meeting, mid)
     _record("F10 meeting stays FINALIZING after freeze",
             m is not None and m.status == "FINALIZING", f"status={m.status if m else None}")
 
@@ -170,7 +172,7 @@ def _part_a() -> int:
     db.close()
     db2 = SessionLocal()
     rd2 = stream_service.get_finalization_readiness(db2, mid)
-    m2 = db2.get(models.Meeting, mid)
+    m2 = db2.get(Meeting, mid)
     _record("F09 readiness survives restart (new Session, same DB file)",
             rd2["finalization_ready"] is True and m2 is not None and m2.status == "FINALIZING",
             f"rd2={rd2} status={m2.status if m2 else None}")
@@ -374,3 +376,6 @@ if __name__ == "__main__":
         print(f"  [{'PASS' if ok else 'FAIL'}] {case}" + (f" — {detail}" if detail else ""))
     print(f"\nTOTAL {len(_RESULTS)} cases: {passed} PASS / {failed} FAIL")
     sys.exit(0 if failed == 0 and rc_a == 0 and rc_b == 0 else 1)
+
+
+

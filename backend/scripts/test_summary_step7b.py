@@ -83,21 +83,21 @@ os.environ.setdefault("SSE_HEARTBEAT_INTERVAL", "1.0")
 os.environ.setdefault("SSE_QUEUE_MAXSIZE", "10")
 os.environ.setdefault("SUMMARY_MAX_ATTEMPTS", "2")
 
-from app import models  # noqa: E402
+from app.agent.summary_model import MeetingSummary  # noqa: E402
+from app.meeting.meeting_model import Meeting  # noqa: E402
 from app.db import SessionLocal, create_all  # noqa: E402
-from app.exceptions import InvalidMeetingStateTransition, TranscriptConflictError  # noqa: E402
-from app.repositories import summary_repository, transcript_repository  # noqa: E402
-from app.schemas import transcript as transcript_schemas  # noqa: E402
-from app.services import (  # noqa: E402
-    finalizer_service,
-    meeting_service,
-    sse_service,
-    stream_service,
-    summary_service,
-    transcript_service,
-)
-from app.services.llm.base import LLMConfigurationError, LLMProvider, SummaryGenerationError  # noqa: E402
-from app.services.llm.fake import FakeProvider  # noqa: E402
+from app.common.exceptions import InvalidMeetingStateTransition, TranscriptConflictError  # noqa: E402
+from app.agent import summary_repository  # noqa: E402
+from app.transcript import repository as transcript_repository  # noqa: E402
+from app.transcript import schemas as transcript_schemas  # noqa: E402
+from app.agent import finalizer as finalizer_service  # noqa: E402
+from app.agent import summary_service  # noqa: E402
+from app.meeting import service as meeting_service  # noqa: E402
+from app.realtime import sse_service  # noqa: E402
+from app.transcript import service as transcript_service  # noqa: E402
+from app.transcript import stream_service  # noqa: E402
+from app.agent.llm.base import LLMConfigurationError, LLMProvider, SummaryGenerationError  # noqa: E402
+from app.agent.llm.fake import FakeProvider  # noqa: E402
 
 _RESULTS: list[tuple[str, bool, str]] = []
 
@@ -161,7 +161,7 @@ def _seed_finalizing(mid: str, *, title: str = "Step7B 会议", seed_finals: int
     as the FIRST accept (newly_accepted=True) by the caller.
     """
     db = SessionLocal()
-    db.add(models.Meeting(id=mid, title=title, status="CREATED"))
+    db.add(Meeting(id=mid, title=title, status="CREATED"))
     db.commit()
     meeting_service.start_meeting(db, mid)
     meeting_service.finish_meeting(db, mid)
@@ -196,7 +196,7 @@ def seed_frozen(mid: str, *, title: str = "Step7B 会议", seed_finals: int = 3)
 
 def _part_a() -> int:
     create_all()
-    from app.services.event_broker import event_broker
+    from app.realtime.event_broker import event_broker
 
     # --- B01: first STREAM_END is the trigger; retry is not -----------------
     mid = _next_id()
@@ -229,7 +229,7 @@ def _part_a() -> int:
     fake = FakeProvider(responses=[VALID_JSON])
     ok = finalizer_service.finalize_for_meeting(db, mid, provider=fake)
     item = summary_repository.get_latest(db, mid)
-    m = db.get(models.Meeting, mid)
+    m = db.get(Meeting, mid)
     _record("B02 Finalizer: summary COMPLETED",
             ok and item is not None and item.status == "COMPLETED")
     _record("B02b Finalizer: meeting FINALIZING -> COMPLETED",
@@ -247,7 +247,7 @@ def _part_a() -> int:
     bad = _Probe(error="provider down")
     finalizer_service.finalize_for_meeting(db, mid, provider=bad)
     item = summary_repository.get_latest(db, mid)
-    m = db.get(models.Meeting, mid)
+    m = db.get(Meeting, mid)
     _record("B03 FAILED summary -> meeting COMPLETED (never Meeting FAILED)",
             item is not None and item.status == "FAILED"
             and m is not None and m.status == "COMPLETED",
@@ -281,11 +281,11 @@ def _part_a() -> int:
     # (i.e. the Finalizer completed summary persistence then died *before* the
     # complete_after_summary step). Insert terminal row directly at v1 WITHOUT
     # touching meeting status.
-    db.add(models.MeetingSummary(meeting_id=mid, version=1, status="COMPLETED"))
+    db.add(MeetingSummary(meeting_id=mid, version=1, status="COMPLETED"))
     db.commit()
     probe = _Probe()  # NOT scripted -> any LLM call would raise (and be counted)
     finalizer_service.finalize_for_meeting(db, mid, provider=probe)
-    m = db.get(models.Meeting, mid)
+    m = db.get(Meeting, mid)
     _record("B05 crash-gap rerun completes meeting with ZERO extra LLM calls",
             m is not None and m.status == "COMPLETED" and len(probe.calls) == 0,
             f"status={m.status if m else None} probe_calls={len(probe.calls)}")
@@ -310,7 +310,7 @@ def _part_a() -> int:
 
             read_db = _SL()
             try:
-                obs = read_db.get(models.Meeting, self.obs_mid)
+                obs = read_db.get(Meeting, self.obs_mid)
                 self.observed = obs.status if obs else None
             finally:
                 read_db.close()
@@ -334,7 +334,7 @@ def _part_a() -> int:
     # which requires a running loop, so we instead leave loop=None (direct put).
     mid = _next_id()
     seed_frozen(mid)
-    from app.services.event_broker import event_broker
+    from app.realtime.event_broker import event_broker
 
     sub = event_broker.subscribe(mid)  # loop stays None -> direct put_nowait
     db = SessionLocal()
@@ -422,7 +422,7 @@ def _part_a() -> int:
     finally:
         sse_service.publish_summary_completed = original_pub
     item = summary_repository.get_latest(db, mid)
-    m = db.get(models.Meeting, mid)
+    m = db.get(Meeting, mid)
     _record("B11 SSE publish failure does NOT roll back durable completion",
             item is not None and item.status == "COMPLETED"
             and m is not None and m.status == "COMPLETED",
@@ -436,7 +436,7 @@ def _part_a() -> int:
     fake_sentry = FakeProvider()  # if the factory fell back, this WOULD be used
     settings.llm_provider = "not-a-real-provider"
     try:
-        from app.services.llm.factory import get_provider
+        from app.agent.llm.factory import get_provider
 
         raised = False
         try:
@@ -736,3 +736,6 @@ if __name__ == "__main__":
         print(f"  [{'PASS' if ok else 'FAIL'}] {case}" + (f" — {detail}" if detail else ""))
     print(f"\nTOTAL {len(_RESULTS)} cases: {passed} PASS / {failed} FAIL")
     sys.exit(0 if rc_a == 0 and rc_b == 0 and failed == 0 else 1)
+
+
+

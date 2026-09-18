@@ -8,10 +8,14 @@ node_modules/
 
 # Python
 __pycache__/
+**/__pycache__/
 *.py[cod]
 .venv/
 venv/
 *.egg-info/
+
+# ESP-IDF
+firmware/**/build/
 
 # Env / secrets
 .env
