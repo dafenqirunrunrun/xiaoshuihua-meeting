@@ -24,9 +24,13 @@ interface MeetingState {
   streamStatus: StreamStatus
   /** 页面初始加载中 */
   loading: boolean
+  /** 加载失败状态（'not_found' | 'network' | 其它错误消息）；null = 无错误 */
+  error: string | null
 
   setMeeting: (meeting: Meeting | null) => void
   setFinalSegments: (segments: TranscriptSegment[]) => void
+  setLoading: (loading: boolean) => void
+  setError: (error: string | null) => void
   /** 重置会议级状态（退出页面 / 切换会议时清理，避免跨会议串数据） */
   resetMeetingState: () => void
 }
@@ -38,9 +42,12 @@ export const useMeetingStore = create<MeetingState>((set) => ({
   summary: null,
   streamStatus: 'idle',
   loading: false,
+  error: null,
 
   setMeeting: (meeting) => set({ meeting }),
   setFinalSegments: (segments) => set({ finalSegments: segments }),
+  setLoading: (loading) => set({ loading }),
+  setError: (error) => set({ error }),
 
   resetMeetingState: () =>
     set({
@@ -50,5 +57,6 @@ export const useMeetingStore = create<MeetingState>((set) => ({
       summary: null,
       streamStatus: 'idle',
       loading: false,
+      error: null,
     }),
 }))
