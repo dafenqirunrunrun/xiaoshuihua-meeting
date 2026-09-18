@@ -245,6 +245,36 @@ existing implementation
     FINALIZING / COMPLETED / 结果页跳转）实测通过；**Backend 零修改**。
   - 明确不做：fake 数据（无会议列表 / 头像 / 时间戳 / 摘要）、动画库、API Key 输入；
     不进入 8C。
+- **Step 8B-6 已完成**：Meeting Discovery & Resume（`e51a97d` + `7870978` + `c70ea10`）。
+  - 后端 `GET /api/meetings`：`status?/limit?/offset?` 过滤 + 分页（默认 20 / 最大 100），
+    复用 `MeetingOut`；排序 `updated_at DESC, created_at DESC`；路由先于 `GET /{id}`；
+    非法 status/limit/offset → 422。测试 `backend/scripts/test_list_meetings.py` 17/17。
+  - **Resume = 导航不是生命周期**：`/meetings/:id` 进入 = GET Meeting → Snapshot → SSE；
+    Meeting 从不 Pause（无 PAUSED / POST /resume）；离开页面 ≠ 结束/暂停（header
+    「返回会议列表」纯导航）。
+  - Home 发现（Active IN_PROGRESS/FINALIZING ≤3 + Recent CREATED/COMPLETED）与
+    Meetings 真实列表（状态 Tabs → 后端 status 过滤；状态 CTA：继续准备 / 继续会议 /
+    查看收尾 / 查看结果）。无 user isolation。
+  - 修复：`useMeetingList` 依赖稳定标量（`e0e3372`）—— 修复首页无限请求循环抖动；
+    Result 页加「返回」按钮（navigate(-1) / fallback /meetings）。
+  - 验证：后端回归全绿（list 17 + step5 21 + step6 21 + step7A 28 + step7B 36）；
+    typecheck + build PASS；浏览器四态 resume + 各 Tab 过滤实测。
+- **Step 8C-1 已完成**：Summary Snapshot & Real Result Page。
+  - Result 页 = 归档阅读态，恢复模型 `GET Meeting → GET Summary Snapshot（latest） →
+    GET Transcript Snapshot（仅 FINAL ASC）`，刷新后从 Backend 全量恢复，不依赖
+    Zustand 残留；**不连 Transcript SSE、不消费 summary.\* SSE**（实时更新留 8C-2）。
+  - 三个数据域独立 load/error/retry：Meeting（useMeetingLoad 复用）/ Summary
+    （`useMeetingSummary`）/ Transcript（`useTranscriptSnapshotResult`）。任一失败
+    不拖垮其它域。
+  - Summary 状态展示（actual enum NOT_STARTED/GENERATING/COMPLETED/FAILED）：
+    COMPLETED 分节（概述/核心议题/结论/未决）；GENERATING/NOT_STARTED/FINALIZING
+    → 「AI 纪要正在生成」+ 手动「刷新状态」；FAILED → 「生成失败」，Meeting 仍
+    COMPLETED，Transcript 仍可看；404 区分 meeting 不存在 vs summary 未生成。
+  - 只展示 latest version（弱位置 vN），无版本切换 / 无 Regenerate（8C-3）。
+  - **Backend 零修改**；前端仅 Result 页 + 2 个新 hook + global.css 补 classes。
+  - 验证：完整 Happy Path 实测（meeting_092bbe38，3 FINAL → COMPLETED → summary v1
+    COMPLETED），浏览器覆盖 C1-01~C1-15（含 F5 refresh 恢复、Meetings→查看结果、
+    FINALIZING not-ready、FAILED、404、网络错误独立 retry）。
 
 
 ## 常用命令

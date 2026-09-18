@@ -602,3 +602,50 @@ frontend/src/
 无 user isolation 假逻辑（单租户全量可见）     无翻页 UI（limit=20 单页，可后续加）
 无 AI Chat / 无真实 ASR / 无 Redis / Kafka   不进入 8C（Result / Summary 渲染）
 ```
+
+## 14. Result Page Recovery（Step 8C-1 已实现）
+
+> Result 页 = 归档阅读态：展示**持久化**的 Meeting + Summary + FINAL Transcript。
+> 刷新后从 Backend 全量恢复，不依赖 Zustand 临时状态（PRD §54）。
+> 与 MeetingRoom（实时态）职责分离：Result **不连接 Transcript SSE**，不消费
+> summary.* SSE（实时更新留 8C-2）。
+
+### 14.1 恢复模型
+
+```
+/meetings/:id/result
+├── GET Meeting（useMeetingLoad，复用 MeetingRoom 模式）
+├── GET Summary Snapshot（latest version，Step 7B §15，POST /summary 返回）
+└── GET Transcript Snapshot（仅 FINAL，segment_seq ASC，PRD §32/§48）
+```
+
+三个数据域**独立加载、独立错误、独立 retry**：
+- Meeting 域失败（404「会议不存在」/ network「会议加载失败」+ 重试）→ 页面级轻量态。
+- Summary 域失败（404 `summary not found` = 会议存在但纪要未生成；网络失败 →
+  「纪要加载失败」+ 重新加载）**不影响** Meeting / Transcript。
+- Transcript 域失败 → 「会议内容加载失败」+ 重新加载，**不影响** Summary / Meeting。
+
+### 14.2 Summary 状态展示（actual enum：NOT_STARTED / GENERATING / COMPLETED / FAILED）
+
+- `COMPLETED` → 真实分节（会议概述 / 核心议题 / 主要结论 / 未决问题，来自 SummaryOut
+  `overview / key_topics / conclusions / open_questions`；空数组弱化，不显示大空卡片）。
+- `GENERATING` / `NOT_STARTED` / meeting=FINALIZING 且 summary 未生成 → 「AI 纪要正在
+  生成」+ 轻量「刷新状态」（手动重新 GET，不做自动轮询）。
+- `FAILED` → 「AI 纪要生成失败」；**Meeting 仍显示 COMPLETED**（Summary FAILED ≠
+  Meeting FAILED，PRD §12）；Transcript Tab 仍可查看。
+- version：append-only；8C-1 只展示 latest（弱位置显示「版本 vN」，无版本切换）。
+
+### 14.3 404 语义区分（actual backend contract）
+
+- Meeting 不存在 → GET /summary 与 GET /meeting 均 404 `meeting not found: ...`；
+  前端 Meeting 域先捕到「会议不存在」。
+- 会议存在但 Summary 未生成 → GET /summary 404 `summary not found`；前端归为
+  「纪要尚未生成」/「AI 纪要正在生成」（按 Meeting 状态），绝不误显示「会议不存在」。
+
+### 14.4 明确不做（8C-1）
+
+```text
+无 summary.started / completed / failed SSE 消费（8C-2）
+无 Regenerate / 重新生成按钮（8C-3）             无版本切换 / 对比
+无自动轮询（手动「刷新状态」）                   无 Meeting 删除 / 编辑
+```
