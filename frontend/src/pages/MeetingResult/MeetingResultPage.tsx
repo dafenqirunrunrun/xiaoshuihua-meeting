@@ -1,3 +1,4 @@
+import { useCallback } from 'react'
 import { useNavigate, useParams } from 'react-router-dom'
 import { Button, Card, Skeleton, Tabs, Typography } from 'antd'
 import {
@@ -9,6 +10,7 @@ import { EmptyPlaceholder } from '@/components/EmptyPlaceholder'
 import { MeetingStatusTag } from '@/components/MeetingStatusTag'
 import { useMeetingLoad } from '@/hooks/useMeetingLoad'
 import { useMeetingSummary } from '@/hooks/useMeetingSummary'
+import { useSummaryResultStream } from '@/hooks/useSummaryResultStream'
 import { useTranscriptSnapshotResult } from '@/hooks/useTranscriptSnapshotResult'
 import { useMeetingStore } from '@/stores/meetingStore'
 import { formatDateTime, formatDuration } from '@/utils/time'
@@ -105,7 +107,7 @@ function SummarySections({ summary }: { summary: MeetingSummary }) {
 }
 
 /**
- * Meeting Result —— Step 8C-1：真实 Summary + Transcript 展示。
+ * Meeting Result —— Step 8C-2：真实 Summary + Transcript 展示 + Summary 实时通知。
  *
  * 恢复模型（刷新后从 Backend 恢复，不依赖 Zustand 残留）：
  *   GET Meeting → GET Summary Snapshot（latest version）→ GET Transcript Snapshot
@@ -115,8 +117,15 @@ function SummarySections({ summary }: { summary: MeetingSummary }) {
  *   - Transcript域（useTranscriptSnapshotResult，独立 retry）—— 会议内容 Tab
  * 任一域失败不拖垮其它域。
  *
- * 本 Step 明确不做：summary SSE / Regenerate / 版本切换（留 8C-2/8C-3）。
- * Result 是归档阅读态：不连 Transcript SSE，无 PARTIAL / live dot / streamStatus。
+ * 8C-2：Summary 实时通知（useSummaryResultStream）。
+ *   - SSE 只是通知通道，GET /summary 是 durable 事实源：
+ *     summary.started / completed / failed 到达 → 只重新 GET /summary（或 GET /meeting）；
+ *     **绝不**把 SSE 的 {version,status} payload 直接当 Summary 渲染。
+ *   - 仅当 summary 非 terminal（meeting FINALIZING / summary missing / GENERATING）
+ *     时连接 SSE；terminal 后关闭；手动「刷新状态」仍是兜底 fallback。
+ *   - Result 是归档阅读态：不消费 transcript.partial / final，不连 Transcript SSE。
+ *
+ * 本 Step 明确不做：Regenerate / 版本切换（留 8C-3）。
  */
 export function MeetingResultPage() {
   const { meetingId } = useParams<{ meetingId: string }>()
@@ -135,6 +144,34 @@ export function MeetingResultPage() {
   // Transcript 域（持久化 FINAL only，ASC）
   const { segments, loading: transcriptLoading, error: transcriptError, retry: retryTranscript } =
     useTranscriptSnapshotResult(meetingId)
+
+  // ---- 8C-2 Summary 实时通知 ----
+  // 连接条件（spec：仅 summary 非 terminal 时连 SSE）：
+  //   - meeting FINALIZING：纪要生成中 / 即将生成 → 连；
+  //   - meeting COMPLETED + summary GENERATING：重新生成中（8C-3 预留，天然兼容）→ 连；
+  //   - 其它（COMPLETED 且 summary 终态、CREATED/IN_PROGRESS、meeting 未加载）→ 不连。
+  // meeting 未加载前（null）不连，避免在未知状态上挂流。
+  const summaryTerminal =
+    summary?.status === 'COMPLETED' || summary?.status === 'FAILED'
+  const streamTerminal = !(
+    meeting?.status === 'FINALIZING' ||
+    (meeting?.status === 'COMPLETED' && summary?.status === 'GENERATING')
+  )
+  // onSummaryEvent：SSE 只是通知通道，只触发 GET（Server 是事实源），
+  // 绝不把 SSE 的 {version,status} payload 直接当 Summary 渲染。
+  const handleSummaryEvent = useCallback(() => {
+    if (summaryTerminal || !meetingId) return
+    // GET /summary（useMeetingSummary）→ 成功后持久化快照覆盖 UI；
+    // 404 → not_found → 渲染「正在生成」；meeting.status(COMPLETED) 时
+    // 重复 GET 无害（already COMPLETED → 快照即最终态）。
+    retrySummary()
+  }, [summaryTerminal, meetingId, retrySummary])
+
+  useSummaryResultStream({
+    meetingId,
+    terminal: streamTerminal,
+    onSummaryEvent: handleSummaryEvent,
+  })
 
   const handleBack = () => {
     if (window.history.length > 1) {
