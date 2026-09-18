@@ -2,6 +2,9 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { listMeetings, normalizeApiError } from '@/api'
 import type { Meeting, MeetingListQuery } from '@/types/meeting'
 
+/** 列表页分页：每页 20，后端默认亦为 20（LIST_DEFAULT_LIMIT）。 */
+const DEFAULT_LIMIT = 20
+
 /**
  * Meeting 列表加载钩子（Step 8B-6，Meeting Discovery）。
  *
@@ -13,7 +16,10 @@ import type { Meeting, MeetingListQuery } from '@/types/meeting'
  *
  * 组件不得直接调 axios —— 一律走 API 层 listMeetings。
  */
-export function useMeetingList(query: MeetingListQuery = {}, reloadKey = 0) {
+export function useMeetingList(
+  query: MeetingListQuery = {},
+  reloadKey = 0,
+) {
   const [meetings, setMeetings] = useState<Meeting[]>([])
   const [total, setTotal] = useState(0)
   const [loading, setLoading] = useState(true)
@@ -21,11 +27,18 @@ export function useMeetingList(query: MeetingListQuery = {}, reloadKey = 0) {
   const [retry, setRetry] = useState(0)
   const inFlight = useRef(0)
 
+  // 参数收敛为稳定标量：query 往往是渲染时新建的对象字面量，直接依赖其
+  // 引用会导致「请求 → setState → 重渲染 → 新引用 → 再次请求」的无限
+  // 循环，表现为首页持续抖动（每次响应都闪现 loading 骨架）。
+  const status = query.status ?? null
+  const limit = query.limit ?? DEFAULT_LIMIT
+  const offset = query.offset ?? 0
+
   const load = useCallback(() => {
     const reqId = ++inFlight.current
     setLoading(true)
     setError(null)
-    listMeetings(query)
+    listMeetings({ status: status ?? undefined, limit, offset })
       .then((res) => {
         if (inFlight.current !== reqId) return
         setMeetings(res.items)
@@ -39,7 +52,7 @@ export function useMeetingList(query: MeetingListQuery = {}, reloadKey = 0) {
       .finally(() => {
         if (inFlight.current === reqId) setLoading(false)
       })
-  }, [query])
+  }, [status, limit, offset])
 
   const reload = useCallback(() => setRetry((k) => k + 1), [])
 

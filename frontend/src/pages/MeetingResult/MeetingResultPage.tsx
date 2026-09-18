@@ -1,5 +1,6 @@
 import { Card, Tabs, Typography } from 'antd'
-import { FileTextOutlined } from '@ant-design/icons'
+import { ArrowLeftOutlined, FileTextOutlined } from '@ant-design/icons'
+import { useNavigate } from 'react-router-dom'
 import { EmptyPlaceholder } from '@/components/EmptyPlaceholder'
 
 const { Title } = Typography
@@ -8,11 +9,27 @@ const { Title } = Typography
  * Meeting Result —— Step 8A.1 视觉落地 + 8B-5 骨架打磨。
  * 双 Tab（会议纪要 / 会议内容）保留；纪要 tab 建立 Overview / Topics /
  * Conclusions / Open Questions 四区信息层级（8C 用真实数据填充）。
+ * 返回按钮：优先回上一界面（navigate(-1)）；无历史（直接输 URL 进来）
+ * 时回退到会议列表 /meetings。
  */
 export function MeetingResultPage() {
+  const navigate = useNavigate()
+
+  const handleBack = () => {
+    if (window.history.length > 1) {
+      navigate(-1)
+    } else {
+      navigate('/meetings')
+    }
+  }
+
   return (
     <div className="page result">
       <div className="result-head">
+        <button type="button" className="room__back" onClick={handleBack}>
+          <ArrowLeftOutlined aria-hidden />
+          返回
+        </button>
         <Title level={1} className="result-head__title h-m0">
           会议结果
         </Title>
