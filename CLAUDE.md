@@ -275,6 +275,25 @@ existing implementation
   - 验证：完整 Happy Path 实测（meeting_092bbe38，3 FINAL → COMPLETED → summary v1
     COMPLETED），浏览器覆盖 C1-01~C1-15（含 F5 refresh 恢复、Meetings→查看结果、
     FINALIZING not-ready、FAILED、404、网络错误独立 retry）。
+- **Step 8C-2 已完成**：Summary Realtime SSE（Result 页实时通知，`feat(frontend): stream summary generation status`）。
+  - **SSE 只当通知通道，GET /summary 是 durable 事实源**：summary.started / completed /
+    failed / meeting.status 到达 → 只触发 GET（/summary 或 /meeting），**绝不**把 SSE
+    `{version,status}` payload 直接当 Summary 渲染（summary events 非 durable、不回放）。
+  - 新 hook `useSummaryResultStream`（Result 专用，**不复用/不碰 useMeetingStream**）：
+    仅 summary 非 terminal（meeting FINALIZING，或 COMPLETED + summary GENERATING）
+    才连 SSE；terminal 后关闭；断线恢复 = 指数退避（1s/2s/4s/8s/max10s）+ **GET /summary**
+    → 已 terminal 则不重连，否则重建；StrictMode gen 计数保证单 EventSource。
+  - Result 页 `useSummaryResultStream` + `useMeetingSummary`（重 GET）协作：摘要生成中
+    显示「AI 纪要正在生成」（不造假进度）→ summary.completed 到达 → 自动 GET → 渲染
+    真实持久化摘要；手动「刷新状态」保留为 fallback（降权）。
+  - **不消费 transcript.partial/final**（Result 归档态）；不调用 regenerateSummary
+    （8C-3 加按钮）；不暴露 SSE 技术细节给用户。
+  - **Backend 零修改**；前端仅 `useSummaryResultStream.ts`（新建）+ MeetingResultPage
+    （接 hook）。
+  - 验证：后端回归 7A 28/28 + 7B 36/36 PASS；typecheck + build PASS；浏览器 E2E
+    （新建 FINALIZING → Result 页停留 SSE 已连 + 「AI 纪要正在生成」→ 后台 stream-end
+    → **无刷新**自动转真实摘要 COMPLETED + terminal 后 SSE 关闭）；COMPLETED 页不连
+    SSE + 刷新恢复摘要；FAILED 页显示生成失败且不连 SSE。
 
 
 ## 常用命令

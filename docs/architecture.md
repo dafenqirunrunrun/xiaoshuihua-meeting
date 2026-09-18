@@ -645,7 +645,65 @@ frontend/src/
 ### 14.4 明确不做（8C-1）
 
 ```text
-无 summary.started / completed / failed SSE 消费（8C-2）
 无 Regenerate / 重新生成按钮（8C-3）             无版本切换 / 对比
-无自动轮询（手动「刷新状态」）                   无 Meeting 删除 / 编辑
+无自动轮询（手动「刷新状态」兜底，SSE 通知见 §15）  无 Meeting 删除 / 编辑
+```
+
+## 15. Summary Realtime Notification（Step 8C-2 已实现）
+
+> Result 页在 8C-1 基础上新增 **Summary 生命周期实时通知**：
+> SSE 只是**通知通道**，GET /summary 才是 **durable 事实源**。
+> 「生成中 → 完成/失败」自动过渡，无需手动刷新；刷新/断线仍按 Snapshot 恢复。
+
+### 15.1 角色与连接条件
+
+```
+/meetings/:id/result（summary 非 terminal 时）
+├── GET Meeting
+├── GET Summary Snapshot（初始 latest）
+├── GET Transcript Snapshot
+└── EventSource /api/meetings/:id/events?after_segment_seq=0（仅 Summary 生命周期）
+```
+
+连接条件（useSummaryResultStream）：
+- **仅当 summary 未达 terminal** 才建立 SSE —— meeting 仍 FINALIZING（纪要生成中 /
+  即将生成），或 meeting COMPLETED 且 summary GENERATING（重新生成中）。
+- meeting COMPLETED 且 summary 终态（COMPLETED/FAILED）→ **不连**（无需通知，
+  手动刷新兜底；GET /summary 即快照）。
+- summary terminal 后 **关闭 EventSource**；重新生成开始则下次 render 自动重建。
+
+### 15.2 SSE 事件处理（只通知，不取数）
+
+| 事件 | 前端动作 |
+| --- | --- |
+| `summary.started` | 转「正在生成」（不造假进度/百分比） |
+| `summary.completed` | **重新 GET /summary** → 渲染持久化快照 |
+| `summary.failed` | **重新 GET /summary** → 渲染 FAILED 状态 |
+| `meeting.status(COMPLETED)` | **重新 GET /meeting**（Server 是状态事实源） |
+
+- **绝不**把 SSE `{version, status}` payload 直接当 Summary 渲染 —— 那是通知，
+  数据一律来自 GET /summary（SSE 非 durable、不回放，重连靠 GET）。
+- 消费到的任何 summary 事件都只触发一次轻量 GET；GET 失败不影响已有展示
+  （Summary 域独立 error/retry 保留）。
+
+### 15.3 断线恢复（Snapshot-first）
+
+- onerror → 主动 close → 指数退避（1s/2s/4s/8s/max10s）→ **GET /summary**：
+  - 若已 terminal → 不重建 SSE（已覆盖最终态）；
+  - 若仍 GENERATING/missing → 重建 SSE（新 EventSource）。
+- 与 MeetingRoom 的 useMeetingStream Trascript-Snapshot-recovery 同构，只是恢复源
+  换成 GET /summary。任何时刻最多一个 EventSource（StrictMode gen 计数防护）。
+
+### 15.4 硬约束
+
+- Result 是归档阅读态：**不消费 transcript.partial / final**（Transcript 由
+  useTranscriptSnapshotResult 从 GET 恢复）。
+- 不调用 regenerateSummary（8C-3 才加按钮）；不产生假进度；不暴露 SSE 技术细节给用户。
+- meetingId scope —— 每个会议独立 EventSource，切换/离开即关闭。
+
+### 15.5 明确不做（8C-2）
+
+```text
+无 Regenerate / 重新生成按钮（8C-3）   无版本切换 / 对比（8C-3）
+无 Transcript 实时流（Result 归档态）  无 Pause / ASR 控制
 ```
