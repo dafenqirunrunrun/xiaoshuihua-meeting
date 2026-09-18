@@ -69,10 +69,7 @@ export function AppShell() {
           style={{ borderInlineEnd: 'none' }}
         />
 
-        <div className="app-side-footer">
-          <span className="app-side-footer__tag">小水华</span>
-          让每一次会议，都有回响。
-        </div>
+        <div className="app-side-footer">让每一次会议，都有回响。</div>
       </Sider>
 
       <Layout>

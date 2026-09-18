@@ -37,12 +37,20 @@ function useNowTick(active: boolean, startIso: string | null | undefined) {
   return now
 }
 
-/** Header strip：真实后端字段，title 缺失/为空时才 fallback「未命名会议」。 */
-function Header({ meeting, action }: { meeting: Meeting; action?: React.ReactNode }) {
+/**
+ * Header strip：title + #id + 状态 Tag + timer（仅进行中），action 在右侧。
+ * 详细字段（开始时间 / 持续时长 / 转写连接态）留给右 Rail —— 不在此重复状态。
+ */
+function Header({
+  meeting,
+  action,
+  timer,
+}: {
+  meeting: Meeting
+  action?: React.ReactNode
+  timer?: string
+}) {
   const title = meeting.title?.trim() || '未命名会议'
-  const startedAtText = meeting.started_at
-    ? `${formatDateTime(meeting.started_at, true)} 开始`
-    : '等待开始'
   return (
     <header className="room__header">
       <div style={{ minWidth: 0 }}>
@@ -52,9 +60,13 @@ function Header({ meeting, action }: { meeting: Meeting; action?: React.ReactNod
         <div className="room__meta" style={{ marginTop: 6 }}>
           {meeting.id ? <span className="room__id">#{meeting.id}</span> : null}
           {meeting.id ? <span className="meta-sep" /> : null}
-          <span>{startedAtText}</span>
-          <span className="meta-sep" />
           <MeetingStatusTag status={meeting.status} />
+          {timer ? (
+            <>
+              <span className="meta-sep" />
+              <span className="u-tabular">{timer}</span>
+            </>
+          ) : null}
         </div>
       </div>
       {action ? <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>{action}</div> : null}
@@ -477,7 +489,11 @@ export function MeetingRoomPage() {
 
   return (
     <div className="page page--wide" style={{ minHeight: 0 }}>
-      <Header meeting={meeting} action={headerAction} />
+      <Header
+        meeting={meeting}
+        action={headerAction}
+        timer={meeting.status === 'IN_PROGRESS' ? durationText : undefined}
+      />
 
       <div className="room__body">
         <section className="room__transcript">

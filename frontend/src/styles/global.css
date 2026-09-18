@@ -139,20 +139,14 @@ body {
   color: var(--color-text-tertiary);
 }
 
-/* 侧栏底部 tagline：浅薄荷装饰板，安静收尾 */
+/* 侧栏底部 tagline：一行安静小字收尾，不抢视觉权重 */
 .app-side-footer {
-  margin: 16px 14px;
-  padding: 14px 16px;
-  border-radius: var(--radius-md);
-  background: linear-gradient(135deg, var(--color-mint-light), #f0fbf8);
-  color: #2c8f6e;
-  font-size: 12.5px;
+  margin: 16px 20px 0;
+  padding: 12px 0 0;
+  border-top: 1px solid var(--color-border-light);
+  color: var(--color-text-tertiary);
+  font-size: 12px;
   line-height: 1.6;
-}
-.app-side-footer__tag {
-  display: block;
-  font-weight: 600;
-  color: #1e7a5c;
 }
 
 /* 侧栏导航交互：hover 图标轻推 1px + 文字淡显 */
@@ -271,8 +265,8 @@ body {
   align-items: center;
   justify-content: space-between;
   gap: 24px;
-  margin: 12px 0 40px;
-  padding: 40px 44px;
+  margin: 8px 0 32px;
+  padding: 32px 40px;
   overflow: hidden;
   background: linear-gradient(135deg, #fdfeff 0%, #f0f6ff 55%, #edf7f4 100%);
   border: 1px solid var(--color-border);
@@ -282,37 +276,38 @@ body {
 .home-hero__copy {
   position: relative;
   z-index: 1;
-  max-width: 560px;
+  max-width: 520px;
 }
 .home-hero__title {
-  font-size: 28px !important;
+  font-size: 26px !important;
   font-weight: 600 !important;
   line-height: 1.28 !important;
   color: var(--color-text-primary) !important;
   letter-spacing: 0.01em;
 }
 .home-hero__subtitle {
-  font-size: 15px !important;
-  line-height: 1.7 !important;
+  font-size: 14px !important;
+  line-height: 1.65 !important;
   color: var(--color-text-secondary) !important;
-  margin-top: 10px !important;
+  margin-top: 8px !important;
   margin-bottom: 0 !important;
 }
 .home-hero__actions {
   display: flex;
   align-items: center;
   gap: 12px;
-  margin-top: 26px;
+  margin-top: 20px;
 }
 .home-hero__visual {
   position: relative;
   z-index: 1;
   flex: none;
   pointer-events: none;
+  opacity: 0.92;
 }
 .home-hero__visual svg {
   display: block;
-  width: min(400px, 38vw);
+  width: min(360px, 34vw);
   height: auto;
 }
 
@@ -534,20 +529,20 @@ body {
   align-items: center;
   justify-content: center;
   gap: 6px;
-  padding: 48px 24px;
+  padding: 32px 24px;
   text-align: center;
 }
 .prep-orb {
   position: relative;
   display: grid;
   place-items: center;
-  width: 84px;
-  height: 84px;
-  margin-bottom: 20px;
+  width: 68px;
+  height: 68px;
+  margin-bottom: 14px;
   border-radius: 50%;
   background: var(--color-primary-light);
   color: var(--color-primary);
-  font-size: 30px;
+  font-size: 26px;
 }
 .prep-orb::before,
 .prep-orb::after {
@@ -588,13 +583,13 @@ body {
 .room__rail {
   display: flex;
   flex-direction: column;
-  gap: 16px;
+  gap: 12px;
 }
 .rail-section {
   background: var(--color-bg-surface);
   border: 1px solid var(--color-border);
   border-radius: var(--radius-lg);
-  padding: 16px 20px;
+  padding: 14px 18px;
   box-shadow: var(--shadow-card);
 }
 .rail-title {
@@ -609,7 +604,7 @@ body {
   align-items: center;
   justify-content: space-between;
   gap: 12px;
-  padding: 8px 0;
+  padding: 6px 0;
   border-bottom: 1px solid var(--color-border-light);
 }
 .info-row:last-child {
@@ -706,8 +701,8 @@ body {
 .settings-entry {
   display: flex;
   align-items: center;
-  gap: 16px;
-  padding: 20px 6px;
+  gap: 14px;
+  padding: 14px 6px;
   border-bottom: 1px solid var(--color-border-light);
 }
 .settings-entry:last-child {
@@ -717,12 +712,12 @@ body {
   display: grid;
   place-items: center;
   flex: none;
-  width: 40px;
-  height: 40px;
+  width: 34px;
+  height: 34px;
   border-radius: var(--radius-md);
   background: var(--color-bg-subtle);
   color: var(--color-primary);
-  font-size: 18px;
+  font-size: 16px;
 }
 .settings-entry__body {
   min-width: 0;
@@ -737,6 +732,11 @@ body {
   margin-top: 2px;
   font-size: 12.5px;
   line-height: 1.6;
+  color: var(--color-text-tertiary);
+}
+.settings-entry__arrow {
+  flex: none;
+  font-size: 12px;
   color: var(--color-text-tertiary);
 }
 
@@ -817,16 +817,16 @@ body {
   .home-hero {
     flex-direction: column;
     align-items: flex-start;
-    padding: 28px 24px;
+    padding: 24px 24px;
   }
   .home-hero__visual {
     position: absolute;
     right: -40px;
     bottom: -20px;
-    opacity: 0.35;
+    opacity: 0.3;
   }
   .home-hero__visual svg {
-    width: 260px;
+    width: 240px;
   }
 }
 

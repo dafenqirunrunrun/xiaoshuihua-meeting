@@ -49,7 +49,7 @@ export function HomePage() {
         </div>
       </div>
 
-      {/* 最近会议：真实空态 + CTA */}
+      {/* 最近会议：真实空态（无 CTA —— 主 CTA 已在 Hero，避免同屏重复） */}
       <section>
         <div className="section-header">
           <div>
@@ -63,15 +63,6 @@ export function HomePage() {
             icon={<CalendarOutlined />}
             title="暂无会议记录"
             description="创建你的第一场会议，实时转写与 AI 纪要将在这里沉淀。"
-            action={
-              <Button
-                type="primary"
-                icon={<PlusOutlined />}
-                onClick={() => setModalOpen(true)}
-              >
-                创建会议
-              </Button>
-            }
             compact
           />
         </div>

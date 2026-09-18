@@ -3,6 +3,7 @@ import {
   SettingOutlined,
   DatabaseOutlined,
   InfoCircleOutlined,
+  RightOutlined,
 } from '@ant-design/icons'
 
 const { Title } = Typography
@@ -26,8 +27,8 @@ const SETTINGS_ENTRIES = [
 ]
 
 /**
- * 设置页骨架（Visual Polish，fronted_designer §31 保留）。
- * 三个分组入口 + 明确「Coming later」占位。
+ * 设置页（fronted_designer §31 保留，8B-5.1 紧凑化）。
+ * 三个分组条目（模型设置 / 数据管理 / 关于我们）+ 轻量 chevron，形如真实设置列表。
  * 明确不做：API Key / 麦克风 等不真实能力（PRD §45 设备拒绝、arch §10）。
  */
 export function SettingsPage() {
@@ -52,6 +53,7 @@ export function SettingsPage() {
               <div className="settings-entry__name">{entry.name}</div>
               <div className="settings-entry__desc">{entry.desc}</div>
             </div>
+            <RightOutlined className="settings-entry__arrow" aria-hidden />
           </div>
         ))}
       </div>
