@@ -1,0 +1,245 @@
+import { useEffect, useRef } from 'react'
+import { getMeeting, getTranscriptSnapshot } from '@/api'
+import { useMeetingStore } from '@/stores/meetingStore'
+import type { Meeting } from '@/types/meeting'
+import type { PartialUtterance, TranscriptSegment } from '@/types/transcript'
+import type { SseEnvelope } from '@/types/sse'
+
+/**
+ * 实时转写 SSE 流（Step 8B-4）。消费 Step 5 已实现的 gap-free 契约。
+ *
+ * 连接顺序（PRD §53/§54）：Snapshot 是持久化事实源，SSE 只是实时通知通道。
+ *   GET Meeting → GET Transcript Snapshot → maxSegmentSeq → GET /events?after_segment_seq=maxSeq
+ * 绝不先连 SSE 再等 Snapshot。
+ *
+ * 生命周期：
+ *   - CREATED / COMPLETED：不连 / 关闭（COMPLETED 后无需实时字幕）。
+ *   - IN_PROGRESS / FINALIZING：建立并保持 SSE。Finish → FINALIZING 不关流，
+ *     ASR 可能仍发 trailing FINAL（Finish ≠ Transcript Stream End）。
+ *   - unmount / meetingId 变化：close EventSource + 清 reconnect timer（gen 防护）。
+ *
+ * 断线恢复（onerror）：浏览器默认自动重连不可靠（后端恢复协议是
+ * Snapshot + after_segment_seq），所以主动 close → clear PARTIAL（临时态不持久）
+ * → 指数退避（1s/2s/4s/8s/max10s）→ 重新 GET Snapshot → setFinalSegments →
+ * 重算 maxSeq → 以新游标重建 SSE。绝不依赖 Last-Event-ID。
+ *
+ * React StrictMode：cleanup close 使任意时刻每个 meeting 最多一个 active
+ * EventSource（gen 计数防护过期回调 / 双连接）。
+ *
+ * meeting.status 事件：不猜 timestamps，调用 GET Meeting 用 server 响应覆盖
+ * store（Server 是 Meeting Source of Truth）。
+ *
+ * SSE 永远不是事实源：断 ≠ 丢；刷新走 Snapshot 恢复。
+ */
+const BASE_DELAY = 1000
+const MAX_DELAY = 10000
+
+function backoffDelay(attempt: number): number {
+  return Math.min(BASE_DELAY * 2 ** attempt, MAX_DELAY)
+}
+
+interface UseMeetingStreamParams {
+  meetingId: string | undefined
+  status: Meeting['status'] | undefined
+  /** Snapshot 首次加载成功后才为 true —— 是建立 SSE 的前置条件 */
+  snapshotReady: boolean
+  /** 已持久化 FINAL 的最大 segment_seq（作为连接游标 after_segment_seq） */
+  maxSegmentSeq: number
+}
+
+/** 从 partial 记录里摘掉某 utterance（无则原样返回，避免无谓 setState） */
+function withoutPartial(
+  partials: Record<string, PartialUtterance>,
+  utteranceId: string,
+): Record<string, PartialUtterance> {
+  if (!(utteranceId in partials)) return partials
+  const next = { ...partials }
+  delete next[utteranceId]
+  return next
+}
+
+export function useMeetingStream({
+  meetingId,
+  status,
+  snapshotReady,
+  maxSegmentSeq,
+}: UseMeetingStreamParams) {
+  const esRef = useRef<EventSource | null>(null)
+  const timerRef = useRef<number | null>(null)
+  const genRef = useRef(0)
+  const retryRef = useRef(0)
+  const maxSeqRef = useRef(0)
+  const statusRef = useRef(status)
+  // Snapshot 游标只增不减：初始以此 seed；后续 live FINAL / 显式 recovery 更新。
+  // 若每次 render 都覆盖会把「已收到的 live max」打回 snapshot 值，破坏重连游标。
+  if (maxSegmentSeq > maxSeqRef.current) maxSeqRef.current = maxSegmentSeq
+  statusRef.current = status
+
+  /** 关闭当前流 + 清退避 timer；gen++ 使过期回调静默失效。 */
+  const closeStream = () => {
+    genRef.current += 1
+    if (timerRef.current !== null) {
+      window.clearTimeout(timerRef.current)
+      timerRef.current = null
+    }
+    if (esRef.current) {
+      esRef.current.close()
+      esRef.current = null
+    }
+  }
+
+  /** writer helpers：SSE reducer 逻辑（FINAL 去重 + ASC；PARTIAL 原地覆盖） */
+  const handlePartial = (env: SseEnvelope) => {
+    const p = env.payload as { utterance_id?: string; speaker_id?: string; text?: string }
+    if (!p?.utterance_id) return
+    useMeetingStore.getState().upsertPartial({
+      utterance_id: p.utterance_id,
+      speaker_id: p.speaker_id ?? 'unknown',
+      text: p.text ?? '',
+    })
+  }
+
+  const handleFinal = (env: SseEnvelope) => {
+    const p = env.payload as Record<string, unknown>
+    if (typeof p.segment_seq !== 'number' || typeof p.utterance_id !== 'string') return
+    const seg: TranscriptSegment = {
+      segment_seq: p.segment_seq,
+      utterance_id: p.utterance_id,
+      speaker_id: typeof p.speaker_id === 'string' ? p.speaker_id : 'unknown',
+      text: typeof p.text === 'string' ? p.text : '',
+      start_ms: typeof p.start_ms === 'number' ? p.start_ms : null,
+      end_ms: typeof p.end_ms === 'number' ? p.end_ms : null,
+    }
+    // segment_seq 是前端去重主依据（Snapshot catch-up / 重连重复均不重复展示）+ ASC
+    useMeetingStore.setState((s) => {
+      if (s.finalSegments.some((f) => f.segment_seq === seg.segment_seq)) {
+        return { partialUtterances: withoutPartial(s.partialUtterances, seg.utterance_id) }
+      }
+      return {
+        finalSegments: [...s.finalSegments, seg].sort(
+          (a, b) => a.segment_seq - b.segment_seq,
+        ),
+        partialUtterances: withoutPartial(s.partialUtterances, seg.utterance_id),
+      }
+    })
+    if (seg.segment_seq > maxSeqRef.current) maxSeqRef.current = seg.segment_seq
+  }
+
+  const handleMeetingStatus = async (mid: string) => {
+    try {
+      // Server 是 Source of Truth：状态事件只是通知，用 GET Meeting 覆盖
+      const updated = await getMeeting(mid)
+      useMeetingStore.getState().setMeeting(updated)
+    } catch {
+      // 拉取失败：保留现状不清空；后续状态事件会再触发
+    }
+  }
+
+  const handleRecovery = (mid: string) => {
+    const gen = genRef.current
+    const attempt = retryRef.current
+    retryRef.current += 1
+    const delay = backoffDelay(attempt)
+    if (timerRef.current !== null) window.clearTimeout(timerRef.current)
+    timerRef.current = window.setTimeout(async () => {
+      timerRef.current = null
+      if (genRef.current !== gen) return // 已清理（离开页面 / 切换会议）
+      const st = statusRef.current
+      if (st === 'CREATED' || st === 'COMPLETED') return // 不再需要实时
+      try {
+        // Snapshot Recovery：重拉已持久化 FINAL → 新游标 → 新 SSE
+        const snapshot = await getTranscriptSnapshot(mid)
+        if (genRef.current !== gen) return
+        const segs = snapshot.segments
+        useMeetingStore.getState().setFinalSegments(segs)
+        const newMax = segs.length ? segs[segs.length - 1].segment_seq : 0
+        maxSeqRef.current = newMax
+        openStream(mid, newMax)
+      } catch {
+        if (genRef.current !== gen) return
+        handleRecovery(mid) // Snapshot 失败 → 继续退避重试
+      }
+    }, delay)
+  }
+
+  const openStream = (mid: string, cursor: number) => {
+    if (esRef.current) return // 单连接防护：任意时刻最多一个 EventSource
+    const gen = genRef.current
+    useMeetingStore.getState().setStreamStatus('connecting')
+
+    const es = new EventSource(`/api/meetings/${mid}/events?after_segment_seq=${cursor}`)
+    esRef.current = es
+
+    es.onopen = () => {
+      if (genRef.current !== gen) {
+        es.close()
+        return
+      }
+      retryRef.current = 0 // 成功连接后重置退避
+      useMeetingStore.getState().setStreamStatus('connected')
+    }
+
+    es.onerror = () => {
+      if (genRef.current !== gen) return
+      if (esRef.current) {
+        esRef.current.close()
+        esRef.current = null
+      }
+      useMeetingStore.getState().setStreamStatus('reconnecting')
+      useMeetingStore.getState().clearPartialUtterances() // PARTIAL 临时态，恢复前清空
+      handleRecovery(mid)
+    }
+
+    const onMessage = (e: MessageEvent) => {
+      if (genRef.current !== gen) return
+      try {
+        const env = JSON.parse(e.data as string) as SseEnvelope
+        if (env.meeting_id !== mid) return // 防御：只处理本会议帧
+        switch (env.event_type) {
+          case 'transcript.partial':
+            handlePartial(env)
+            break
+          case 'transcript.final':
+            handleFinal(env)
+            break
+          case 'meeting.status':
+            // eslint-disable-next-line @typescript-eslint/no-floating-promises
+            handleMeetingStatus(mid)
+            break
+          default:
+            break // heartbeat / summary.*（留给 8C）忽略
+        }
+      } catch {
+        /* 畸形帧：忽略，不打断流 */
+      }
+    }
+
+    es.addEventListener('message', onMessage)
+  }
+
+  // ---- 主生命周期：连接条件满足才建立，否则关闭 ----
+  useEffect(() => {
+    if (!meetingId || !status) return
+    const active = status === 'IN_PROGRESS' || status === 'FINALIZING'
+    if (!active) {
+      closeStream()
+      useMeetingStore.getState().setStreamStatus('idle')
+      return
+    }
+    if (!snapshotReady) return // Snapshot 前置：先恢复已持久化 FINAL 再连 SSE
+    openStream(meetingId, maxSeqRef.current)
+    return () => closeStream()
+  }, [meetingId, status, snapshotReady])
+
+  // unmount 兜底：StrictMode cleanup 由上面 effect 负责；这里再保底一次
+  useEffect(() => {
+    return () => {
+      genRef.current += 1
+      if (timerRef.current !== null) window.clearTimeout(timerRef.current)
+      if (esRef.current) {
+        esRef.current.close()
+        esRef.current = null
+      }
+    }
+  }, [])
+}

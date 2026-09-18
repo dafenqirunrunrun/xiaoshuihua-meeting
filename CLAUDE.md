@@ -186,6 +186,30 @@ existing implementation
     路由可达（SPA fallback 200），Vite proxy `/api/health → 8000` 连通。
   - **Backend 零修改**（Step 8A 未动 `backend/`）。
   - 前端命令见下方「常用命令」。
+- **Step 8B-1 已完成**：Meeting Snapshot + CREATED pre-meeting 态（`7bf6af4`）。
+- **Step 8B-2 已完成**：Start / Finish Lifecycle（`31a6ba9`）。
+  - 创建 ≠ 开始：CREATED 展示「开始会议」→ POST /start → IN_PROGRESS；
+    IN_PROGRESS 展示「结束会议」（Popconfirm）→ POST /finish → FINALIZING。
+  - Server 是 Source of Truth：start/finish 均以 backend 返回的 Meeting 覆盖 store，
+    前端绝不自行写 status / started_at / COMPLETED；错误展示后端 409 detail。
+  - FINALIZING / COMPLETED 无 start/finish 按钮；finish ≠ completed（绝不预置 COMPLETED）。
+- **Step 8B-3 已完成**：Transcript Snapshot（`ae17b38`）。
+  - GET Meeting 成功 → GET /transcript Snapshot → `setFinalSegments`（FINAL 仅 ASC）。
+  - Snapshot 是已持久化 FINAL 的历史事实源；CREATED 不拉；IN_PROGRESS/FINALIZING/
+    COMPLETED 均可看历史。失败只影响 Transcript 区（轻量重试），不动 meeting。
+- **Step 8B-4 已完成**：Realtime Transcript SSE + Auto Scroll（文档见 `architecture.md §6.1`）。
+  - **恢复模型**：GET Meeting → GET Transcript Snapshot → `maxSegmentSeq` →
+    `GET /events?after_segment_seq=maxSeq`（Snapshot FIRST，SSE 只是通知通道）。
+  - `useMeetingStream`：EventSource 生命周期 + 断线 Snapshot-recovery 指数退避
+    （1s/2s/4s/8s/max10s）+ `meeting.status → GET Meeting` 覆盖 store（不猜状态）。
+  - `useMeetingStream.ts` store：`upsertPartial`（utterance_id 原地覆盖）/
+    `removePartialUtterance`（FINAL 落定删除）/ `clearPartialUtterances`（恢复前清空）/
+    `setStreamStatus`；FINAL 去重以 `segment_seq` 为准 + 保持 ASC。
+  - CREATED / COMPLETED 不连流；Finish → FINALIZING **不关流**（trailing FINAL 仍收）；
+    unmount / meetingId 变化 close + 清游标；StrictMode 单 EventSource（gen 计数）。
+  - `useAutoScroll`：底部附近跟随 / 向上查历史暂停 + 「回到底部」/ 首次 instant。
+    纯 UI，不影响数据语义。PARTIAL 次级轻量（opacity），FINAL 正式稳定。
+  - **Backend 零业务修改**；未处理 summary.* 事件（8C）。
 
 
 ## 常用命令

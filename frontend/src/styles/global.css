@@ -320,6 +320,26 @@ body {
   font-variant-numeric: tabular-nums;
 }
 
+/* 8B-4 PARTIAL 临时字幕：次级轻量，克制不喧哗；FINAL 落定即消失 */
+.transcript-segment--partial {
+  opacity: 0.62;
+}
+.transcript-segment--partial .transcript-segment__speaker {
+  color: var(--color-text-tertiary);
+}
+.transcript-segment--partial .transcript-segment__text {
+  color: var(--color-text-secondary);
+}
+.transcript-segment--partial .transcript-segment__time {
+  color: var(--color-primary);
+  font-weight: 500;
+}
+
+/* 8B-4 「有新内容 · 回到底部」轻量按钮：悬浮于 section head 右侧 */
+.transcript-jump {
+  margin-left: auto;
+}
+
 /* live 指示：平缓呼吸点，克制不喧哗 */
 .live-dot {
   width: 8px;

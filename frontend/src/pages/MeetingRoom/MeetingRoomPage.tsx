@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { useNavigate, useParams } from 'react-router-dom'
 import { Button, Skeleton, Tag, message, Popconfirm } from 'antd'
 import {
@@ -8,6 +8,7 @@ import {
   ArrowLeftOutlined,
   PlayCircleOutlined,
   StopOutlined,
+  ArrowDownOutlined,
 } from '@ant-design/icons'
 import { EmptyPlaceholder } from '@/components/EmptyPlaceholder'
 import { InfoRow } from '@/components/InfoRow'
@@ -15,10 +16,12 @@ import { MeetingStatusTag } from '@/components/MeetingStatusTag'
 import { useMeetingStore } from '@/stores/meetingStore'
 import { useMeetingLoad } from '@/hooks/useMeetingLoad'
 import { useTranscriptSnapshot } from '@/hooks/useTranscriptSnapshot'
+import { useMeetingStream } from '@/hooks/useMeetingStream'
+import { useAutoScroll } from '@/hooks/useAutoScroll'
 import { formatDateTime, formatDuration, elapsedMs } from '@/utils/time'
 import { startMeeting, finishMeeting, normalizeApiError } from '@/api'
 import type { Meeting } from '@/types/meeting'
-import type { TranscriptSegment } from '@/types/transcript'
+import type { PartialUtterance, TranscriptSegment } from '@/types/transcript'
 
 /** 实时秒数刷新 hook：仅 active 时以 1s 步进更新，unmount 或 active 变 false 即清理。 */
 function useNowTick(active: boolean, startIso: string | null | undefined) {
@@ -86,26 +89,57 @@ function timingText(startMs: number | null, endMs: number | null): string {
   return `${(startMs / 1000).toFixed(1)}s`
 }
 
+/** 实时转写状态标签（8B-4）：meeting.status 与 streamStatus 是两个不同维度 */
+function streamStatusTag(
+  meetingStatus: Meeting['status'],
+  streamStatus: ReturnType<typeof useMeetingStore.getState>['streamStatus'],
+) {
+  switch (meetingStatus) {
+    case 'CREATED':
+      return <Tag color="default">等待会议开始</Tag>
+    case 'IN_PROGRESS':
+      if (streamStatus === 'connected') return <Tag color="blue">实时转写已连接</Tag>
+      if (streamStatus === 'reconnecting') return <Tag color="warning">正在重新连接</Tag>
+      if (streamStatus === 'connecting') return <Tag color="processing">连接中...</Tag>
+      return <Tag color="default">等待实时连接</Tag>
+    case 'FINALIZING':
+      if (streamStatus === 'connected') return <Tag color="processing">正在接收最后转写</Tag>
+      return <Tag color="default">正在收尾</Tag>
+    case 'COMPLETED':
+      return <Tag>转写已结束</Tag>
+    default:
+      return <Tag color="default">等待会议开始</Tag>
+  }
+}
+
 /**
- * 转写内容区：展示已持久化 FINAL，或按状态的中性空态 / 轻量失败态。
- * 8B-3 不做 PARTIAL / streaming 光标 / 自动滚动。
+ * 转写内容区：已持久化 FINAL（正式稳定）+ 实时 PARTIAL（次级轻量）+ 空态 / 失败态。
+ * 8B-4 才做 PARTIAL 展示与自动滚动；不做大面积动画 / streaming 光标。
  */
 function TranscriptBody({
   status,
   segments,
+  partials,
+  streamStatus,
   error,
   loading,
   onRetry,
+  listRef,
 }: {
   status: Meeting['status']
   segments: TranscriptSegment[]
+  partials: PartialUtterance[]
+  streamStatus: ReturnType<typeof useMeetingStore.getState>['streamStatus']
   error: string
   loading: boolean
   onRetry: () => void
+  listRef?: React.Ref<HTMLOListElement>
 }) {
   const placeholder = transcriptPlaceholder(status)
+  const hasContent = segments.length > 0 || partials.length > 0
+  const reconnecting = streamStatus === 'reconnecting' || streamStatus === 'connecting'
 
-  if (loading && segments.length === 0) {
+  if (loading && segments.length === 0 && partials.length === 0) {
     return (
       <div className="transcript-surface transcript-surface--top">
         <Skeleton active paragraph={{ rows: 3 }} title={false} />
@@ -131,12 +165,17 @@ function TranscriptBody({
     )
   }
 
-  if (segments.length === 0) {
+  if (!hasContent) {
+    // 空态文案按状态 + 断线恢复提示
+    const title =
+      status === 'IN_PROGRESS' && reconnecting
+        ? '实时连接恢复中...'
+        : placeholder.title
     return (
       <div className="transcript-surface">
         <EmptyPlaceholder
           icon={<AudioOutlined />}
-          title={placeholder.title}
+          title={title}
           description={placeholder.description}
           compact
         />
@@ -146,7 +185,7 @@ function TranscriptBody({
 
   return (
     <div className="transcript-surface transcript-surface--top">
-      <ol className="transcript-segments">
+      <ol className="transcript-segments" ref={listRef}>
         {segments.map((seg) => (
           <li key={seg.segment_seq} className="transcript-segment">
             <span className="transcript-segment__speaker">{seg.speaker_id}</span>
@@ -156,6 +195,13 @@ function TranscriptBody({
                 {timingText(seg.start_ms, seg.end_ms)}
               </span>
             ) : null}
+          </li>
+        ))}
+        {partials.map((p) => (
+          <li key={p.utterance_id} className="transcript-segment transcript-segment--partial">
+            <span className="transcript-segment__speaker">{p.speaker_id}</span>
+            <span className="transcript-segment__text">{p.text}</span>
+            <span className="transcript-segment__time">识别中</span>
           </li>
         ))}
       </ol>
@@ -174,22 +220,16 @@ function summaryTag(status: Meeting['status']) {
   return <Tag>等待会议结束</Tag>
 }
 
-/** 转写标签（仅展示） */
-function transcriptTag(status: Meeting['status']) {
-  if (status === 'IN_PROGRESS') return <Tag color="blue">进行中</Tag>
-  if (status === 'FINALIZING' || status === 'COMPLETED') return <Tag>已关闭</Tag>
-  return <Tag color="default">等待会议开始</Tag>
-}
-
 /**
  * Meeting Room —— Step 8B-1 真实 GET Meeting 驱动 + 8B-2 生命周期（start/finish）
- * + 8B-3 Transcript Snapshot（已持久化 FINAL 恢复展示）。
+ * + 8B-3 Transcript Snapshot（已持久化 FINAL 恢复展示）+ 8B-4 实时 SSE + 自动滚动。
  * 创建 ≠ 开始：CREATED 展示「准备开始会议」，点击「开始会议」→ POST /start → IN_PROGRESS；
  * IN_PROGRESS 可「结束会议」→ POST /finish → FINALIZING。
  * Server 是 Source of Truth：start/finish 均以 backend 返回的 Meeting 覆盖 store，
  * 前端绝不自行写 status / started_at / COMPLETED。
- * 8B-3：Meeting 成功后 GET /transcript Snapshot 恢复 FINAL 列表（ASC，仅历史事实）。
- * 8B-4 才接入 SSE 实时转写；此处不调用 summary 接口。
+ * 恢复模型：GET Meeting → GET Transcript Snapshot → maxSeq → SSE after_segment_seq。
+ * SSE 只是实时通知通道，不是事实源（断 ≠ 丢；刷新走 Snapshot 恢复）。
+ * 8B-4 不处理 summary.* 事件（留给 8C）。
  */
 export function MeetingRoomPage() {
   const { meetingId } = useParams<{ meetingId: string }>()
@@ -207,6 +247,8 @@ export function MeetingRoomPage() {
 
   // 8B-3：Meeting 成功存在后再加载 Transcript Snapshot（仅持久化 FINAL，ASC）
   const finalSegments = useMeetingStore((s) => s.finalSegments)
+  const partials = useMeetingStore((s) => s.partialUtterances)
+  const streamStatus = useMeetingStore((s) => s.streamStatus)
   const {
     transcriptError,
     transcriptLoading,
@@ -225,6 +267,29 @@ export function MeetingRoomPage() {
     meeting?.status === 'IN_PROGRESS' && meeting.started_at
       ? formatDuration(elapsedMs(meeting.started_at, new Date(now)))
       : '--'
+
+  // 8B-4：Snapshot 成功后计算 maxSegmentSeq 作为 SSE 游标（无 FINAL → 0，backend 允许）
+  const snapshotReady = !transcriptLoading && !transcriptError
+  const maxSegmentSeq = finalSegments.length
+    ? finalSegments[finalSegments.length - 1].segment_seq
+    : 0
+
+  // 8B-4：SSE 流（含 Snapshot-first 连接、断线恢复、meeting.status→GET Meeting）
+  useMeetingStream({
+    meetingId,
+    status: meeting?.status,
+    snapshotReady,
+    maxSegmentSeq,
+  })
+
+  // 8B-4：自动滚动（跟随底部 / 向上查历史暂停 / 回到底部 FAB）
+  const segmentsRef = useRef<HTMLOListElement>(null)
+  // contentKey：FINAL 数 + PARTIAL 文本变化 → 驱动跟随（新行与正文变长都算）
+  const partialList = Object.values(partials)
+  const contentKey = `${finalSegments.length}:${partialList
+    .map((p) => `${p.utterance_id}=${p.text}`)
+    .join('|')}`
+  const { showJumpButton, jumpToBottom } = useAutoScroll(segmentsRef, contentKey)
 
   // ---- 生命周期动作（Step 8B-2）：start / finish，仅经 API layer ----
   const [startLoading, setStartLoading] = useState(false)
@@ -396,13 +461,26 @@ export function MeetingRoomPage() {
           <div className="room__section-head">
             <span className="live-dot" />
             <span>实时记录</span>
+            {showJumpButton ? (
+              <Button
+                className="transcript-jump"
+                size="small"
+                icon={<ArrowDownOutlined />}
+                onClick={jumpToBottom}
+              >
+                有新内容 · 回到底部
+              </Button>
+            ) : null}
           </div>
           <TranscriptBody
             status={meeting.status}
             segments={finalSegments}
+            partials={partialList}
+            streamStatus={streamStatus}
             error={transcriptError}
             loading={transcriptLoading}
             onRetry={retryTranscript}
+            listRef={segmentsRef}
           />
         </section>
 
@@ -433,7 +511,7 @@ export function MeetingRoomPage() {
           <div className="rail-section">
             <div className="rail-title">会议信息</div>
             <InfoRow label="Meeting ID" value={<span className="room__id">{meeting.id}</span>} />
-            <InfoRow label="转写" value={transcriptTag(meeting.status)} />
+            <InfoRow label="转写" value={streamStatusTag(meeting.status, streamStatus)} />
           </div>
         </aside>
       </div>

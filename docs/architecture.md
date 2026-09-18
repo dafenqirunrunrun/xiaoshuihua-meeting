@@ -131,6 +131,43 @@ Receive incremental events
 
 - SSE 只是实时增量通知机制；页面刷新 / 重连 / 重新进入一律用 Snapshot 恢复后去重。
 
+### 6.1 Frontend SSE 消费实现（Step 8B-4 已实现）
+
+> 消费 Step 5 的 gap-free 契约；**Backend 零业务修改**（前端纯 Consumer）。
+
+```text
+Snapshot FIRST → SSE SECOND
+  GET Meeting
+    ↓
+  GET Transcript Snapshot          ← 持久化事实（durable source of truth）
+    ↓
+  maxSegmentSeq = 最后一个 FINAL 的 segment_seq（无 FINAL → 0，backend 允许）
+    ↓
+  GET /api/meetings/{id}/events?after_segment_seq=maxSeq
+```
+
+- **连接顺序不可倒置**：Snapshot 是恢复基线，SSE 只是实时通知通道。
+- **Stream 生命周期**：CREATED / COMPLETED 不连（或关闭）；IN_PROGRESS / FINALIZING
+  建立并保持。`Finish → FINALIZING` **不关流**：ASR 可能仍发 trailing FINAL
+  （Finish ≠ Transcript Stream End）。unmount / meetingId 变化必须 close EventSource。
+- **PARTIAL ephemeral / FINAL durable**：SSE 只负责 **live projection**；PARTIAL 是
+  临时态（keyed by `utterance_id` 原地覆盖，FINAL 落定即删，不持久化、不写
+  localStorage）；FINAL 以 `segment_seq` 前端去重 + 保持 ASC，Snapshot catch-up /
+  重连重复不会造成重复展示。
+- **meeting.status 事件**：前端不猜 timestamps / 不构造 Meeting —— 收到后调用
+  GET Meeting，用 server 响应覆盖 store（Server 仍是 Meeting Source of Truth）。
+  这样 FINALIZING → COMPLETED 由后端真正状态驱动（Summary 事件交给 8C）。
+- **断线恢复（onerror）**：浏览器默认自动重连不可靠（恢复协议是
+  Snapshot + after_segment_seq），so：主动 close → `clearPartialUtterances`（临时态）
+  → 指数退避（1s/2s/4s/8s/max 10s，成功连接后重置）→ 重新 GET Snapshot →
+  setFinalSegments → 重算 maxSeq → 以新游标重建 SSE。**绝不依赖 Last-Event-ID**。
+- **单连接不变量**：React StrictMode 的 cleanup + `gen` 计数 + `openStream` 单飞
+  保证任意时刻每个 meeting 最多一个 active EventSource；旧会议的 reconnect timer
+  在 meetingId 变化时清除（gen 失效），不污染新会议。
+- **auto-scroll 不影响数据语义**：底部附近自动跟随（新 PARTIAL/FINAL 或 PARTIAL
+  文本变长）；用户向上查历史则暂停跟随，显示「有新内容 · 回到底部」，点击恢复。
+  纯 UI 行为。
+
 ## 7. Stream End 与 Freeze
 
 - 用户 Finish 进入 FINALIZING **不代表 Transcript 已完整**。
