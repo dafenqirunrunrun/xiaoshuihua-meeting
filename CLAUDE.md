@@ -502,3 +502,60 @@ npm run build      # tsc --noEmit && vite build
     LLM Provider / DeepSeek / **DB 既有表**（仅新增 1 张表，无 migration）/
     **前端业务代码**。
   - **本 Step 未 push**（按用户要求：可 commit 到 `dafenqi`，等待确认后再 push）。
+- **Step AGENT-2 已完成**：Final Summary V2 —— Meeting State as the primary summary input。
+  - **输入升级（本步唯一实质变更）**：`full transcript → LLM → summary` 升级为
+    `Meeting State（工作记忆）+ 选定 Transcript Evidence → LLM → summary`。
+    **Meeting State 负责「重要信息是什么」，Evidence 负责「原话证据是什么」**；
+    不再默认把整份 Transcript 喂进 Prompt。
+  - **§2 排序不变式（本步最重要）**：`finish → flush 剩余 FINAL → Meeting State 达到最新
+    → 才生成 Final Summary`。`finalize_for_meeting` 现在**自己**同步强制 flush
+    （`meeting_state_service.process_pending(force_flush=True)`，Step 0）——
+    因为 `/finish` 的 flush 跑在**另一个后台任务**里，可能失败/竞争/根本没跑
+    （trailing FINAL / crash-gap）。`assess_usability` 守住最后一跳：状态游标落后于
+    transcript 时**拒绝使用**（`state_stale`）→ 降级。**绝不静默使用过期状态当完整状态**。
+  - **Fallback（§8/§9，设计的降级，非失败）**：`v2_disabled` / `agent_disabled` /
+    `no_state` / `state_failed` / `state_empty` / `state_stale` / `state_unreadable`
+    任一 → legacy 全量 transcript 路径。`summary_source = meeting_state |
+    transcript_fallback | empty_meeting`（**只在日志，不落库**）。
+  - **结构化输出（§5）+ 向后兼容**：新增内部 `FinalMeetingSummary`
+    （overview / key_topics / decisions / action_items / open_questions / risks /
+    closing_summary，`extra="forbid"`，全部列表可空）。**既有 `MeetingSummarySchema`
+    零改动**——`to_legacy_schema` 把它投影回去（decision → conclusions，
+    action item 折叠为「task（owner，deadline）」以免承诺丢失，risk → open_questions）。
+    前端 / API 契约 / SSE / DB 列**全部不动**。
+  - **Evidence 策略（§4）**：复用 Meeting State 已有的 `source_segment_seqs`，±1 邻域
+    扩展，**按优先级排序**（decision 0 > action_item 1 > risk 2 > open_question 3 >
+    topic 4），`max_evidence_segments` 上限截断。**无 RAG / Embedding / 向量库**。
+    引用不存在的 seq **静默丢弃**（不给模型凭空编号）。
+  - **State/Evidence 冲突收口（§7）**：State = 语义候选，Evidence = 事实依据；
+    Final Summary Agent 做第二遍收口，证据不足时**降级为 open_question 或省略**，
+    **绝不编造更确定的结论**。Prompt 12 条规则显式禁止把提议升格为决策、禁止编造
+    owner/deadline（未出现时保持 `null`）。
+  - **空会议（§16）**：`final_transcript_seq == 0` → **确定性、零 LLM** 的
+    `precomputed` 计划（`overview="本次会议未产生有效转写内容。"` + 空列表）——
+    不 404、不永久 GENERATING、不让模型编内容。
+  - **Feature flag（§10）**：`FINAL_SUMMARY_V2_ENABLED=false` **完整还原**旧行为
+    （可逆切换，非单向门）。另有 `FINAL_SUMMARY_MAX_EVIDENCE_SEGMENTS` /
+    `FINAL_SUMMARY_EVIDENCE_NEIGHBOR_WINDOW` / `FINAL_SUMMARY_MAX_INPUT_CHARS` /
+    `FINAL_SUMMARY_MODEL`，全部走既有 settings，**无散落 `os.getenv()`**。
+  - **可观测（§19）**：`final_summary_plan` 日志输出 `summary_source` / `state_version`
+    / `last_processed_segment_seq` / `final_transcript_seq` / `evidence_segment_count`
+    / `fallback_reason`；**不打印 Transcript 原文 / 模型输出 / 密钥**。
+  - **§2 顺序陷阱（重要，测试必须知道）**：legacy `step7a/7b` 套件**默认阈值下不创建
+    state 行**（只 seed 3 条 FINAL < 阈值 8），因此走 fallback → **它们全绿并不能证明
+    V2 生效**。V2 由 `test_final_summary_v2.py` 单独证明（断言 `summary_source` +
+    `ScriptedProvider` 同时服务 AGENT-1 与 AGENT-2 两种 prompt）。
+  - **Known Limitations**：① V2 明细（decisions/action_items/risks/evidence）**塞在既有
+    `raw_model_output` 列**里，**不新增 DB 列**（加列 = 对核心表 ALTER，是本步的
+    stop condition）；`summary_source` **只在日志**，未持久化；② 前端**仍只消费扁平化
+    后的旧四字段**，V2 明细的点击溯源 UI 属后续步骤（本步只保证后端数据具备能力）；
+    ③ multi-worker 不安全（沿用进程内 `meeting_lock`）。
+  - 测试：`backend/tests/test_final_summary_v2.py` **35/35 PASS**
+    （T01~T32：来源选择 / §2 stale 拒绝 / 空会议 / evidence 优先级·邻域·截断·悬空引用 /
+    schema 与兼容映射 / §7 过度自信不落结论 / §14 action item 合并 / §15 语义边界 /
+    §13 证据溯源端到端 / §2 三态排序 / §10 flag OFF 还原 / §17 六段脚本回放 E2E）。
+    `pytest` **130/130 PASS**；回归全绿（Step5 21 + Step6 21 + Step7A 28 + Step7B 36 +
+    list 17 + ASR-A 22 + AGENT-1 40）；前端 typecheck + build PASS。
+  - **零改动**：Meeting 四态机 / Freeze 语义 / Transcript 契约 / LLM Provider /
+    DeepSeek / **DB 既有表（无 schema change / 无 migration）** / **前端业务代码**。
+  - **本 Step 未 push**（按用户要求：可 commit 到 `dafenqi`，等待确认后再 push）。

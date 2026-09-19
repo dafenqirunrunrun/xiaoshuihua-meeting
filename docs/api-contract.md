@@ -462,6 +462,25 @@ Response **200**：
 
 ## 5. Step 状态
 
+> **Step AGENT-2 已完成**：Final Summary V2（Meeting State 作为纪要主输入）。
+> **本步不新增 / 不修改任何 HTTP / SSE 契约** —— 这是刻意的设计结果，不是遗漏：
+>
+> - **`GET /api/meetings/{id}/summary` 的响应形状完全不变**（仍是
+>   `SummaryOut`：overview / key_topics / conclusions / open_questions …）。
+>   V2 的富结果（decisions / action_items / risks / evidence）**扁平化投影**回
+>   既有字段（见 `architecture.md §20.7`），因此**前端零改动**。
+> - **SSE `summary.*` 不变**（仍是 `{version, status}`）。
+> - **Meeting 状态机不变**（四态，无新状态）。
+> - **无 DB schema change / 无 migration**：V2 明细写在既有
+>   `raw_model_output` 列内（Known Limitation，见 `architecture.md §20.8`）。
+> - 新增的只有**内部**模块（`final_summary_service` / `final_summary_prompts` /
+>   `final_summary_schemas` / `evidence`）与 settings，**不对外暴露**。
+> - **`GET /api/internal/meetings/{id}/state`（§3）不变**，仍是 AGENT-1 的形状。
+>
+> 影响到的既有行为：`finalize_for_meeting` 现在会**先同步强制 flush Meeting State**
+> 再生成纪要（§2 排序不变式）—— 见 `architecture.md §20.2`。这改变的是**触发时序**，
+> 不改变任何对外契约。
+
 > **Step AGENT-1 已完成**：Meeting State Agent（会议工作记忆）。新增
 > `GET/POST /api/internal/meetings/{id}/state[/process-pending]`（调试用，见 §3）；
 > FINAL 首次提交与 `POST /finish` 会后台推进状态；新增 1 张表（`meeting_state`，

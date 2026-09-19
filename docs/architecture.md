@@ -1296,3 +1296,212 @@ Final Summary 重构（下一步单独做：Meeting State → Final Summary Agen
 - 前端 `npm run typecheck` + `npm run build` PASS
 - **Meeting 状态机零改动；Freeze 语义零改动；Transcript 契约（ASR-0A/0B）零改动；
   LLM Provider 零改动；DB 既有表零改动（新增 1 张表，无 migration）；前端零改动**
+
+---
+
+## 20. Final Summary V2：Meeting State 作为纪要主输入（Step AGENT-2 已实现）
+
+### 20.1 定位
+
+AGENT-1（§19）让系统持续维护一份 **Meeting State（结构化工作记忆）**。
+AGENT-2 把这个工作记忆接进 **最终纪要**，改变的是摘要的**输入**，不是它的输出契约：
+
+```text
+Step 7A 之前:   Full Transcript ──────────────────► LLM ──► Final Summary
+Step AGENT-2:   Meeting State（语义）  ┐
+                                       ├──► Final Summary Agent ──► Structured Summary
+                Transcript Evidence（事实）┘
+```
+
+分工是本步的核心命题：
+
+| 角色 | 回答的问题 |
+|---|---|
+| **Meeting State** | **重要信息是什么**（议题 / 决策 / 待办 / 未决 / 风险） |
+| **Transcript Evidence** | **原话证据是什么**（被引用的 FINAL 片段原文） |
+
+因此**不再默认把整份 Transcript 重新塞进 Prompt**：State 已经消化过一遍，
+Evidence 只补齐「凭什么这么说」。legacy 全量路径**完整保留**为降级路径（§20.5）。
+
+### 20.2 §2 排序不变式（本步最重要的一条）
+
+```text
+finish ──► flush 剩余 FINAL ──► Meeting State 达到最新 ──► 才生成 Final Summary
+```
+
+**绝对不允许**：最后两句 Transcript 还没进入 Meeting State，Summary 已经生成。
+
+为什么这条不变式**必须由 Finalizer 自己守**：`POST /finish` 确实会安排一次强制
+flush，但它跑在**另一个 BackgroundTask** 里 —— 可能失败、可能与 trailing FINAL
+竞争、或者（crash-gap 恢复场景）根本没跑过。所以：
+
+- `finalize_for_meeting` 在生成纪要**之前**，**同步**调用
+  `meeting_state_service.process_pending(force_flush=True)`（代码中的 Step 0）。
+- `force_flush=True` 把不足阈值的尾巴当成**一个最终批次**送出，会议中途结束也能收口。
+- **best-effort by construction**：`process_pending` 对业务原因**从不抛异常**
+  （失败记录在 state 行上并上报），所以 flush 失败**绝不阻断会议完成**（§18）。
+- `final_summary_service.assess_usability` 守住**最后一跳**：若状态游标仍然落后于
+  transcript（`state_stale`），**拒绝把该状态当作完整状态使用**，改走 legacy 全量
+  transcript —— **降级，但绝不静默漏报**。
+
+### 20.3 Usability Gate（来源选择的唯一裁决点）
+
+`assess_usability(db, meeting_id) -> StateAssessment`（只读、无锁；撕裂读只会导致
+降级，不会导致错误纪要）。按顺序判定：
+
+| reason | 含义 |
+|---|---|
+| `v2_disabled` | `FINAL_SUMMARY_V2_ENABLED=false` |
+| `agent_disabled` | `MEETING_AGENT_ENABLED=false` |
+| `no_state` | 没有 state 行（例如从没达到批阈值） |
+| `state_unreadable` | state 行损坏 —— **绝不 laundered 成「无内容」** |
+| `state_failed` | 最后一次更新没落地（读得出，但**不当作 current**：失败的正是会议末尾） |
+| `state_empty` | 状态为空 |
+| `state_stale` | **游标 < 最终 transcript seq**（§20.2 的最后一跳） |
+
+任一成立 → `SOURCE_TRANSCRIPT_FALLBACK`；`final_transcript_seq == 0` → 先判
+`SOURCE_EMPTY_MEETING`（§20.6）。
+
+### 20.4 Evidence Selection（`app/agent/evidence.py`）
+
+纯函数、无 DB、无 settings 查询（调用方传入全部策略参数），因此可单测：
+
+1. 取 Meeting State 已在 decisions / action_items / open_questions / risks / topics
+   上记录的 `source_segment_seqs`（**去重** —— 同一行常被两条目同时引用）；
+2. 每条引用按 `neighbor_window`（默认 ±1）扩展邻域；
+3. 按 **evidence priority** 排序后截断到 `max_evidence_segments`（默认 60）；
+4. 最终按 `segment_seq` ASC 输出 —— **引用顺序 = 会议发生顺序**，读起来是原话。
+
+优先级（数字越小越不可丢）：`decision 0 > action_item 1 > risk 2 > open_question 3 >
+topic 4`。**邻域候选继承引用它的条目的优先级**（决策旁边的上下文比直接引用的
+topic 更该保留），所以上限真的咬下来时，被裁掉的是「上下文」而不是「承重证据」。
+
+引用到**不存在的 seq 静默丢弃**：状态引用 seq 99 而会议只有 6 段时，不能凭空造出
+一段转写。悬空引用由 prompt 的冲突规则处理，不由 evidence 层「修补」。
+
+**明确不做**：RAG / Embedding / 向量库 / 语义检索（本步范围外）。
+
+### 20.5 State / Evidence 冲突收口（§7）
+
+```text
+Meeting State     = 语义候选（semantic candidate）
+Transcript Evidence = 事实依据（factual grounding）
+```
+
+Final Summary Agent 做**第二遍收口**。二者冲突时**以证据为准**：
+证据不足 → **降级**（decision → open_question）或**省略**；
+**绝不编造更确定的结论**。Prompt 的 12 条规则显式约束：
+
+- 只依据提供的材料，不编造其中没有的信息；
+- **不得凭空创建 decision / owner / deadline**；证据不足宁可省略；
+- 证据只显示某人在**提议或询问**（「下周三上线怎么样？」）→ **不得写成正式 decision**；
+- 讨论中的意见不是 decision；只有证据显示**明确达成一致**才写入 decisions；
+- action_items 必须有明确动作语义（谁做什么）；
+- owner / deadline 未明确出现时保持 **`null`**，**不写「未指定」之类占位文本**；
+- risk 表示**潜在问题**，不是已发生的故障；
+- 保留每条目的 `source_segment_seqs`；不确定时给空数组，**不编造编号**。
+
+`test_final_summary_v2.py::TestConflictDowngrade` 覆盖：状态过度自信时，
+**不支持该主张的 decision 不会出现在最终结论里**。
+
+### 20.6 空会议（§16）
+
+`final_transcript_seq == 0` → **确定性、零 LLM** 的 `precomputed` 计划：
+
+```json
+{"overview": "本次会议未产生有效转写内容。", "key_topics": [], "conclusions": [], "open_questions": []}
+```
+
+理由：对空 transcript 调模型**只能得到编造内容**。该形状合法且终态（COMPLETED），
+所以空会议仍然到达可用的 Result 页 —— **不 404、不永久 GENERATING、不产生幻觉**。
+
+### 20.7 结构化输出与向后兼容（§5）
+
+新增内部 schema `FinalMeetingSummary`（`extra="forbid"`，全部列表可空，因此
+「合法但空」总是可表达）：
+
+```text
+overview / key_topics[] / decisions[] / action_items[] / open_questions[] / risks[] / closing_summary
+Decision      { text, source_segment_seqs }
+ActionItem    { task, owner?, deadline?, status?, source_segment_seqs }
+```
+
+**既有 `MeetingSummarySchema` 零改动**。`to_legacy_schema` 把 V2 投影回去：
+
+| V2 | legacy |
+|---|---|
+| `overview` | `overview` |
+| topic titles | `key_topics` |
+| decision texts，然后 action items 渲染为 `"task（owner，deadline）"` | `conclusions` |
+| open question texts，然后 risk texts | `open_questions` |
+
+把 action item 折进 `conclusions` 是**旧 schema 的损失性设计**，但**严格优于丢弃**：
+前端把 conclusions 显示为字符串列表，「完成后端接口联调（小王，周二之前）」在那里
+读起来是对的。**未扁平化的 V2 结果同时持久化**，所以信息实际没有丢失。
+
+因此 **前端 / API 契约 / SSE / DB 列全部不动**。
+
+### 20.8 持久化与 Known Limitations
+
+V2 明细**塞在既有 `meeting_summary.raw_model_output` 列**里（JSON），
+**不新增 DB 列** —— 加列意味着对核心表 ALTER，且本仓库无 alembic/migration 工具，
+这是本步明确的 stop condition。`summary_source` **只写日志，不落库**。
+
+后果（如实记录）：
+
+1. 前端**目前仍只消费扁平化后的旧四字段**；
+2. V2 明细的**点击溯源 UI** 属后续步骤 —— **本步只保证后端数据具备该能力**；
+3. 若将来要按 `summary_source` 查询或做灰度统计，需要一次真正的 migration。
+
+### 20.9 Feature Flag（§10）
+
+`FINAL_SUMMARY_V2_ENABLED=false` → **完整还原**旧行为（legacy 全量 transcript 路径），
+**可逆切换，不是单向门**。其余参数全部集中在 `app/config.py`，**无散落 `os.getenv()`**：
+
+| 设置 | 默认 | 作用 |
+|---|---|---|
+| `FINAL_SUMMARY_V2_ENABLED` | `true` | V2 总开关 |
+| `FINAL_SUMMARY_MAX_EVIDENCE_SEGMENTS` | `60` | evidence 上限 |
+| `FINAL_SUMMARY_EVIDENCE_NEIGHBOR_WINDOW` | `1` | 引用邻域扩展半径 |
+| `FINAL_SUMMARY_MAX_INPUT_CHARS` | `120000` | 超限 → `SummaryPlanError`（**不静默截断**） |
+| `FINAL_SUMMARY_MODEL` | `""` | 预留（模型覆盖） |
+
+### 20.10 可观测性（§19）
+
+每次规划输出一行 `final_summary_plan`：
+
+```text
+meeting_id / summary_source / state_version / last_processed_segment_seq
+/ final_transcript_seq / evidence_segment_count / fallback_reason
+```
+
+**绝不打印完整 Transcript、模型输出或密钥。**
+
+### 20.11 本 Step 明确不做（§21/§22）
+
+真实 ASR / ESP32 / PCM / Speaker Diarization / **RAG / Embedding / 向量库** /
+LangGraph / Multi-Agent / Critic / Planning Agent / 邮件 / Calendar /
+**任务自动执行** / Meeting State 编辑 UI / Transcript 点击溯源 UI /
+multi-worker 行锁重构 / Redis / Kafka / Celery / 复杂定时器 /
+全局 ASR 时间轴 / 前端大改 / **AGENT-3 的任何内容**。
+
+### 20.12 验证
+
+- `pytest` —— **130/130 PASS**（freeze 35 + E2E 20 + Meeting State 40 +
+  **Final Summary V2 35**）
+- 回归全绿：Step5 21 + Step6 21 + Step7A 28 + Step7B 36 + list 17 + ASR-A 22
+- 前端 `npm run typecheck` + `npm run build` PASS
+- **Meeting 状态机零改动；Freeze 语义零改动；Transcript 契约零改动；LLM Provider
+  零改动；DB 既有表零改动（无 schema change / 无 migration）；前端零改动**
+
+### 20.13 一个必须知道的测试陷阱
+
+legacy `step7a/step7b` 套件**在默认阈值下不会创建 state 行**（只 seed 3 条 FINAL，
+低于 `MEETING_AGENT_BATCH_MAX_SEGMENTS=8`），因此它们走的是 **fallback** —— 
+**它们全绿并不能证明 V2 生效**。
+
+V2 由 `backend/tests/test_final_summary_v2.py` **单独证明**：其 `scripted` fixture
+把同一个 `ScriptedProvider` 装到**两条 provider 解析路径**上
+（`app.agent.llm.factory.get_provider` 与 `app.agent.summary_service.get_provider`
+—— 后者是模块级 import 绑定，只 patch factory **够不到**），并直接断言
+`summary_source == meeting_state`。

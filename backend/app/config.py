@@ -78,5 +78,32 @@ class Settings(BaseSettings):
     # is flushed by the next FINAL or by the finish-time forced flush.
     meeting_agent_max_batches_per_run: int = 4
 
+    # --- Final Summary V2 (Step AGENT-2) ------------------------------------
+    # Master switch for "Meeting State -> Final Summary". When false the summary
+    # pipeline behaves EXACTLY as it did before AGENT-2 (full-transcript prompt),
+    # regardless of whether a meeting state exists. This is the gray-release
+    # kill switch: turning it off is a complete return to the legacy path, never
+    # a partial state.
+    final_summary_v2_enabled: bool = True
+    # Upper bound on how many transcript segments are carried into the V2 prompt
+    # as EVIDENCE. The state's source_segment_seqs are the primary selection;
+    # this bound stops a pathological meeting from reconstituting the whole
+    # transcript (which would defeat the point of consuming the state at all).
+    # Selection is priority-ordered (decisions / action items first), so the
+    # bound never silently drops the most load-bearing grounding.
+    final_summary_max_evidence_segments: int = 60
+    # Neighbour window around each cited segment (0 disables). A decision cited
+    # at seq 8 is easier to judge with seq 7 and 9 alongside it, and the extra
+    # context does not need to be cited by the state to be worth showing.
+    final_summary_evidence_neighbor_window: int = 1
+    # Hard bound on the assembled V2 prompt (state + evidence). Same stance as
+    # the rest of the pipeline: refuse loudly rather than silently truncate.
+    final_summary_max_input_chars: int = 120_000
+
+    # Model name for the Final Summary Agent. Empty means "use the provider's
+    # own configured model" (DeepSeekProvider already owns deepseek_model).
+    # Set it only to pin the summary to a different model than the agent's.
+    final_summary_model: str = ""
+
 
 settings = Settings()
