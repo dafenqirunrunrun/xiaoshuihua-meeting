@@ -117,6 +117,42 @@ def _ensure_transcript_not_frozen(db: Session, meeting_id: str) -> None:
         )
 
 
+def _ensure_utterance_open(meeting_id: str, utterance_id: str) -> None:
+    """Reject PARTIAL for an utterance that already has a persisted FINAL.
+
+    ASR-0B freeze (decision 4): once an utterance reaches FINAL it is CLOSED.
+    A later PARTIAL for the same utterance — the normal shape of an out-of-order
+    or post-reconnect delivery — must NOT be accepted into the live cache:
+    the frontend would render a permanent "识别中" line that can never be
+    resolved, because the FINAL it waits for already arrived and will not be
+    re-sent as a live frame.
+
+    This follows the existing "contract drift must fail loudly" principle
+    (no silent no-op): the caller learns the utterance is closed.
+
+    Must be called under the meeting lock.
+    """
+    from app.db import SessionLocal
+
+    db = SessionLocal()
+    try:
+        closed = (
+            transcript_repository.get_by_utterance_id(db, meeting_id, utterance_id)
+            is not None
+        )
+    finally:
+        db.close()
+    if closed:
+        raise TranscriptConflictError(
+            meeting_id,
+            "",
+            message=(
+                f"utterance {utterance_id} already reached FINAL and is closed; "
+                f"PARTIAL for a finalized utterance is rejected"
+            ),
+        )
+
+
 def handle_partial(
     db: Session,
     meeting_id: str,
@@ -129,6 +165,7 @@ def handle_partial(
     and is never replayed. This is a cache-only operation — no DB commit to
     wait on — so publishing from here is safe and non-blocking.
     """
+    _ensure_utterance_open(meeting_id, event.utterance_id)
     live_utterance_cache.upsert(
         meeting_id,
         event.utterance_id,

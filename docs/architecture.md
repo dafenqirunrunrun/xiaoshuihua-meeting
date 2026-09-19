@@ -921,23 +921,9 @@ PARTIAL revision、**不发送 `segmentSeq`**。它仍是**纯外部 HTTP 客户
 
 ### 17.10 PENDING COLLABORATOR CONFIRMATION
 
-> 以下两项**尚未**与协作者锁死，本 Step 不单方面宣布为双方最终协议。
-> `protocols/transcript-format.md` 属共同协议，本 Step **未修改**其核心字段。
-
-**PENDING 1 — `TRANSCRIPT_STREAM_END` 契约**
-
-```text
-未确认：谁发送 / 何时发送 / payload 字段 / last_segment_seq 归属
-现状：  继续使用项目内既有 internal mock STREAM_END，仅用于完整链路回归
-        （freeze → summary → COMPLETED）。它不是双方最终协议。
-```
-
-**PENDING 2 — multi-ASR-session 时间轴语义**
-
-```text
-未确认：同一 meeting 多个 ASR session（重连）时，startMs/endMs 是否重置
-现状：  只保证单 session（mock-session-001）正确；不猜测多 session 行为
-```
+> ⚠️ **本节已被 §18（ASR-0B Contract Freeze）取代**，保留作为 ASR-0A 时的历史记录。
+> 两项 PENDING 的处置见 §18.2：PENDING 2 已冻结；PENDING 1 部分冻结
+> （`last_segment_seq` 归属已定，**发送者身份与时机仍 PENDING**）。
 
 ### 17.11 本 Step 明确不做
 
@@ -959,3 +945,160 @@ STREAM_END 双方协议重设计 / 多 session 时间轴规则
 - 回归全绿：Step5 21 + Step6 21 + Step7A 28 + Step7B 36 + list 17
 - 前端 `npm run typecheck` + `npm run build` PASS
 - **Backend DB schema 零改动；LLM Provider 零改动；Meeting 状态机零改动**
+
+---
+
+## 18. ASR Event Contract Freeze + E2E Acceptance（Step ASR-0B 已实现）
+
+### 18.1 本 Step 定位
+
+ASR-0A 让系统**能**吃下协作者的标准化输入；ASR-0B 把这件事从"能跑"推进到
+"契约锁定 + 端到端可验收"，即：把口头约定变成**有回归保护的冻结契约**。
+
+```text
+审计现状  →  解决两个 PENDING  →  统一 protocols/ 为事实源
+         →  Mock Producer 场景覆盖  →  E2E 验收
+         →  internal ASR 独立 OpenAPI  →  pytest 收口 + CI 准备
+```
+
+**不接真实 ASR**（V0.2）；**不改 MVP 产品范围**。
+
+### 18.2 两项 PENDING 的处置
+
+**PENDING 1 — `TRANSCRIPT_STREAM_END`：部分冻结**
+
+| 问题 | 处置 |
+| --- | --- |
+| `last_segment_seq` 归属 | ✅ **冻结**：Transcript-owned。字段改**可选**，省略时后端派生 `max(seq) or 0`；提供时保留完整 gap/overrun 校验 |
+| 谁发送 / 何时发送 / `event_id` 由谁生成 | ⏳ **仍 PENDING**（不单方面锁死） |
+| MVP 用法 | 内部 mock 发出，**仅供 E2E 回归**，代码中已标注"非最终协作契约" |
+
+**PENDING 2 — multi-ASR-session 时间轴：✅ 冻结**
+
+- `startMs/endMs` = **ASR session-local 相对偏移**，跨 session **不可比较**。
+- 排序**永远只认 `segment_seq`**；时间字段只用于存储/回显/展示。
+- MVP **不做 rebase**。
+- ⏳ **V0.2 known limitation / tech debt**：会议级全局时间轴重建需先持久化 session
+  元数据（`provider`/`asrSessionId`/`sentenceId` 当前不落库）→ 需 DB schema 变更。
+
+### 18.3 五个冻结决策（实现摘要）
+
+1. **`last_segment_seq` 可选 + `ge=0`**（`schemas.py`）+ 服务端派生
+   （`stream_service._resolve_terminal_seq`）。
+2. **排序归属**：`segment_seq` 继续 Transcript-owned；上游不被要求反向查询。
+3. **时间轴**：见 §18.2 PENDING 2。
+4. **Utterance 关闭**：同 utterance 一旦 FINAL 即 closed，后续 PARTIAL → **409**，
+   不进 live cache（`transcript_service._ensure_utterance_open`，**领域级**，
+   两个 ingress 同时生效）。
+5. **`asrSessionId` maxLength=48** 写入正式协议并暴露在 OpenAPI schema。
+
+### 18.4 修复的真实缺陷：空会议永久卡死
+
+**症状**：创建 → 开始 → 直接「结束会议」（不产生任何 FINAL）→ 会议**永久停留在
+FINALIZING**，会议列表永远显示「查看收尾」，SSE 永远等一个不会来的 STREAM_END，
+前端无出口。
+
+**根因**：`StreamEndEvent.last_segment_seq` 为 `Field(default=None, ge=1)`，
+且 `handle_stream_end` 显式 `if payload.last_segment_seq is None: raise`。
+于是空会议无解：`0 → 422`（`ge=1`）；`1 → 409 missing [1]`（缺口检查）。
+
+**修复**：`ge=1 → ge=0`；字段语义改为可选；省略时派生 `max_seq or 0`。
+`_find_gaps(last=0)` → `range(1,1)` 为空，overrun 在 `max_seq is None` 时短路，
+**完整性算法本身无需改动**。
+
+**边界**：这不是"放宽校验"。显式提供值时 gap/overrun 校验**原样保留**；
+STREAM_END 后新 FINAL 仍 409；`event_type` / path≠payload 校验不变。
+
+### 18.5 protocols/ 成为协议事实源
+
+`protocols/*.md` 由 5 个 3 行占位文件升格为**跨模块通信契约的唯一事实源**：
+
+| 文档 | 状态 |
+| --- | --- |
+| `README.md` | 优先级、变更流程、三条铁律（不猜 / 归属清晰 / PENDING 不实现） |
+| `transcript-format.md` | ✅ FROZEN：外部 DTO、identity 归属、时间轴、48 上限、错误码、顺序与重复矩阵、utterance 关闭 |
+| `realtime-events.md` | ✅ FROZEN：SSE 帧/事件名/具名帧陷阱/恢复游标/Broker 语义/STREAM_END 终止契约 |
+| `meeting-api.md` | ✅ FROZEN：四态机、生命周期接口、幂等冲突、列表契约、Summary 契约 |
+| `esp32-audio.md` | ⏸ NOT IN SCOPE（V0.2），列出开工前必须回答的 6 个问题 |
+
+每条冻结项都标注 ✅ FROZEN；未确认项标注 ⏳ PENDING 并注明"不得按假设实现"。
+
+### 18.6 Mock Producer 场景覆盖
+
+`backend/scripts/mock_transcript_producer.py` 新增 `--scenario`：
+
+| 场景 | 覆盖 |
+| --- | --- |
+| `happy` | 多段 PARTIAL → FINAL，正常流 |
+| `reconnect` | 新 `asrSessionId`、`sentenceId` 从 1 重启、时钟归零（多 session 身份与时间轴） |
+| `duplicate` | 重复投递已持久化 FINAL → 幂等 200 且不新增 segment |
+| `out-of-order` | 先发后句再发前句 → seq 按**到达顺序**分配 |
+| `errors` | 9 项错误矩阵断言（未知字段/未知 type/时序倒置/speakerId=-2/sessionId 超长/path≠payload/内容漂移/PARTIAL after FINAL/未知 meeting） |
+| `all` | 串联 |
+
+仍是**纯外部 HTTP 客户端**，仅依赖标准库（有回归断言保证不 import Backend 内部）。
+
+### 18.7 internal ASR 独立 OpenAPI
+
+```text
+GET /api/internal/docs           Swagger UI（仅 internal ASR 契约）
+GET /api/internal/openapi.json   对应 OpenAPI 文档
+```
+
+**从真实路由派生**（`internal_docs._build_schema()` 用同一 router 构造临时 app），
+因此**不会与实现漂移**——这是相对手写 spec 的关键优势。
+主 `/docs` 仍描述全部端点；此为**附加视图**，无路由搬迁、无行为变更。
+
+### 18.8 E2E 验收链路
+
+```text
+mock_transcript_producer.py（外部协作者线格式，子进程，真网络）
+  → POST /api/internal/.../asr-events      （ingress + adapter）
+  → Transcript Domain                       （seq 分配、持久化）
+  → GET /transcript snapshot                （durable 事实）
+  → GET /events (SSE)                       （live 增量，具名帧）
+  → Finalizer + Summary                     （freeze → LLM(fake) → COMPLETED）
+```
+
+用**子进程真实 uvicorn + 临时 SQLite**，而非 TestClient：mock producer 必须像协作者
+一样走网络，SSE 必须走真实 socket 才能证明帧真的到达。
+
+> ⚠️ 子进程 `stdout` **必须重定向到文件，不可用 `subprocess.PIPE`**：
+> uvicorn 会为每个请求打 access log，未被读取的管道填满 OS 缓冲后会**阻塞服务器**
+> 在请求中途（曾导致整套测试超时挂起）。
+
+React 那一跳在**帧层面**断言（`event:` 名 + envelope 字段名 + 稳定 id），
+DOM 层面的断言由 `scripts/e2e_asr_browser.py`（真实 Chrome CDP）承担。
+
+### 18.9 测试收口与 CI 准备
+
+- pytest 引入为**开发依赖**（`requirements-dev.txt`，pytest 9.1.1）。
+- `backend/tests/`：
+  - `conftest.py` —— 每测试新建 schema；`DATABASE_URL`/`LLM_PROVIDER` 必须在
+    任何 `app.*` import **之前**注入（`settings` 是 import 期单例）。
+  - `test_asr_contract_freeze.py` —— 五项冻结决策回归 **35 cases**。
+  - `test_asr_e2e_acceptance.py` —— Mock→Adapter→Transcript→SSE→Summary **20 cases**。
+- **两套并存**：`scripts/test_*.py` 手写脚本仍为早前 Step 的权威回归记录，
+  **不删除**；CI 跑 `pytest` + `legacy-suites` **两个 job**，避免早期 Step 回归被
+  绿色 pytest 掩盖。迁移进 `tests/` 是后续任务。
+- `.github/workflows/backend-tests.yml`：Python 3.13，全程离线
+  （`LLM_PROVIDER=fake`，不需要真实密钥）。
+
+### 18.10 本 Step 明确不做
+
+```text
+真实 Tencent ASR / 音频采集 / ESP32 固件 / PCM / 腾讯签名
+真实 LLM Provider（继续 FakeProvider；真实 Provider 属 V0.2）
+DB schema change / 新 UNIQUE / SQLite migration / MySQL
+Meeting 状态机修改 / Freeze 语义修改 / LLM Provider 修改
+前端业务代码改动（本 Step 零前端改动）
+当前 MVP 产品范围之外的任何功能
+```
+
+### 18.11 验证
+
+- `pytest` —— **55/55 PASS**（freeze 35 + E2E 20）
+- `scripts/test_asr_adapter.py` —— ASR-A01~A20 **20/20 PASS**
+- 回归全绿：Step5 21 + Step6 21 + Step7A 28 + Step7B 36 + list 17
+- **DB schema 零改动；LLM Provider 零改动；Meeting 状态机零改动；
+  Freeze 语义零改动（仅 STREAM_END 的「终值来源」放宽）；前端零改动**

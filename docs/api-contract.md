@@ -142,12 +142,23 @@ Request（协作者 camelCase 格式）：
 |---|---|---|
 | type | str | `transcript.partial` \| `transcript.final` |
 | meetingId | str | 必须与 path `meeting_id` 一致，否则 **400** |
-| asrSessionId | str | 1..48（上限保证派生 `utterance_id` 落在 64 字符界内） |
+| asrSessionId | str | 1..**48**（硬约束，见下）；派生 `utterance_id` 必须落在 64 字符界内 |
 | sentenceId | int | ≥ 0；**session 内**句子编号，**不等于** `segment_seq` |
 | speakerId | int | ≥ -1；**-1 = 说话人暂未知**，合法，映射为内部 `unknown` |
-| startMs / endMs | int | ≥ 0 且 `endMs >= startMs` |
+| startMs / endMs | int | ≥ 0 且 `endMs >= startMs`；**session-local 相对偏移** |
 | text | str | ≤ 4000 |
 | provider | str | 不透明；不得据此硬编码厂商逻辑 |
+
+> **`asrSessionId` 上限 48 是契约硬约束（ASR-0B 决策 5）**：
+> `utterance_id = f"{asrSessionId}:{sentenceId}"` 最坏长度 = 48 + 1 + 10 = 59 ≤ 64。
+> 超过 → 422。该约束已同步暴露在 OpenAPI schema（`maxLength: 48`）。
+> 理由：保持派生 identity **精确单射**，优于静默哈希/截断一个 identity。
+
+> **时间轴语义（ASR-0B 决策 3）**：`startMs/endMs` 是**每个 ASR session 内的相对偏移**，
+> **跨 session 不可比较**（重连后上游可能归零）。排序**永远只认 `segment_seq`**；
+> 这两个字段只用于存储 / 回显 / 展示，**绝不参与排序或完整性判断**。MVP **不做 rebase**。
+> ⏳ V0.2 known limitation：会议级全局时间轴重建需先持久化 session 元数据
+> （当前 `provider`/`asrSessionId`/`sentenceId` **不落库**）。
 
 **拒绝规则**：未知字段（如 `segmentSeq`）或 snake_case 写法 → **422**（`extra="forbid"`，
 契约漂移必须大声失败）。
@@ -161,6 +172,10 @@ FINAL event_id = 确定性摘要(meetingId|asrSessionId|sentenceId|FINAL)
 
 状态码：`200` 接收成功 / `422` payload 校验失败 / `400` meetingId 不一致 /
 `404` meeting 不存在 / `409` 状态不允许或幂等冲突。
+
+> **协作者专用文档（ASR-0B）**：`GET /api/internal/docs`（Swagger UI）与
+> `GET /api/internal/openapi.json`，仅覆盖三个 internal ASR 端点，**从真实路由派生**
+> （不手写、不会漂移）。主 `/docs` 仍描述全部端点；此为**附加**视图，无路由搬迁。
 
 **`segment_seq`**：FINAL 由 Backend 在 meeting lock 内分配 `max + 1`；
 幂等重试复用已存 seq，不消耗新号。见 arch §17.3。
@@ -219,6 +234,12 @@ Request（Transcript Event Contract，PRD §15）：
 - 只进进程内 `live_utterance_cache`（key = meeting_id + utterance_id），**不写库**。
 - 同一 utterance 的后续 PARTIAL 覆盖旧值（PRD §22）。
 - 收到该 utterance 的 FINAL 后，cache 条目删除（PRD §23，Part 8）。
+- **Utterance 关闭（ASR-0B 决策 4）**：一旦该 utterance 收到 FINAL，即视为 **closed**；
+  此后同 `utterance_id` 的 PARTIAL → **409**，**不写入 live cache**。
+  理由：若接受，前端会渲染一条永远无法收敛的"识别中"行（它等待的 FINAL 已到达，
+  且不会再作为 live 帧重发）。遵循"契约漂移必须大声失败"原则。
+  该不变式是**领域级**的，在 `/asr-events` 与 `/transcript-events` 两个 ingress 上都生效
+  （`transcript_service._ensure_utterance_open`）。
 
 ### FINAL 语义（PRD §23-§24）
 
@@ -273,8 +294,9 @@ Receive → Validate(status/meeting/seq) → Idempotency Check → Persist → C
 ### POST /api/internal/meetings/{meeting_id}/stream-end
 
 > 终端 STREAM_END；**持久化落盘**（`transcript_stream` 表），重启不丢失。Step 4。
+> **ASR-0B 更新**：`last_segment_seq` 改为**可选**且 `ge=0`。
 
-Request（PRD §25，event_id/meeting_id 必须）：
+Request（PRD §25，`event_id` / `meeting_id` 必须）：
 
 ```json
 {
@@ -287,6 +309,13 @@ Request（PRD §25，event_id/meeting_id 必须）：
 
 - `event_type` 严格要求为 `"TRANSCRIPT_STREAM_END"`（常量），否则 400。
 - `path meeting_id == payload meeting_id`，否则 400（§49.1 精神）。
+- **`last_segment_seq` 可选（ASR-0B 决策 1/2）**：
+  - **省略** → 后端派生终值 `max(segment_seq) or 0`（`stream_service._resolve_terminal_seq`）。
+  - **提供** → 保留完整 gap / overrun 校验（兼容与额外一致性检查能力）。
+  - 范围 `ge=0`：**空会议**（无任何 FINAL）以 `last_segment_seq = 0` 正常 freeze。
+  - 依据：`segment_seq` 是 Transcript-owned，上游不应被要求反向查询我方排序。
+  - 修正背景：早期 `ge=1` + 必填使**零 segment 会议永久卡在 FINALIZING**
+    （0 → 422；1 → 409 missing [1]），见 `protocols/realtime-events.md §6.2`。
 
 Response `200 / StreamEndOut`：
 
@@ -301,13 +330,17 @@ Response `200 / StreamEndOut`：
 状态码：
 
 - `200` — 首次接受（已落盘 & 完整性通过），或幂等命中
-- `400` — event_type 非法 / last_segment_seq 缺失 / path≠payload meeting_id
+- `400` — event_type 非法 / path≠payload meeting_id
 - `404` — meeting 不存在
 - `409` —
   - meeting 状态不允许（必须 FINALIZING；CREATED/IN_PROGRESS 拒绝）
   - Transcript 不完整，存在缺口（`missing segments: [2]`）
   - DB 已存在比 last 更大的 seq（overrun，禁止静默忽略）
   - 已经接受过一个不同的 `last_segment_seq`（一个 Stream 只有一个终点）
+
+> ⏳ **PENDING（未冻结）**：真实协作方的 STREAM_END **发送者身份与发送时机**
+> 双方尚未确认。MVP 阶段该信号由内部 mock 发出，**仅供 E2E 回归**，代码已标注
+> "这不是最终协作契约"。见 `protocols/realtime-events.md §6.5`。
 
 状态约束（Part 4）：
 

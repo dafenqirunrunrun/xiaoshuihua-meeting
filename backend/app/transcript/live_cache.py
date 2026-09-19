@@ -60,6 +60,16 @@ class _PartialCache:
             for key in [k for k in self._store if k.startswith(prefix)]:
                 self._store.pop(key, None)
 
+    def clear_all(self) -> None:
+        """Drop every PARTIAL entry, for every meeting.
+
+        Process-wide reset: used by the test harness to isolate cases that share
+        this singleton, and available as a whole-cache flush. NOT part of any
+        business transition — lifecycle cleanup uses `clear_meeting`.
+        """
+        with self._lock:
+            self._store.clear()
+
     def size(self) -> int:
         with self._lock:
             return len(self._store)

@@ -77,7 +77,17 @@ class AsrTranscriptEvent(BaseModel):
 
     # --- meeting / session / sentence identity -------------------------------
     meetingId: str = Field(min_length=1, max_length=64)
-    asrSessionId: str = Field(min_length=1, max_length=_MAX_SESSION_ID)
+    asrSessionId: str = Field(
+        min_length=1,
+        max_length=_MAX_SESSION_ID,
+        description=(
+            "ASR session identifier. maxLength=48 is a hard contract bound, not a "
+            "style preference: the internal utterance_id is derived as "
+            "'{asrSessionId}:{sentenceId}' and must fit the internal 64-char bound. "
+            "48 + 1 + 10 = 59 <= 64. Longer ids are rejected (422) so the derived "
+            "identity stays exact and injective instead of being hashed/truncated."
+        ),
+    )
     sentenceId: int = Field(ge=0, le=_MAX_SENTENCE_ID)
 
     # --- speaker: INT, -1 means "speaker not yet identified" -----------------

@@ -384,3 +384,50 @@ npm run build      # tsc --noEmit && vite build
 - `docs/architecture.md` — 架构与原则
 - `docs/api-contract.md` — API / SSE / Transcript 契约（与实际实现一致）
 - `docs/decisions/ADR-001-mvp-architecture.md` — MVP 架构决策
+- **Step ASR-0B 已完成**：ASR Event Contract Freeze + E2E Acceptance。
+  - **定位**：ASR-0A 让系统"能吃下"协作者输入；ASR-0B 把口头约定变成**有回归保护的
+    冻结契约**。不接真实 ASR（V0.2），不改 MVP 产品范围。
+  - **两个 PENDING 处置**：
+    - **PENDING 1（STREAM_END）部分冻结**：`last_segment_seq` 归属已定（Transcript-owned，
+      改**可选** + `ge=0`，省略时后端派生 `max(seq) or 0`，提供时保留完整 gap/overrun 校验）；
+      **发送者身份与时机仍 PENDING**，MVP 由内部 mock 发（仅供 E2E，代码已标注非最终契约）。
+    - **PENDING 2（multi-ASR-session 时间轴）✅ 冻结**：`startMs/endMs` = **session-local
+      相对偏移**，跨 session **不可比较**；排序**永远只认 `segment_seq`**；MVP **不做 rebase**。
+      ⏳ V0.2 tech debt：会议级全局时间轴需先持久化 session 元数据（当前不落库）。
+  - **五个冻结决策**：① `last_segment_seq` 可选 + `ge=0` + 服务端派生；② `segment_seq`
+    继续 Transcript-owned，上游不必反向查询；③ 时间轴如上；④ **utterance 关闭**——同
+    utterance 一旦 FINAL 即 closed，后续 PARTIAL → **409** 且不进 live cache
+    （`transcript_service._ensure_utterance_open`，**领域级**，两个 ingress 同时生效）；
+    ⑤ `asrSessionId` maxLength=**48** 写入正式协议 + OpenAPI schema。
+  - **修复真实缺陷：空会议永久卡死**。创建 → 开始 → 直接「结束会议」→ 因
+    `Field(default=None, ge=1)` + 显式 `None → 400`，空会议 `0 → 422`、`1 → 409 missing [1]`，
+    **永久停留 FINALIZING**、无出口。修复：`ge=1 → ge=0` + 字段可选 + 派生 `max_seq or 0`
+    （`_find_gaps(last=0)` 为空，完整性算法本身无需改动）。**边界**：显式提供值时
+    gap/overrun 校验原样保留，这不是放宽校验。
+  - **`protocols/*.md` 升格为协议事实源**（原为 5 个 3 行占位）：README（优先级/变更流程/
+    三条铁律）+ `transcript-format.md` ✅ + `realtime-events.md` ✅ + `meeting-api.md` ✅
+    （均 FROZEN）+ `esp32-audio.md` ⏸（V0.2，列出开工前必答 6 问）。
+  - **Mock Producer 场景覆盖**（`--scenario`）：`happy` / `reconnect` / `duplicate` /
+    `out-of-order` / `errors`（9 项错误矩阵断言）/ `all`。仍是纯外部 HTTP 客户端，
+    **仅依赖标准库**（有回归断言保证不 import Backend 内部）。
+  - **internal ASR 独立 OpenAPI**：`GET /api/internal/docs`（Swagger UI）+
+    `GET /api/internal/openapi.json`，**从真实路由派生**（同一 router 构造临时 app）
+    故**不会漂移**；主 `/docs` 不变，此为附加视图。
+  - **E2E 验收链路**：`mock producer（子进程，真网络）→ asr-events ingress → Transcript
+    Domain → Snapshot → SSE（具名帧）→ Finalizer → Summary COMPLETED`，用**真实 uvicorn
+    子进程 + 临时 SQLite**（TestClient 绕开网络与 socket，无法证明 SSE 帧真的到达）。
+    ⚠️ 子进程 stdout **必须重定向到文件**，不可 `subprocess.PIPE`（access log 填满
+    未读管道会阻塞服务器，曾致整套测试挂起）。
+  - **pytest 收口 + CI 准备**：pytest 9.1.1 入 `requirements-dev.txt`；`backend/tests/`
+    （`conftest.py` 每测试新建 schema；env 必须在任何 `app.*` import **前**注入，因
+    `settings` 是 import 期单例）+ `test_asr_contract_freeze.py`（35）+ 
+    `test_asr_e2e_acceptance.py`（20）。**两套并存**：`scripts/test_*.py` 手写脚本仍是
+    早前 Step 的权威回归记录，**不删除**；CI 跑 `pytest` + `legacy-suites` **两个 job**，
+    避免早期回归被绿色 pytest 掩盖。`.github/workflows/backend-tests.yml`（Python 3.13，
+    全程离线，无需真实密钥）。
+  - 测试：**pytest 55/55 PASS**；`test_asr_adapter.py` ASR-A01~A20 20/20；
+    回归全绿（Step5 21 + Step6 21 + Step7A 28 + Step7B 36 + list 17）。
+  - **未改**：DB schema / 新 UNIQUE / migration / LLM Provider / DeepSeek /
+    Meeting 状态机 / Freeze 语义（仅 STREAM_END「终值来源」放宽）/ 前端业务代码
+    （本 Step 零前端改动）。
+  - 明确不做：真实 Tencent ASR / 音频采集 / ESP32 / PCM / 腾讯签名 / 真实 LLM Provider。

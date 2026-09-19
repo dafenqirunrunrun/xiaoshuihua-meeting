@@ -20,6 +20,7 @@ from app.agent import router as agent_router
 from app.common import health_router
 from app.meeting import router as meeting_router
 from app.realtime import router as realtime_router
+from app.transcript import internal_docs as transcript_internal_docs
 from app.transcript import internal_router as transcript_internal_router
 from app.transcript import router as transcript_router
 
@@ -68,4 +69,8 @@ app.include_router(transcript_router.router, prefix="/api")
 app.include_router(realtime_router.router, prefix="/api")
 app.include_router(agent_router.router, prefix="/api")
 app.include_router(transcript_internal_router.router, prefix="/api")
+# Focused docs for the collaborator-facing internal ASR contract
+# (GET /api/internal/docs + /api/internal/openapi.json) — derived from the real
+# routes above, so it cannot drift from the implementation.
+app.include_router(transcript_internal_docs.router, prefix="/api")
 

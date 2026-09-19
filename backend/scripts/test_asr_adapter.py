@@ -20,7 +20,7 @@ Cases:
   ASR-A04  consecutive PARTIALs keep ONE utterance identity (in-place update)
   ASR-A05  speakerId = -1 accepted -> internal "unknown" (never "speaker_-1")
   ASR-A06  external FINAL adapts -> 200, persisted
-  ASR-A07  FINAL clears the matching PARTIAL cache entry
+  ASR-A07  utterance CLOSED once FINAL: later PARTIAL -> 409 (ASR-0B decision 4)
   ASR-A08  FINAL lands in the durable transcript (Snapshot)
   ASR-A09  commit-before-publish: DB has the FINAL before the SSE frame
   ASR-A10  Snapshot recovers persisted FINAL after "refresh"
@@ -390,16 +390,28 @@ def run_cases() -> int:
                 ffr is not None and _snapshot(m2["id"]) != [],
                 f"segs={len(_snapshot(m2['id']))}")
 
-        # ---- A07: PARTIAL cleared for that utterance ---------------------------
-        # Re-send a PARTIAL for the SAME sentence; it must be a NEW live partial
-        # (the previous cache entry was removed by the FINAL).
-        c, _ = _post_asr(m2["id"], _asr_event(
+        # ---- A07: utterance is CLOSED once FINAL (ASR-0B decision 4) -----------
+        # A PARTIAL for the SAME sentence AFTER its FINAL is rejected: the
+        # utterance is closed, so nothing may re-enter the live cache. Accepting
+        # it would render a "识别中" line whose FINAL already arrived and will
+        # never be re-sent as a live frame. The cache entry itself was removed by
+        # the FINAL — closure is what keeps it removed.
+        c, body = _post_asr(m2["id"], _asr_event(
             m2["id"], 1, kind="partial", speaker_id=-1, text="我们今天讨论会议助手的整体"))
-        assert c == 200, c
-        again = sse.read_until("transcript.partial", timeout=8)
-        _record("ASR-A07 FINAL cleared the matching PARTIAL cache entry",
-                again is not None and again["data"]["payload"]["utterance_id"] == f"{SESSION}:1",
-                f"uid={again['data']['payload']['utterance_id'] if again else None}")
+        _record("ASR-A07 PARTIAL after FINAL -> 409 (utterance closed)",
+                c == 409 and "closed" in str(body.get("detail", "")),
+                f"code={c} detail={str(body.get('detail'))[:60]}")
+
+        # The rejection must not have disturbed the persisted FINAL.
+        segs_now = _snapshot(m2["id"])
+        _record("ASR-A07b rejected PARTIAL left the FINAL untouched",
+                len(segs_now) == 1 and segs_now[0]["segment_seq"] == 1,
+                f"segs={[(s['segment_seq'], s['text'][:8]) for s in segs_now]}")
+
+        # A different utterance must still be able to open a new live partial.
+        c, _ = _post_asr(m2["id"], _asr_event(
+            m2["id"], 9, kind="partial", speaker_id=-1, text="新的句子"))
+        _record("ASR-A07c a different utterance still accepts PARTIAL", c == 200, f"code={c}")
 
     # ---- A08: durable persistence -----------------------------------------
     segs = _snapshot(m2["id"])

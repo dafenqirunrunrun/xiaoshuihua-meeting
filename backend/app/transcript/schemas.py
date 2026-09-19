@@ -30,7 +30,13 @@ class StreamEndEvent(BaseModel):
     event_id: str = Field(min_length=1, max_length=64)
     meeting_id: str = Field(min_length=1, max_length=64)
     event_type: Literal["TRANSCRIPT_STREAM_END"] = "TRANSCRIPT_STREAM_END"
-    last_segment_seq: int | None = Field(default=None, ge=1)
+    # ASR-0B freeze: OPTIONAL. `segment_seq` is Transcript-owned, so the sender
+    # is not required to reverse-query our ordering. When omitted the backend
+    # derives the terminal seq from the persisted max (0 for an empty meeting).
+    # When supplied, the strict gap/overrun validation below still applies.
+    # `ge=0` (not 1): an empty transcript legitimately ends at 0 and must be
+    # able to leave FINALIZING — see stream_service.handle_stream_end.
+    last_segment_seq: int | None = Field(default=None, ge=0)
     emitted_at: int | None = Field(default=None)
 
 
