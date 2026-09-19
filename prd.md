@@ -9,6 +9,13 @@
 > 上游：语音采集 / ASR / Speaker 识别由其他同学负责  
 > MVP 原则：主链路稳定优先，不提前引入 Agent、RAG、Memory、Multi-Agent、Todo、Decision。  
 
+> **§3.2 范围变更记录（Step AGENT-1，用户明确授权）**：Meeting State Agent（会议工作记忆）
+> 已按用户明确要求纳入实现范围。它是 **Transcript 的下游消费者**，不改变主链路、
+> 不改变 Meeting 四态机、不改变 Freeze 语义，且由 `MEETING_AGENT_ENABLED` 开关控制
+> （关闭后主链路行为与变更前完全一致）。§3.2 与 §56 的「禁止擅自增加」仍**对其余各项
+> 有效**（RAG / Memory / Multi-Agent / 向量库 / 跨会议问答 / LangGraph 等一律不做）。
+> 见 `docs/architecture.md §11`。
+
 ---
 
 # 0. 文档优先级与使用方式
@@ -139,7 +146,7 @@ Mock ASR / Mock Stream
 ## 3.2 MVP 不做
 
 ```text
-Meeting Agent
+Meeting Agent              ← 仅 Step AGENT-1 的 Meeting State Agent 例外（见 §3.2 范围变更记录）
 Discussion Node
 Agent Thread
 Memory Snapshot
@@ -2025,7 +2032,7 @@ Summary 失败不能显示“会议失败”
 
 ```text
 RAG
-Agent
+Agent                    ← 例外：Meeting State Agent（Step AGENT-1，用户明确授权，见 §3.2）
 Multi-Agent
 LangGraph
 Todo
@@ -2177,13 +2184,14 @@ Todo
 Decision
 Summary Version
 更完整的导出
+Meeting State → Final Summary Agent（纪要改为消费 Meeting State，而非整段 Transcript）
 ```
 
 ## V0.3
 
 ```text
 Discussion Node
-Meeting Agent
+Meeting Agent（多轮编排；Meeting State Agent 已在 Step AGENT-1 落地）
 会议中问答
 ```
 

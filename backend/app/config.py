@@ -50,5 +50,33 @@ class Settings(BaseSettings):
     # when false, the first Pydantic failure immediately marks FAILED.
     summary_parse_repair: bool = True
 
+    # --- Meeting State Agent (Step AGENT-1) --------------------------------
+    # Master switch. When false the whole downstream consumer is inert: no
+    # scheduling, no LLM, no state row — Transcript / SSE / Summary behave
+    # EXACTLY as before. The agent is a downstream consumer, never a
+    # precondition for transcript commit.
+    meeting_agent_enabled: bool = True
+    # Batch/flush thresholds. A batch is flushed when EITHER bound is reached
+    # (or when the meeting finishes / freezes — see meeting_state_agent).
+    # Char count is the real cost driver for the prompt, so it is checked too.
+    meeting_agent_batch_max_segments: int = 8
+    meeting_agent_batch_max_chars: int = 1200
+    # Structured-output (Pydantic) validation attempts per state update, with
+    # the same bounded repair-prompt semantics as the Summary pipeline.
+    meeting_agent_max_attempts: int = 2
+    meeting_agent_parse_repair: bool = True
+    # Hard bound on the batch body fed to the LLM. No silent truncation: a batch
+    # larger than this is SKIPPED with a logged reason (the state simply does not
+    # advance — the transcript is untouched and a later batch can still progress).
+    meeting_agent_max_batch_chars: int = 12_000
+    # Hard bound on the accumulated state text included in the prompt (it is the
+    # only part of the prompt that can grow unboundedly across the meeting).
+    # Exceeding it fails the update loudly rather than silently clipping context.
+    meeting_agent_max_state_chars: int = 24_000
+    # Safety valve on ONE drain pass: how many batches a single trigger may
+    # process. Bounds the work (and LLM cost) of a single call; whatever remains
+    # is flushed by the next FINAL or by the finish-time forced flush.
+    meeting_agent_max_batches_per_run: int = 4
+
 
 settings = Settings()

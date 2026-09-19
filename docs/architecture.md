@@ -391,11 +391,17 @@ Phase C [locking, 回写]
 ## 10. 明确不做（后续版本）
 
 ```text
-Agent / Multi-Agent / Memory / RAG / Discussion Node / Todo / Decision
+Multi-Agent / Memory / RAG / Discussion Node / Todo / Decision
 向量数据库 / 跨会议检索 / 声纹身份映射 / 自动议题 / 自动章节
 真实麦克风 / 音频上传 / ASR WebSocket / Whisper / FunASR / 音频 Codec / PCM / 采样率
 复杂权限 / AI Chat / 知识库 / 思维导图 / AI PPT
 ```
+
+> **范围变更（Step AGENT-1，用户明确授权）**：`Meeting Agent` 一项按用户明确要求
+> 移出此清单并已实现为 **Meeting State Agent（会议工作记忆）**，见 §19。
+> 它是 Transcript 的**下游消费者**，不改变主链路 / 四态机 / Freeze 语义 / Summary
+> 核心行为，并由 `MEETING_AGENT_ENABLED` 控制（关闭即退化为变更前行为）。
+> 其余各项**仍然不做**。PRD 侧对应记录见 `prd.md §3.2` 范围变更记录。
 
 ## 11. Finalizer + Summary API + Summary SSE + Meeting Completion（Step 7B 已实现）
 
@@ -1102,3 +1108,191 @@ Meeting 状态机修改 / Freeze 语义修改 / LLM Provider 修改
 - 回归全绿：Step5 21 + Step6 21 + Step7A 28 + Step7B 36 + list 17
 - **DB schema 零改动；LLM Provider 零改动；Meeting 状态机零改动；
   Freeze 语义零改动（仅 STREAM_END 的「终值来源」放宽）；前端零改动**
+
+---
+
+## 19. Meeting State Agent（Step AGENT-1 已实现）
+
+> **范围说明**：本节是 §10「明确不做」中 `Meeting Agent` 一项的**授权例外**，见 §10
+> 范围变更记录与 `prd.md §3.2`。除本节外，§10 其余各项仍然不做。
+
+### 19.1 定位
+
+**Meeting State ≠ Final Summary。** Meeting State 是会议进行中的**工作记忆（Working
+Memory）**：随 FINAL 持续增量更新的结构化状态。Final Summary 是会后一次性生成的
+派生结果。本 Step 只做前者，**不重构** Summary（§12 说明下一步会考虑让 Summary 改为
+消费 Meeting State）。
+
+### 19.2 数据流与边界
+
+```text
+ASR / Mock Producer
+   │  （外部 camelCase DTO，ASR-0A/0B 契约）
+   ▼
+Transcript Domain（既有）  asr_service → transcript_service → 持久化 FINAL + SSE
+   │  ★ 只在 FINAL **首次提交成功** 时返回领域事实 FinalApplied
+   ▼
+[Application 层调度]  路由层 BackgroundTasks → run_agent_background
+   ▼
+Meeting State Consumer   幂等游标 last_processed_segment_seq
+   ▼
+Batch Buffer             AGENT_BATCH_MAX_SEGMENTS / MAX_CHARS
+   ▼
+Meeting State Updater    Previous State + New Batch → LLM
+   ▼
+LLM Provider（既有 fail-closed 工厂）
+   ▼
+Structured Validation    Pydantic（成功判据）+ 有界 repair
+   ▼
+Meeting State Repository  meeting_state 表（upsert，version +1）
+```
+
+**三条逻辑边界（本 Step 的核心约束）**：
+
+1. **ASR 不知道 Agent 存在**：`asr_adapter.py` / `asr_service.py` **零 Agent 调用**。
+   禁止 `save_transcript(); call_agent()` 这种硬编码耦合。
+2. **Agent 只知道 Transcript**：Agent 只读**持久化 FINAL**（`meeting_id` / `segment_seq`
+   / `text` / speaker），**绝不**触碰 provider raw payload、`asrSessionId`、
+   `sentenceId` 或其他厂商专有字段。真实 ASR 换供应商不影响 Agent 层。
+3. **Agent 是下游消费者，不是 Transcript 的前置条件**：FINAL 落库与 SSE 广播在 Agent
+   被调度**之前**已经完成并提交。
+
+### 19.3 触发机制
+
+调度点是“**FINAL 被首次提交**”这个领域事实，而不是 ASR 的产物：
+
+- `transcript_service.handle_final()` 在**真实插入**时返回
+  `FinalApplied(segment_seq, event_id)`；Case A / Case C 幂等重试返回 `None`
+  → **绝不重跑 LLM（不重付模型成本）**。
+- `handle_event(..., background_tasks=None)` 把 `FinalApplied` 交给路由层（应用层），
+  由路由层用**既有 FastAPI BackgroundTasks** 机制调度消费。
+- `background_tasks=None`（legacy 脚本直接调用）等于“不调度”，保持既有调用方语义不变。
+- Agent 包**只在调度函数内 lazy import**，transcript 包对 agent 包**无 import 期依赖**。
+
+**不引入** MQ / Kafka / Redis Stream / Celery / 定时线程 / 调度器。
+
+### 19.4 Batch / Flush 规则
+
+- `select_batches()` 返回 `(ready, remainder)`：
+  - `ready` —— 达到阈值（`AGENT_BATCH_MAX_SEGMENTS` 或 `AGENT_BATCH_MAX_CHARS`）的批次，
+    值得一次 LLM 调用。
+  - `remainder` —— 未达阈值的尾部，**继续缓冲**，不提前 flush。
+    （提前 flush 等于每句一次 LLM 调用，正是 Batch 要避免的。）
+- 一次 run 最多处理 `AGENT_MAX_BATCHES_PER_RUN` 个批次；超出部分留给下次触发
+  （outcome `BATCH_LIMIT_REACHED`）。
+- **强制 flush（§11）**：会议结束（`POST /finish`）时调度 `force_flush=True`，
+  用 `_chunk()` 把**包括尾部 remainder** 的全部 pending 按**同样的阈值切分**后处理。
+  强制 flush 只解除“批次数量上限”，**不**把所有内容并成一条超大 prompt
+  （那会被尺寸守卫拒绝，反而丢掉最需要抢救的尾部句子）。
+- 单个超长 segment 自成一批（**绝不切分** —— 切分会破坏 `segment_seq` 证据链），
+  交由尺寸守卫显式拒绝而非静默截断。
+
+### 19.5 幂等设计
+
+| 场景 | 机制 | 结果 |
+|---|---|---|
+| 同一 FINAL 重发（同 event_id） | `transcript_service` Case A 短路 | 200，`FinalApplied = None`，**不调度** |
+| 旧 segment 迟到（Case C） | 同上 | 200，不调度 |
+| 已处理 segment 再次进入 pending | 游标 `last_processed_segment_seq` 过滤（`seq > cursor`） | 不进 batch，不重复累加 |
+| 并发 run（LLM 调用期间状态被他人推进） | Phase C 锁内重读游标；不一致 → `SUPERSEDED`，**丢弃本次结果** | 不覆盖，下轮重放剩余 |
+| `process-pending` 重复调用 | 无 pending → `NO_WORK` | 零变化、零 LLM 调用 |
+
+游标只在**成功提交**时推进，且与 `state_json` 在**同一次 commit** 内写入。
+
+### 19.6 持久化与恢复
+
+新增表 `meeting_state`（`Base.metadata.create_all()` 建表，**无 ALTER / 无 migration**）：
+
+```text
+meeting_id (PK, FK -> meeting.id ON DELETE CASCADE)   一场会议一份当前状态
+version                   成功更新计数（append-only 语义）
+last_processed_segment_seq 幂等游标
+state_json                结构化状态（MeetingStateContent）
+status                    EMPTY / ACTIVE / FAILED / FROZEN
+model_name / last_error    可观测性
+created_at / updated_at
+```
+
+**为什么必须新表（不可复用既有三张表）**：`meeting` 是四态生命周期（无 content 语义）；
+`transcript_segment` 是 append-only 事实（不可变）；`meeting_summary` 是 append-only
+版本化终稿（会后语义）。三者语义均不兼容“**单行、原地更新、会中可用**”的工作记忆。
+
+**恢复**：状态在 DB，进程重启后 `GET /summary` 式的读取即可恢复；崩溃遗留的 `ACTIVE`
+行由下一次触发从游标继续，**不重放已处理 segment**。`FROZEN` 在 transcript freeze 后
+由一次 drain 收口（`FAILED` 行**不**被提升为 `FROZEN`，失败保持可见）。
+
+### 19.7 Failure Policy
+
+**Agent 失败绝不阻塞 Transcript**：
+
+- FINAL 已提交 → SSE 正常 → Agent 才被调度。Agent 抛异常时 `run_agent_background`
+  **吞掉一切异常**（含未预期异常），绝不让下游工作反噬转写路径。
+- LLM 失败 / 输出校验失败 → `mark_failed` 记录 `last_error`，**游标不推进**、
+  **`state_json` 不动**（版本号不增长）→ 下次触发**重放**这批 segment。
+- Provider 级失败（超时 / 5xx / 未配置 / 未知 provider）**不做 repair 重试**
+  （重试坏链路只烧延迟）；仅**形状级**失败（JSON / Pydantic）走有界 repair prompt。
+- 无静默截断：prompt 尺寸超硬上界 → 整批拒绝 + 记录，状态不动。
+
+### 19.8 可观测性
+
+每次 run 一行结构化日志：`meeting_id`、`agent_run_id`、`from_segment_seq`、
+`to_segment_seq`、`previous_state_version`、`new_state_version`、`llm_latency_ms`、
+`status`。**绝不输出 transcript 原文**（与“日志不输出密钥”同级的红线）。
+
+### 19.9 配置（全部集中在 `app/config.py`）
+
+```text
+MEETING_AGENT_ENABLED            默认 true   总开关（false = 完全惰性，零 Agent 行为）
+MEETING_AGENT_BATCH_MAX_SEGMENTS 默认 8      批大小（按 segment 数）
+MEETING_AGENT_BATCH_MAX_CHARS    默认 1200   批大小（按字符数）
+MEETING_AGENT_MAX_ATTEMPTS       默认 2      形状失败的有界 repair 次数
+MEETING_AGENT_PARSE_REPAIR       默认 true   是否启用 repair prompt
+MEETING_AGENT_MAX_BATCH_CHARS    默认 12000  单批硬上界（超限拒绝，不截断）
+MEETING_AGENT_MAX_STATE_CHARS    默认 24000  状态硬上界（超限拒绝，不截断）
+MEETING_AGENT_MAX_BATCHES_PER_RUN 默认 4     单次 run 批次上限
+```
+
+**未提供 `MEETING_AGENT_MODEL`**：模型名由 Provider 层拥有，独立开关会与实际调用的
+模型漂移。全部经 `settings`（无散落 `os.getenv()`）。
+
+### 19.10 Debug API（仅内部，非产品 UI）
+
+```text
+GET  /api/internal/meetings/{meeting_id}/state                 → 当前状态（空状态 200，会议缺失 404）
+POST /api/internal/meetings/{meeting_id}/state/process-pending → 后台强制 drain（幂等）
+```
+
+前端**不使用**这两个端点。**本 Step 零前端改动。**
+
+### 19.11 本 Step 明确不做
+
+```text
+真实腾讯 ASR / 音频采集 / ESP32 / PCM
+MQ / Kafka / Redis Stream / Celery / 后台定时线程 / 调度器
+Multi-Agent 编排 / Planning Agent / Critic Agent / RAG / 向量库
+自动执行任务 / 邮件 / Calendar
+声纹身份映射 / 会议级 ASR 全局时间轴 rebase
+Final Summary 重构（下一步单独做：Meeting State → Final Summary Agent）
+前端大改（本 Step 零前端改动）
+```
+
+### 19.12 Known Limitations
+
+- **multi-worker 不安全**：游标推进依赖进程内 `meeting_lock`（RLock，与 Step 5/6 同一
+  限制）。多进程 / 多实例下两个 run 可能读到同一游标。升级路径：DB 行锁或
+  `UPDATE ... WHERE version = :expected`（乐观并发）——见 §8.2 与
+  “FUTURE: multi-worker sequence allocation”。
+- **merge 策略只能增改、不能删**：列表语义为“非空替换、空/缺省保留”（安全方向）。
+  模型**无法主动删除或编辑**既有条目。这是 AGENT-2 的工作。
+- **状态可能滞后于 Transcript**（设计如此）：批次阈值意味着最后一个未达阈值的尾部
+  要等到下一个 FINAL 或会议结束的强制 flush。
+- **`source_segment_seqs` 依赖模型正确引用**：schema 保证字段存在且为 int 列表，
+  但**不保证**引用的 seq 真的支持该结论（模型可能引用错误证据）。
+
+### 19.13 验证
+
+- `pytest` —— **95/95 PASS**（freeze 35 + E2E 20 + **Meeting State 40**）
+- 回归全绿：Step5 21 + Step6 21 + Step7A 28 + Step7B 36 + list 17 + ASR-A 22
+- 前端 `npm run typecheck` + `npm run build` PASS
+- **Meeting 状态机零改动；Freeze 语义零改动；Transcript 契约（ASR-0A/0B）零改动；
+  LLM Provider 零改动；DB 既有表零改动（新增 1 张表，无 migration）；前端零改动**

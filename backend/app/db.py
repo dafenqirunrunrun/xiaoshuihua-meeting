@@ -45,6 +45,7 @@ def create_all() -> None:
     """Create tables (imports models first)."""
     from app.agent.summary_model import MeetingSummary  # noqa: F401
     from app.meeting.meeting_model import Meeting  # noqa: F401
+    from app.meeting_state.model import MeetingState  # noqa: F401
     from app.transcript.segment_model import TranscriptSegment  # noqa: F401
     from app.transcript.stream_model import TranscriptStream  # noqa: F401
 

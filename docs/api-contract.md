@@ -383,7 +383,73 @@ FINAL after Stream End（Part 8）：
 
 ---
 
-## 3. 领域异常 → HTTP 映射
+## 3. Meeting State Debug API（`/api/internal`，Step AGENT-1）
+
+> **仅开发 / 调试用，非产品 UI 契约**；前端不调用（本 Step 零前端改动）。
+> Agent 是 Transcript 的下游消费者：**没有** agent 相关的写入口，状态由 FINAL 提交
+> 或 `POST /finish` 后台推进。详见 `architecture.md §19`。
+
+### GET /api/internal/meetings/{meeting_id}/state
+
+返回该会议的**当前工作记忆**（Meeting State），最新版本，非 append-only 历史。
+
+- 从未处理过任何 FINAL → **200**，返回空状态（`version=0`、`status="EMPTY"`、
+  各列表为空）。这是合法答案，不是 404。
+- meeting 不存在 → **404**。
+
+```json
+{
+  "meeting_id": "meeting_001",
+  "version": 3,
+  "last_processed_segment_seq": 6,
+  "status": "ACTIVE",
+  "model_name": "fake",
+  "updated_at": "2026-09-19T10:00:00Z",
+  "current_topic": "上线安排",
+  "topics": [
+    { "title": "上线安排", "summary": "讨论上线时间与稳定性", "source_segment_seqs": [1, 2] }
+  ],
+  "decisions": [
+    { "text": "定下周三上线", "source_segment_seqs": [3] }
+  ],
+  "action_items": [
+    { "task": "后端接口联调", "owner": "小王", "deadline": "周二之前", "source_segment_seqs": [4, 5] }
+  ],
+  "open_questions": [
+    { "text": "支付接口稳定性需要确认", "source_segment_seqs": [6] }
+  ],
+  "risks": []
+}
+```
+
+- `status` ∈ `EMPTY` / `ACTIVE` / `FAILED` / `FROZEN`（Agent 内部状态，
+  **不是** Meeting 状态机的一部分 —— Meeting 仍然只有四态）。
+- `version` 与 `last_processed_segment_seq` 由**系统维护**，模型不可写。
+- `FAILED` 时 `last_error` 有值，且内容/游标**保持失败前**的值。
+
+### POST /api/internal/meetings/{meeting_id}/state/process-pending
+
+调度一次后台 drain（自己的 DB session，不阻塞请求），把 pending FINAL 折叠进状态。
+**幂等**：无 pending → 后台报告 `NO_WORK`，零状态变化、零 LLM 调用。
+
+Response **200**：
+
+```json
+{
+  "meeting_id": "meeting_001",
+  "scheduled": true,
+  "version_before": 3,
+  "last_processed_segment_seq": 6
+}
+```
+
+- meeting 不存在 → **404**。
+- `MEETING_AGENT_ENABLED=false` 时该调用为 no-op（后台直接返回 `DISABLED`），
+  主链路行为与变更前完全一致。
+
+---
+
+## 4. 领域异常 → HTTP 映射
 
 | 领域异常 | HTTP |
 |---|---|
@@ -394,7 +460,13 @@ FINAL after Stream End（Part 8）：
 
 ---
 
-## 4. Step 状态
+## 5. Step 状态
+
+> **Step AGENT-1 已完成**：Meeting State Agent（会议工作记忆）。新增
+> `GET/POST /api/internal/meetings/{id}/state[/process-pending]`（调试用，见 §3）；
+> FINAL 首次提交与 `POST /finish` 会后台推进状态；新增 1 张表（`meeting_state`，
+> 无 migration）；Meeting 四态机 / Freeze 语义 / Transcript 契约 / LLM Provider /
+> 前端**零改动**。见 `architecture.md §19`。
 
 > Step 6 已完成：Transcript Freeze（durable 边界）+ Finalization Readiness
 > （service 层派生，无公开 API）—— 见 `architecture.md §7.0/§7.3` 与 `ADR-001 D13`。

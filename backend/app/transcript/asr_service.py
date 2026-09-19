@@ -91,11 +91,19 @@ def ingest_asr_event(
     db: Session,
     path_meeting_id: str,
     external: AsrTranscriptEvent,
+    *,
+    background_tasks=None,
 ) -> transcript_schemas.TranscriptEvent:
     """Adapt + ingest one external ASR event. Returns the internal event used.
 
     Raises the same domain exceptions as the internal ingress, so the existing
     HTTP exception handlers map them unchanged (400 / 404 / 409).
+
+    `background_tasks` is forwarded straight through to the Transcript Service,
+    which uses it to schedule the meeting-state consumer for a newly committed
+    FINAL. This layer stays a pure pass-through: it does not inspect, reorder or
+    duplicate the scheduling decision, so the "one agent run per committed FINAL"
+    rule is enforced in exactly one place.
     """
     # --- 1. path/payload meeting id consistency (ASR-0A §21) ----------------
     # Checked on the EXTERNAL value, before translation: the adapter copies
@@ -112,14 +120,18 @@ def ingest_asr_event(
     if internal.status == "PARTIAL":
         # PARTIAL never persists and is never ordered: no allocation, no
         # critical section needed beyond handle_event's own lock.
-        transcript_service.handle_event(db, path_meeting_id, internal)
+        transcript_service.handle_event(
+            db, path_meeting_id, internal, background_tasks=background_tasks
+        )
         return internal
 
     # --- 3+4. FINAL: allocate and persist inside ONE critical section -------
     with meeting_lock(path_meeting_id):
         seq = _resolve_final_segment_seq(db, path_meeting_id, internal)
         ordered = internal.model_copy(update={"segment_seq": seq})
-        transcript_service.handle_event(db, path_meeting_id, ordered)
+        transcript_service.handle_event(
+            db, path_meeting_id, ordered, background_tasks=background_tasks
+        )
     return ordered
 
 

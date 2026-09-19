@@ -39,13 +39,14 @@ router = APIRouter(tags=["internal"])
 def ingest_transcript_event(
     meeting_id: str,
     event: transcript_schemas.TranscriptEvent,
+    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
 ) -> Response:
     """Ingest a single PARTIAL / FINAL transcript event (idempotent for FINAL).
 
     INTERNAL contract: the caller supplies ``segment_seq`` for FINAL.
     """
-    transcript_service.handle_event(db, meeting_id, event)
+    transcript_service.handle_event(db, meeting_id, event, background_tasks=background_tasks)
     return Response(status_code=status.HTTP_200_OK)
 
 
@@ -53,6 +54,7 @@ def ingest_transcript_event(
 def ingest_asr_event(
     meeting_id: str,
     event: asr_schemas.AsrTranscriptEvent,
+    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
 ) -> Response:
     """Ingest one EXTERNAL (collaborator) ASR event.
@@ -61,7 +63,7 @@ def ingest_asr_event(
     logic — adaptation, ordering allocation, and persistence all happen in
     ``asr_service`` / the existing Transcript Service.
     """
-    asr_service.ingest_asr_event(db, meeting_id, event)
+    asr_service.ingest_asr_event(db, meeting_id, event, background_tasks=background_tasks)
     return Response(status_code=status.HTTP_200_OK)
 
 

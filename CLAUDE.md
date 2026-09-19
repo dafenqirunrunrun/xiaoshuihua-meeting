@@ -431,3 +431,74 @@ npm run build      # tsc --noEmit && vite build
     Meeting 状态机 / Freeze 语义（仅 STREAM_END「终值来源」放宽）/ 前端业务代码
     （本 Step 零前端改动）。
   - 明确不做：真实 Tencent ASR / 音频采集 / ESP32 / PCM / 腾讯签名 / 真实 LLM Provider。
+- **Step AGENT-1 已完成**：Meeting State Agent（Streaming Transcript → 会议工作记忆）。
+  - **定位**：`Meeting State ≠ Final Summary`。State 是会议进行中的**工作记忆**
+    （随 FINAL 增量更新）；Summary 是会后一次性的派生结果。**本 Step 不重构 Summary**，
+    下一步（AGENT-2/后续）才考虑 `Meeting State → Final Summary Agent`。
+  - **范围授权**：`Agent` 原属 PRD §3.2/§56 与 arch §10「MVP 不做」。本 Step 按用户
+    **明确要求**实现，属授权范围变更，三处文档已同步标注（`prd.md §3.2` 变更记录 /
+    arch §10 变更记录 / arch §19）。其余各项（RAG / Memory / Multi-Agent / 向量库 /
+    跨会议问答 / LangGraph 等）**仍然不做**。
+  - **链路**：`ASR → Transcript Domain →（FINAL 首次提交）FinalApplied → 应用层
+    BackgroundTasks → Meeting State Consumer → Batch Buffer → LLM（Previous State +
+    New Batch）→ Pydantic 校验 → meeting_state upsert`。
+  - **三条边界（硬约束）**：① `asr_adapter` / `asr_service` **零 Agent 调用**
+    （禁止 `save_transcript(); call_agent()`）；② Agent **只读持久化 FINAL**
+    （`meeting_id`/`segment_seq`/`text`/speaker），**绝不**碰 provider raw payload /
+    `asrSessionId` / `sentenceId`；③ Agent 是**下游消费者**，FINAL 落库 + SSE 广播
+    在它被调度**之前**已完成 —— Agent 失败**绝不**阻塞 Transcript。
+  - **幂等（§4）**：游标 `last_processed_segment_seq`，只处理 `seq > cursor`。
+    游标与 `state_json` **同一次 commit** 写入，且**只在成功时推进**。
+    `FinalApplied` 机制保证幂等重试**不调度**（不重付模型成本）；并发 run 在 Phase C
+    锁内重读游标，不一致 → `SUPERSEDED` 丢弃本次结果。
+  - **Batch/Flush（§5）**：`select_batches` 返回 `(ready, remainder)`；**只有达阈值**
+    （`AGENT_BATCH_MAX_SEGMENTS` / `MAX_CHARS`）的批次才值得一次 LLM 调用，
+    **未达阈值的尾部继续缓冲**（提前 flush = 每句一次调用，正是要避免的）。
+    单次 run 上限 `AGENT_MAX_BATCHES_PER_RUN`。**无定时器 / 无后台线程**。
+  - **强制 Flush（§11）**：`POST /finish` → `force_flush=True`，用 `_chunk()` 把
+    **含尾部 remainder** 的全部 pending 按**同样阈值切分**后处理 —— **只解除批次数量
+    上限，不并成一条超大 prompt**（否则会被尺寸守卫拒绝，反而丢掉最该抢救的尾句）。
+  - **Persistence（§9）**：新增 `meeting_state` 表（**`create_all` 建表，无 ALTER /
+    无 migration**）：`meeting_id PK / version / last_processed_segment_seq /
+    state_json / status(EMPTY·ACTIVE·FAILED·FROZEN) / model_name / last_error /
+    timestamps`。**必须新表**：既有三表语义均不兼容「单行 · 原地更新 · 会中可用」
+    （meeting=四态生命周期；transcript_segment=append-only 事实；
+    meeting_summary=append-only 版本化终稿）。
+  - **Failure Policy（§18）**：失败 → `mark_failed` 记录 `last_error`，
+    **游标不推进 + `state_json` 不动 + version 不增长** → 下次触发**重放**该批。
+    Provider 级失败（超时/5xx/未配置/未知 provider）**不 repair**；仅形状级
+    （JSON/Pydantic）走有界 repair。**无静默截断**（超硬上界整批拒绝）。
+    `run_agent_background` **吞掉一切异常**，绝不让下游反噬转写路径。
+  - **Feature Flag（§17）**：`MEETING_AGENT_ENABLED`（默认 true）；置 false 后
+    ASR / Transcript / SSE / 既有 Summary **行为与变更前完全一致**，
+    Agent 不构成新的单点故障。
+  - **Observability（§15）**：每次 run 一行结构化日志（`meeting_id` / `agent_run_id` /
+    `from..to_segment_seq` / `previous..new_state_version` / `llm_latency_ms` /
+    `status`）；**绝不输出 transcript 原文**。
+  - **配置（§16）**：全部集中在 `app/config.py`（无散落 `os.getenv()`）：
+    `MEETING_AGENT_ENABLED` / `_BATCH_MAX_SEGMENTS`(8) / `_BATCH_MAX_CHARS`(1200) /
+    `_MAX_ATTEMPTS`(2) / `_PARSE_REPAIR`(true) / `_MAX_BATCH_CHARS`(12000) /
+    `_MAX_STATE_CHARS`(24000) / `_MAX_BATCHES_PER_RUN`(4)。
+    **刻意不提供 `MEETING_AGENT_MODEL`**（模型名归 Provider 层，独立开关会漂移）。
+  - **Debug API（§21）**：`GET /api/internal/meetings/{id}/state`（空状态 200 /
+    会议缺失 404）+ `POST .../state/process-pending`（后台 drain，幂等）。
+    **仅内部调试，非产品 UI；前端不使用**。
+  - **明确不做（§19）**：真实腾讯 ASR / ESP32 / PCM / MQ / Kafka / Redis Stream /
+    Celery / Multi-Agent 编排 / Planning Agent / Critic Agent / RAG / 向量库 /
+    自动执行任务 / 邮件 / Calendar / 声纹映射 / 会议级时间轴 rebase / **Summary 重构** /
+    **前端大改**。
+  - **Known Limitations**：① **multi-worker 不安全**（游标推进依赖进程内
+    `meeting_lock`，与 Step 5/6 同一限制；升级路径 = DB 行锁或
+    `UPDATE ... WHERE version = :expected`）；② merge 策略**只能增改、不能删**
+    （列表语义「非空替换、空/缺省保留」，安全方向；模型无法主动删除/编辑既有条目，
+    属 AGENT-2）；③ 状态**可能滞后**于 Transcript（阈值设计使然）；
+    ④ `source_segment_seqs` 只保证字段存在，**不保证引用正确**。
+  - 测试：`backend/tests/test_meeting_state_agent.py` **40/40 PASS**
+    （含 §13 确定性 6 段脚本会议回放：schema 有效 / 游标 / 去重重放不重复 /
+    批次边界 / finish 强制 flush / 非法输出不污染 / source trace）；
+    `pytest` **95/95 PASS**；回归全绿（Step5 21 + Step6 21 + Step7A 28 + Step7B 36 +
+    list 17 + ASR-A 22）；前端 typecheck + build PASS。
+  - **零改动**：Meeting 四态机 / Freeze 语义 / Transcript 契约（ASR-0A·0B）/
+    LLM Provider / DeepSeek / **DB 既有表**（仅新增 1 张表，无 migration）/
+    **前端业务代码**。
+  - **本 Step 未 push**（按用户要求：可 commit 到 `dafenqi`，等待确认后再 push）。

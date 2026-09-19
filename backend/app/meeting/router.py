@@ -2,7 +2,7 @@
 
 from typing import Annotated, Literal
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, BackgroundTasks, Depends, Query
 from sqlalchemy.orm import Session
 
 from app.db import get_db
@@ -49,5 +49,26 @@ def start_meeting(meeting_id: str, db: Session = Depends(get_db)):
 
 
 @router.post("/{meeting_id}/finish", response_model=meeting_schemas.MeetingOut)
-def finish_meeting(meeting_id: str, db: Session = Depends(get_db)):
-    return meeting_service.finish_meeting(db, meeting_id)
+def finish_meeting(
+    meeting_id: str,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+):
+    """IN_PROGRESS -> FINALIZING.
+
+    On the way out, schedules a FORCED flush of the meeting-state agent (Step
+    AGENT-1): the meeting is ending, so whatever is still buffered below the
+    batch thresholds must be folded into the state now rather than waiting for
+    FINALs that will never arrive. Fired after the response and on its own DB
+    session; disabled-agent and no-work cases are both no-ops. The agent never
+    gates this transition — the meeting finishes regardless of what the agent
+    does (or fails to do).
+    """
+    meeting = meeting_service.finish_meeting(db, meeting_id)
+    if meeting.status == "FINALIZING":
+        from app.meeting_state import service as meeting_state_service
+
+        background_tasks.add_task(
+            meeting_state_service.run_agent_background, meeting_id, force_flush=True
+        )
+    return meeting
