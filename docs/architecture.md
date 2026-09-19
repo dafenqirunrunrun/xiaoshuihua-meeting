@@ -775,3 +775,187 @@ useSummaryResultStream.ts -> 8C-2/8C-3 summary.* 通知收不到（页面永不�
 无 Agent 重开发（复用既有 Summary pipeline）
 无 Time Travel / 无手动编辑纪要 / 无导出
 ```
+
+---
+
+## 17. ASR Transcript Input Adapter（Step ASR-0A 已实现）
+
+> 目标：让 Backend 直接消费协作者约定的**标准 ASR 输入格式**，而不改动既有
+> Transcript Domain。边界：**ASR provider-specific 格式止步于 Adapter**。
+> 本 Step 不接真实 Tencent ASR、不动 DB schema、不改 LLM Provider、不改状态机。
+
+### 17.1 ASR Boundary
+
+```text
+Audio / Tencent ASR                     ← 协作者负责
+      ↓
+Normalized PARTIAL / FINAL              ← 协作者契约（camelCase，无 segmentSeq）
+      ↓
+[External DTO]  asr_schemas.py
+      ↓
+[Adapter]       asr_adapter.py          ← 纯翻译：字段映射 + identity 派生
+      ↓
+[Ingress]       asr_service.py          ← 唯一的 segment_seq 分配点（锁内）
+      ↓
+Transcript Domain（既有，未改动）
+  live_cache / repository / commit / publish_final
+      ↓
+SSE（具名帧） → React 实时字幕 → Snapshot / Resume → Freeze → Summary Agent
+```
+
+两个 ingress 并存，两个契约互不污染：
+
+| 路由 | 契约 | 命名 | `segment_seq` |
+| --- | --- | --- | --- |
+| `/api/internal/meetings/{id}/transcript-events` | **内部**（PRD §15） | snake_case | **Producer-owned**（不变） |
+| `/api/internal/meetings/{id}/asr-events` | **外部协作者** | camelCase | **Transcript-owned**（本 Step 新增） |
+
+既有内部路由与 Step 5/6 测试**完全未改动**。
+
+### 17.2 External DTO / Internal DTO 分离
+
+外部 DTO 是 camelCase，内部 Domain 保持 snake_case；**没有**为了接协作者格式
+把整个 Python Domain 改成 camelCase。
+
+```text
+External (camelCase)      Internal (snake_case)
+  type                      status
+  meetingId                 meeting_id
+  asrSessionId              → 仅用于派生 identity，不落库
+  sentenceId                → 仅用于派生 identity，不落库
+  speakerId (int, -1)       speaker_id (str, "unknown" / "speaker_N")
+  startMs / endMs           start_ms / end_ms
+  provider                  → 不落库
+```
+
+外部 DTO 采用 `extra="forbid"`：多一个字段即契约漂移，必须 422 大声失败，
+而不是静默忽略。只接受 camelCase 一种写法（snake_case 会被拒绝）。
+
+### 17.3 segment_seq 归属（本 Step 核心决策）
+
+**协作者不提供 `segmentSeq`**（ASR 的 `sentenceId` 是 session 内编号，与会议级
+Transcript 全局顺序不是同一概念）。**禁止 `segment_seq = sentenceId`**：ASR
+重连会开新 session、句号从头发，会与 `UNIQUE(meeting_id, segment_seq)` 冲突
+并破坏全局顺序。
+
+分配规则（`asr_service._resolve_final_segment_seq`）：
+
+```text
+next_seq = (max persisted segment_seq) + 1
+```
+
+**读取 max → 分配 → 持久化 必须在同一 meeting lock 临界区内**，否则并发 FINAL
+会取到相同 seq。实现上 `ingest_asr_event` 全程持有 `meeting_lock(meeting_id)`，
+`handle_event` 再进入同一把锁（per-meeting `RLock`，同线程可重入）→ 临界区连续。
+
+**幂等重试不消耗新 seq**：分配前先按派生 `event_id` 查已持久化行；命中则**复用**
+其 `segment_seq`，让重试落进既有 Case A 幂等路径（200、不 INSERT）。否则重试会
+分配新尾号、错过 Case A、撞 `UNIQUE(meeting_id, segment_seq)`。
+
+### 17.4 utterance identity 与 event identity 分开
+
+```text
+utterance_id = f"{asrSessionId}:{sentenceId}"        ← PARTIAL 原地覆盖 & PARTIAL→FINAL 交接
+FINAL event_id = "asrf_" + sha256(meetingId|asrSessionId|sentenceId|FINAL)[:32]
+PARTIAL event_id = "asrp_" + sha256(meetingId|asrSessionId|sentenceId|PARTIAL|text|startMs|endMs)[:32]
+```
+
+- `utterance_id` 对同一句的全部 PARTIAL 与对应 FINAL **恒等** → 前端只显示一条
+  会原地变化的字幕，绝不堆成多条。
+- PARTIAL **不**复用该句的固定 event_id：一句会发多个 revision。其摘要混入
+  revision 内容（text + timing），保证不同 revision id 不同、相同重试 id 相同。
+  （`handle_partial` 从不读 `event_id`、也不落库，因此这里只要求确定性与可追溯性。）
+- FINAL 摘要含 `meeting_id`，因为 `UNIQUE(event_id)` 是**全局**而非 meeting 内。
+- `asrSessionId` 上限 48 字符：`utterance_id` 必须落进内部 64 字符界（最坏 48+1+10=59）。
+  超长在边界直接 422，而不是静默截断或散列 identity。
+
+### 17.5 FINAL idempotency 冲突不会被静默吞掉
+
+`event_id` 是**确定性**派生的，所以"同一 ASR sentence identity、内容却不同"会命中
+Case A。既有 `handle_final` 的处理是**先 canonical 比对、不同即 409**（不是无条件
+200）：
+
+```text
+transcript_segment 已有该 event_id
+  ├─ text/speaker/start_ms/end_ms 完全相同 → 200（幂等重试，不重复 INSERT）
+  └─ 任一不同                            → 409 TranscriptConflictError
+```
+
+即：内容漂移会显式报冲突，不会被当成重试吞掉。
+
+### 17.6 speakerId = -1
+
+`-1` 表示"说话人暂时未知"，是**合法值**（早段 PARTIAL 本来就不知道说话人），
+永不报错。映射到内部 `unknown` 哨兵，**绝不**产生 `speaker_-1` 到达持久化或前端。
+
+### 17.7 provider metadata 的限制
+
+`provider` / `asrSessionId` / `sentenceId` 只存在于 External Ingress / Adapter 的
+生命周期内，用于 identity 派生，**不落库**。
+
+**LIMITATION**：DB 无对应列，本 Step 明确不新增列（不做 schema migration）。因此
+这些 metadata 重启后不可查；如需按 session/provider 追溯，需后续 Step 的新增列 +
+索引（届时与 SQLite → 公司数据平台迁移一并评估）。
+
+内部**不硬编码腾讯**：`provider` 是不透明字段，`tencent` / `whisper` / `aliyun`
+走同一条通路（ASR-A12 已覆盖）。
+
+### 17.8 并发范围（MVP 单进程）
+
+sequence 分配依赖 `meeting_lock` —— 一个**进程内** per-meeting `RLock` 注册表。
+它在单进程内使"读 max → 分配"原子，这正是 MVP 的全部部署形态；它**不是**跨进程 /
+跨实例保证。
+
+**FUTURE**：multi-worker / MySQL 阶段必须把分配升级为**数据库级安全机制**
+（`SELECT ... FOR UPDATE` / 条件更新 / 乐观版本号），与 ADR D8 同一议题。
+本 Step 不实现。
+
+### 17.9 Mock Producer
+
+`scripts/mock_transcript_producer.py` 已改写为**模拟协作者输出**（不再模拟我们的
+内部 DTO）：camelCase、带 `asrSessionId` / `sentenceId`、`speakerId=-1`、多段
+PARTIAL revision、**不发送 `segmentSeq`**。它仍是**纯外部 HTTP 客户端**，不 import
+任何 Backend 内部模块。
+
+它发送的 `STREAM_END` 是**当前内部 mock 终结信号**，见 §17.10。
+
+### 17.10 PENDING COLLABORATOR CONFIRMATION
+
+> 以下两项**尚未**与协作者锁死，本 Step 不单方面宣布为双方最终协议。
+> `protocols/transcript-format.md` 属共同协议，本 Step **未修改**其核心字段。
+
+**PENDING 1 — `TRANSCRIPT_STREAM_END` 契约**
+
+```text
+未确认：谁发送 / 何时发送 / payload 字段 / last_segment_seq 归属
+现状：  继续使用项目内既有 internal mock STREAM_END，仅用于完整链路回归
+        （freeze → summary → COMPLETED）。它不是双方最终协议。
+```
+
+**PENDING 2 — multi-ASR-session 时间轴语义**
+
+```text
+未确认：同一 meeting 多个 ASR session（重连）时，startMs/endMs 是否重置
+现状：  只保证单 session（mock-session-001）正确；不猜测多 session 行为
+```
+
+### 17.11 本 Step 明确不做
+
+```text
+真实 Tencent ASR / ESP32 / PCM / 音频上传 / 腾讯 WebSocket / 腾讯签名
+真实 LLM 配置 / DeepSeek 接线（继续 FakeProvider）
+SQLite → MySQL / DB schema change / 新 UNIQUE / migration
+Harness 登录鉴权 / Cloud
+Recording Pause / Resume（有 asrSessionId ≠ 要实现录制生命周期）
+Discussion Node / Todo / Decision
+STREAM_END 双方协议重设计 / 多 session 时间轴规则
+```
+
+### 17.12 验证
+
+- `backend/scripts/test_asr_adapter.py` —— ASR-A01~A20，**20/20 PASS**
+- `backend/scripts/e2e_asr_browser.py` —— 真实 Chrome (CDP) **14/14 PASS**
+  （含 named SSE 真实到达、PARTIAL 原地覆盖、FINAL 替换、刷新 Snapshot 恢复）
+- 回归全绿：Step5 21 + Step6 21 + Step7A 28 + Step7B 36 + list 17
+- 前端 `npm run typecheck` + `npm run build` PASS
+- **Backend DB schema 零改动；LLM Provider 零改动；Meeting 状态机零改动**

@@ -322,6 +322,41 @@ existing implementation
     Step5 21/21 + list 17/17；typecheck + build PASS。
 - **Step 8C Summary Frontend Chain 完成 ✅**（8C-1 Snapshot + 8C-2 Realtime +
   8C-3 Regenerate）。
+- **Step ASR-0A 已完成**：Transcript Input Adapter & Mock Contract Integration。
+  - **ASR Boundary**：`Audio/Tencent ASR → Normalized PARTIAL/FINAL → External DTO
+    → Adapter → Ingress → 既有 Transcript Domain → SSE → React`。provider-specific
+    格式**止步于 Adapter**；内部 Domain 保持 snake_case，未因接协作者格式改成 camelCase。
+  - **两个 ingress 并存**：既有 `POST /api/internal/.../transcript-events`（内部契约、
+    snake_case、`segment_seq` **仍 Producer-owned**）**零改动**；新增
+    `POST /api/internal/meetings/{id}/asr-events`（外部协作者、camelCase、
+    `extra="forbid"`、**无 segmentSeq**）。
+  - **segment_seq = Transcript-owned（仅新路由）**：FINAL 由 `asr_service` 在
+    `meeting_lock` 内分配 `max + 1`；**幂等重试复用已存 seq**（否则会撞
+    `UNIQUE(meeting_id, segment_seq)`）。**禁止 `segment_seq = sentenceId`**
+    （sentenceId 是 session 内编号，重连会重号）。
+  - **identity 分开**：`utterance_id = f"{asrSessionId}:{sentenceId}"`（PARTIAL 原地
+    覆盖 + PARTIAL→FINAL 交接）；`FINAL event_id` = 确定性摘要（含 meetingId，
+    因 `UNIQUE(event_id)` 全局）；PARTIAL event_id 混入 revision 内容，**不复用**该句
+    固定 id。`asrSessionId` 上限 48 保证派生 id ≤ 64。
+  - **Case A 不吞冲突**：同 event_id 但 canonical 内容不同 → **409**（沿用既有
+    `_ensure_identical`，未改语义）。
+  - **speakerId = -1 合法**（说话人暂未知）→ 内部 `unknown`，绝不产生 `speaker_-1`。
+  - **未落库 metadata（limitation）**：`provider` / `asrSessionId` / `sentenceId` 只
+    存活于 ingress 生命周期，**不新增 DB 列**；内部不硬编码腾讯（provider 不透明）。
+  - Mock Producer 改为模拟**协作者格式输出**（camelCase、sentenceId、speakerId=-1、
+    多段 PARTIAL、不发 segmentSeq），仍是纯外部 HTTP 客户端。
+  - **PENDING（未单方面锁死）**：① `STREAM_END` 双方契约（谁发/何时/payload/
+    `last_segment_seq` 归属）——继续用内部 mock 仅供回归；② multi-ASR-session
+    时间轴（重连时 startMs/endMs 是否重置）。
+  - **FUTURE**：multi-worker / MySQL 阶段，seq 分配须升级为数据库级安全机制
+    （现为进程内 `RLock`，仅 MVP 单进程成立）。
+  - **未改**：DB schema / 新 UNIQUE / migration / LLM Provider / DeepSeek /
+    Meeting 状态机 / Freeze 语义 / 既有 ingress / 前端业务代码。
+  - 测试：`scripts/test_asr_adapter.py` **ASR-A01~A20 20/20 PASS**；
+    `scripts/e2e_asr_browser.py` 真实 Chrome CDP **14/14 PASS**（named SSE 真实到达、
+    PARTIAL 原地覆盖、FINAL 替换、刷新 Snapshot 恢复、Summary 渲染、Regenerate v2）；
+    回归 Step5 21 + Step6 21 + Step7A 28 + Step7B 36 + list 17 全绿；
+    前端 typecheck + build PASS。
 
 
 ## 常用命令

@@ -109,8 +109,63 @@ PARTIAL 永远不会出现在此接口。Meeting 不存在 → **404**。
 ## 2. Internal Transcript Ingress（`/api/internal`）
 
 > 供 ASR / Mock Transcript Producer 调用；是跨团队正式契约。PRD §21 / §48。
+> **两个 ingress 并存（Step ASR-0A）**：`/transcript-events` 是**内部**契约
+> （snake_case，`segment_seq` 由 Producer 提供，PRD §15 原文不变）；
+> `/asr-events` 是**外部协作者**契约（camelCase，无 `segmentSeq`，由 Transcript
+> Domain 分配顺序）。详见 arch §17。
 
-### POST /api/internal/meetings/{meeting_id}/transcript-events
+### POST /api/internal/meetings/{meeting_id}/asr-events（外部 ASR 输入，ASR-0A）
+
+> 标准化 ASR 输出的正式入口。**不接收 `segmentSeq`**——顺序是 Transcript Domain
+> 的职责。适配与顺序分配见 arch §17。
+
+Request（协作者 camelCase 格式）：
+
+```json
+{
+  "type": "transcript.partial",
+  "meetingId": "meeting_001",
+  "asrSessionId": "sess-001",
+  "sentenceId": 2,
+  "speakerId": -1,
+  "startMs": 950,
+  "endMs": 6480,
+  "text": "我们今天讨论会议助手",
+  "provider": "tencent"
+}
+```
+
+`type` 取值 `transcript.partial` | `transcript.final`（FINAL 用同格式，`speakerId`
+通常已解析为 `>= 0`）。
+
+| 字段 | 类型 | 规则 |
+|---|---|---|
+| type | str | `transcript.partial` \| `transcript.final` |
+| meetingId | str | 必须与 path `meeting_id` 一致，否则 **400** |
+| asrSessionId | str | 1..48（上限保证派生 `utterance_id` 落在 64 字符界内） |
+| sentenceId | int | ≥ 0；**session 内**句子编号，**不等于** `segment_seq` |
+| speakerId | int | ≥ -1；**-1 = 说话人暂未知**，合法，映射为内部 `unknown` |
+| startMs / endMs | int | ≥ 0 且 `endMs >= startMs` |
+| text | str | ≤ 4000 |
+| provider | str | 不透明；不得据此硬编码厂商逻辑 |
+
+**拒绝规则**：未知字段（如 `segmentSeq`）或 snake_case 写法 → **422**（`extra="forbid"`，
+契约漂移必须大声失败）。
+
+**派生（客户端不提供）**：
+
+```text
+utterance_id  = f"{asrSessionId}:{sentenceId}"   ← PARTIAL 原地覆盖 & PARTIAL→FINAL 交接
+FINAL event_id = 确定性摘要(meetingId|asrSessionId|sentenceId|FINAL)
+```
+
+状态码：`200` 接收成功 / `422` payload 校验失败 / `400` meetingId 不一致 /
+`404` meeting 不存在 / `409` 状态不允许或幂等冲突。
+
+**`segment_seq`**：FINAL 由 Backend 在 meeting lock 内分配 `max + 1`；
+幂等重试复用已存 seq，不消耗新号。见 arch §17.3。
+
+### POST /api/internal/meetings/{meeting_id}/transcript-events（内部契约）
 
 Request（Transcript Event Contract，PRD §15）：
 
