@@ -616,3 +616,73 @@ npm run build      # tsc --noEmit && vite build
   - **零改动**：Meeting 四态机 / Transcript 契约 / ASR 契约 / Freeze 语义 /
     **DB schema（无 migration）** / **前端业务代码** / `DeepSeekProvider` 传输层。
   - **本 Step 未 push**（按用户要求：等待确认后再 push）。
+- **Step UI-INTEL-1 已完成**：Meeting Intelligence Panel（会中 AI 会议理解面板）。
+  - **定位**：把进行中的会议页从「只有实时字幕」升级为「实时字幕 + AI 会议理解」——
+    会议**进行中**就展示 AI 已理解出的结构化内容。**不是新数据域**：复用 AGENT-1
+    已产出的 Meeting State，本步只是**暴露**它并让它**实时可见**。
+  - **三条边界**：① `Meeting State ≠ Final Summary`（会中工作记忆 vs 会后派生终稿，
+    禁止互相推导）；② **前端绝不重新推导**（禁止 `Transcript → 关键词规则 → 猜
+    decision`，展示的每一条都必须来自服务端持久化状态）；③ **零 Agent 改动**
+    （不改 AGENT-1 核心 schema / 游标 / 批次 / 失败策略）。
+  - **公开读取 API**：`GET /api/meetings/{id}/state` → `MeetingStatePublic`
+    （**产品侧唯一入口**；internal 调试接口保留不变，前端不使用）。
+    只有 11 个字段；**结构性**不含 `model_name`（`last_error` 在两个模型上都不是
+    字段，不靠"记得别传"）。会议不存在 → 404；未处理任何 FINAL → **200 +
+    version=0 + EMPTY**（不是错误）。
+  - **损坏降级（§6）**：`state_json` 不可解析时**不 500、不回写 DB**，在**投影层**
+    降级为 `status=FAILED` + 保留可安全读取的标量 + 内容置空。
+    **绝不返回 `ACTIVE + 空内容`**（那等于谎称 AI 正常）；**绝不**把解析异常当产品 500。
+  - **SSE 失效通知 `meeting.state.updated`**（复用既有 `/events` 连接，
+    **不新增第二条 EventSource**）：
+    - 语义是「**product-visible durable 状态变了**」，**不是**「version +1」。
+      必须覆盖：`ACTIVE vN → ACTIVE vN+1`、`ACTIVE|EMPTY → FAILED`、
+      `FAILED → ACTIVE`、`ACTIVE → FROZEN`；`FAILED → FAILED` 与 `NO_WORK` 抑制。
+      **必须覆盖 FAILED** —— `mark_failed` 刻意不推进 version，"version+1 才发"
+      会**静默丢掉整个失败通知**。
+    - payload 仅 `{version,status}`；**先 commit 后 publish**；发布失败**绝不回滚**。
+      **非 durable、不回放**，不改变 `after_segment_seq` 协议，无 Last-Event-ID。
+    - **稳定 id 必须带 status**：`state:<mid>:<version>:<status>` ——
+      `ACTIVE@4` 与 `FAILED@4` 是两个不同的 durable 状态、同一个 version，
+      仅凭 version 无法区分，客户端去重会误判为重复而丢弃。
+      **不引入新的持久化事件序号**。
+  - **✅ 修复真实缺陷（SQLAlchemy identity-map aliasing）**：`db.get()` 每次返回
+    **同一个** identity-mapped 实例，而 `repository.upsert` **原地修改**该实例 ——
+    于是「写后读 `row.status`」拿到的是**新值**，发布判据恒为"没变"，
+    **每一次状态变更都会被静默抑制**（`ACTIVE → FROZEN` 已实测复现）。
+    修复：在写**之前**把 `previous_status` / `previous_version` 读进**普通局部变量**；
+    `_current_state_identity()` 返回**普通元组而非 ORM 行**（docstring 记录此陷阱）。
+    **已做 mutation 验证**：改回别名读 → `test_freeze_is_announced` 立即失败。
+  - **SSE 白名单三处同步 + 编译期守卫（§4 硬要求）**：后端具名帧**不触发
+    `onmessage`**，遗漏订阅是**完全静默**的失效。三处 = 后端 `SSE_EVENT_TYPES` /
+    `types/sse.ts` 的 `SseEventType` / `utils/sse.ts` 的白名单。新增
+    `Exclude<SseEventType, typeof SSE_EVENT_TYPES[number]> extends never` 穷尽性守卫
+    （`satisfies` 只能查多余，查不出**遗漏**——而遗漏恰是静默方向）。
+    **已做 mutation 验证**：删白名单成员 → `npm run typecheck` 立即报错。
+  - **前端数据架构（§7/§8）**：`useMeetingIntelligence(meetingId, enabled)` ——
+    初始 GET / 两道守卫 / `refreshState()`；**状态留在 hook 内，不扩 Zustand 全局
+    store**。`useMeetingStream(..., onStateInvalidated)` 收到失效通知 → `refreshState()`
+    （回调经 `Ref` 读取，故意不进 effect 依赖，否则每次 render 换引用都会重连 SSE）。
+    - **两道守卫缺一不可**：*request sequence*（乱序旧响应不覆盖新响应）+
+      *version*（`incoming.version >= current.version` 才落地）。必须 `>=` 而非 `>`：
+      FAILED 不推进 version，`>` 会丢掉同 version 下的 `ACTIVE → FAILED`。
+      **初始基线 `-1`**，保证首个 `version=0 / EMPTY` 正常进入。
+  - **展示（§9~§12）**：面板挂既有 `room__rail`（轨首），**不重构 MeetingRoom**。
+    四态 Loading / Empty / Error / Normal；**FAILED 保留 last-good 内容** + 轻量提示
+    （**会议 `COMPLETED` + State `FAILED` 是合法组合**）。
+    `owner` / `deadline` = null → 「待确认」，**纯展示层 fallback，绝不写回后端**。
+    `source_segment_seqs` 保留在类型与 API，**点击溯源属 UI-INTEL-2**。
+    视觉沿用既有体系（无新 UI 库 / 动画库 / 渐变 / 发光 / emoji）：
+    `.intel-*` CSS + 宽屏 `--rail-width: 340px` + `<900px` 单列面板独占整行。
+  - 测试：`backend/tests/test_meeting_state_api.py` **31/31 PASS**；
+    `pytest` **171/171 PASS**；回归全绿（Step5 21 + Step6 21 + Step7A 28 +
+    Step7B 36 + list 17 + ASR-A 22）；前端 typecheck + build PASS。
+  - **E2E**：`scripts/e2e_ui_intel_browser.py` 真实 Chrome CDP **17/17 PASS** ——
+    含**只有浏览器能证明**的断言：`meeting.state.updated` **不刷新**页面即更新面板
+    （具名帧真实到达）、`ACTIVE→FAILED` **同 version** 转换、FAILED 保留 last-good、
+    无内部细节泄漏、Agent FAILED ≠ Transcript FAILED。
+    **已做 mutation 验证**：删掉前端失效分派 → UI-I06/UI-I14 失败而 UI-I11（刷新恢复）
+    仍通过，证明测的是**实时失效**而非恢复。
+  - **零改动**：Meeting 四态机 / Freeze 语义 / Transcript 契约 / ASR 契约 /
+    LLM Provider / **DB schema（无 migration，`meeting_state` 表结构不变）** /
+    AGENT-1 核心 schema / AGENT-2。
+  - **本 Step 未 push**（按用户要求：可 commit 到 `dafenqi`，等待确认后再 push）。

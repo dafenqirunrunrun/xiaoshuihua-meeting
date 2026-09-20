@@ -46,6 +46,20 @@ interface UseMeetingStreamParams {
   snapshotReady: boolean
   /** 已持久化 FINAL 的最大 segment_seq（作为连接游标 after_segment_seq） */
   maxSegmentSeq: number
+  /**
+   * `meeting.state.updated` 到达时的失效回调（Step UI-INTEL-1）。
+   *
+   * **复用本 hook 已有的 `/events` EventSource**，不新增第二条 SSE 连接：
+   * Meeting State 的失效通知与 Transcript 增量走的是同一个流。
+   *
+   * 语义纯为 invalidation —— 事件只带 `{version, status}`，调用方应重新
+   * `GET /state`，绝不把 payload 当内容渲染。此处不对回调做任何 await / 错误
+   * 传播：Meeting State 拉取失败绝不影响转写链路。
+   *
+   * 存在 `Ref` 里（见下方 `onStateInvalidatedRef`），故意**不**进 effect 依赖 ——
+   * 否则回调每次 render 换新引用都会重连 SSE。
+   */
+  onStateInvalidated?: () => void
 }
 
 /** 从 partial 记录里摘掉某 utterance（无则原样返回，避免无谓 setState） */
@@ -64,6 +78,7 @@ export function useMeetingStream({
   status,
   snapshotReady,
   maxSegmentSeq,
+  onStateInvalidated,
 }: UseMeetingStreamParams) {
   const esRef = useRef<EventSource | null>(null)
   const timerRef = useRef<number | null>(null)
@@ -71,6 +86,9 @@ export function useMeetingStream({
   const retryRef = useRef(0)
   const maxSeqRef = useRef(0)
   const statusRef = useRef(status)
+  // 失效回调经 Ref 读取：handler 闭包与 effect 依赖都不随回调引用变化（见参数注释）
+  const onStateInvalidatedRef = useRef(onStateInvalidated)
+  onStateInvalidatedRef.current = onStateInvalidated
   // Snapshot 游标只增不减：初始以此 seed；后续 live FINAL / 显式 recovery 更新。
   // 若每次 render 都覆盖会把「已收到的 live max」打回 snapshot 值，破坏重连游标。
   if (maxSegmentSeq > maxSeqRef.current) maxSeqRef.current = maxSegmentSeq
@@ -206,6 +224,12 @@ export function useMeetingStream({
         case 'meeting.status':
           // eslint-disable-next-line @typescript-eslint/no-floating-promises
           handleMeetingStatus(mid)
+          break
+        case 'meeting.state.updated':
+          // Step UI-INTEL-1：纯失效通知 → 重新 GET /state。
+          // 后端保证「先 commit 后 publish」；事件本身 non-durable、不回放，
+          // 所以这里只触发拉取，不消费 payload、不做版本比较（由 hook 守卫）。
+          onStateInvalidatedRef.current?.()
           break
         default:
           break // heartbeat / summary.*（留给 8C）忽略

@@ -104,6 +104,50 @@ Response `200 / MeetingListOut`（复用 `MeetingOut`，无新增派生字段）
 
 PARTIAL 永远不会出现在此接口。Meeting 不存在 → **404**。
 
+### GET /api/meetings/{meeting_id}/state — Meeting State（Step UI-INTEL-1）
+
+> **产品侧唯一的 Meeting State 读取入口**（与 §3 的 `/api/internal/...` 调试接口是
+> 两个东西：那条返回完整 `MeetingState`、含 `model_name`，**前端不使用**）。
+
+返回 AI 在会议进行中理解出的**结构化工作记忆**（`MeetingStatePublic`）。
+**不是**会后 Final Summary —— 两者是独立数据域，禁止互相推导。
+
+```json
+{
+  "meeting_id": "meeting_abc123",
+  "version": 3,
+  "last_processed_segment_seq": 16,
+  "status": "ACTIVE",
+  "updated_at": "2026-09-20T10:11:12.345678",
+  "current_topic": "上线时间安排",
+  "topics":         [{ "title": "…", "summary": "…", "source_segment_seqs": [1, 2] }],
+  "decisions":      [{ "text": "…", "source_segment_seqs": [1, 2] }],
+  "action_items":   [{ "task": "…", "owner": "小王", "deadline": null,
+                       "source_segment_seqs": [4, 5] }],
+  "open_questions": [{ "text": "…", "source_segment_seqs": [7] }],
+  "risks":          [{ "text": "…", "source_segment_seqs": [8] }]
+}
+```
+
+- **`status`** 是 Meeting State 自身的处理状态
+  （`EMPTY` / `ACTIVE` / `FAILED` / `FROZEN`），**不是** Meeting 四态机。
+  两个维度独立：会议 `COMPLETED` + 状态 `FAILED` 是**合法组合**。
+- **`version`** 单调递增，**只由后端在成功更新时推进**（失败不推进）。
+- Meeting 不存在 → **404**。会议存在但**尚未处理任何 FINAL** → **200** +
+  `version = 0` + `status = EMPTY`（最常见的早期状态，**不是错误**）。
+- **`owner` / `deadline` 契约上可为 `null`**（转写里确实没说负责人 / 时间）。
+  UI 的「待确认」纯属展示层 fallback，**绝不写回后端**。
+- **绝不含**：`model_name`（provider 身份是工程事实，不是产品事实）、`last_error`、
+  raw model output、prompt、provider credential、内部异常 / 堆栈。由投影层
+  （`MeetingStatePublic`）**结构性**保证（两个模型上都**没有** `last_error` 字段）。
+- **`state_json` 损坏时**：不 500、不回写 DB；在投影层降级为 `status = FAILED`，
+  保留仍可安全读取的标量（`version` / 游标 / `updated_at`），内容置空。
+  **绝不**返回 `ACTIVE + 空内容`（那等于告诉用户「AI 正常运行」却什么也没有）。
+- **`source_segment_seqs`** 本步只接住数据；点击溯源跳转属 **UI-INTEL-2**。
+- **实时通知**：`meeting.state.updated`（`GET /events` 同一连接）**只是失效通知**，
+  payload 仅 `{version, status}`；前端收到后重新调用本接口。语义与 id 规则见
+  `protocols/realtime-events.md §4`。
+
 ---
 
 ## 2. Internal Transcript Ingress（`/api/internal`）
@@ -276,7 +320,12 @@ Receive → Validate(status/meeting/seq) → Idempotency Check → Persist → C
 - **事件类型**（本 Step 产出）：`transcript.partial`、`transcript.final`、
   `meeting.status`、`heartbeat`。`summary.*`（started/completed/failed）在 Step 7B
   产出（见 §4 Step 状态；payload 仅 `{version,status}`，非 durable，不回放）。
+  `meeting.state.updated` 在 **Step UI-INTEL-1** 产出（同上：payload 仅
+  `{version,status}`，非 durable，不回放）。
 - **稳定 SSE id（Part 13）**：FINAL = `final:<meeting_id>:<segment_seq>`。
+  Meeting State 变更 = `state:<meeting_id>:<version>:<status>`（**必须带 status** ——
+  FAILED 刻意不推进 version，仅凭 version 无法区分同 version 下的
+  `ACTIVE@N` 与 `FAILED@N`；见 `protocols/realtime-events.md §4`）。
 - **PARTIAL 不重放**（Part 12）：只 live 推送，断线后不补。
 - `TRANSCRIPT_STREAM_END` **不广播**（PRD §30 未列出，契约不可扩展）。
 - `Last-Event-ID` header **未实现**（Part 14）：`after_segment_seq` 是唯一恢复游标。
@@ -486,6 +535,22 @@ Response **200**：
 > FINAL 首次提交与 `POST /finish` 会后台推进状态；新增 1 张表（`meeting_state`，
 > 无 migration）；Meeting 四态机 / Freeze 语义 / Transcript 契约 / LLM Provider /
 > 前端**零改动**。见 `architecture.md §19`。
+
+> **Step UI-INTEL-1 已完成**：Meeting Intelligence Panel。本步新增 / 变更的契约：
+>
+> - **`GET /api/meetings/{meeting_id}/state`** —— **产品侧唯一**的 Meeting State
+>   读取入口（`MeetingStatePublic`，见 §1）。会议不存在 → **404**；
+>   尚未处理任何 FINAL → **200** + `version=0` + `status=EMPTY`（不是错误）。
+>   `state_json` 损坏 → 投影层降级为 `FAILED`（不 500、不回写 DB）。
+>   internal 调试接口 `/api/internal/...` **保留且不变**，前端不使用。
+> - **SSE `meeting.state.updated`**（`GET /events` 同一连接）：
+>   payload 仅 `{version, status}`；稳定 id `state:<mid>:<version>:<status>`
+>   （**必须带 status** —— FAILED 不推进 version，见 `realtime-events.md §4`）；
+>   **非 durable**，不回放，不改变 `after_segment_seq` 恢复协议；
+>   **先 commit 后 publish**，发布失败不回滚状态。
+> - **零改动**：Meeting 四态机 / Freeze 语义 / Transcript 契约 / ASR 契约 /
+>   LLM Provider / AGENT-1 核心 schema / **DB schema（无 migration）**。
+>   见 `architecture.md §21`。
 
 > Step 6 已完成：Transcript Freeze（durable 边界）+ Finalization Readiness
 > （service 层派生，无公开 API）—— 见 `architecture.md §7.0/§7.3` 与 `ADR-001 D13`。

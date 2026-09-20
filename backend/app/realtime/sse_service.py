@@ -151,6 +151,38 @@ def build_heartbeat(meeting_id: str) -> SSEEventEnvelope:
     )
 
 
+def build_meeting_state_updated(
+    meeting_id: str, *, version: int, status: str
+) -> SSEEventEnvelope:
+    """Meeting State change notice (Step UI-INTEL-1).
+
+    PURE INVALIDATION, not a payload carrier. The client receives this and
+    re-reads the durable state over HTTP (GET /api/meetings/{id}/state); the
+    event itself is never the source of truth. Hence the payload stays minimal —
+    `{version, status}` only, no topics / decisions / action items, and never
+    `model_name`, `last_error`, raw model output, a prompt or a provider stack.
+
+    It fires whenever the PRODUCT-VISIBLE durable state changes, which is
+    deliberately NOT the same as "version incremented":
+
+        ACTIVE vN -> ACTIVE vN+1   content updated
+        ACTIVE|EMPTY -> FAILED     an update failed (version does NOT move)
+        FAILED -> ACTIVE           recovered
+        ACTIVE -> FROZEN           meeting ended, state frozen
+
+    `status` is in the payload precisely because of the non-version-bumping
+    transitions: the client cannot distinguish ACTIVE@4 from FAILED@4 by version
+    alone. The `id:` therefore carries the status too (see STATE_ID_PREFIX).
+    """
+    return SSEEventEnvelope(
+        sse_id=f"state:{meeting_id}:{version}:{status.lower()}",
+        event_type="meeting.state.updated",
+        meeting_id=meeting_id,
+        emitted_at=_utcnow_iso(),
+        payload={"version": version, "status": status},
+    )
+
+
 # --- Publish entry points (Producer side; MUST run AFTER commit) -----------
 
 def publish_partial(
@@ -201,6 +233,21 @@ def publish_summary_failed(meeting_id: str, *, version: int) -> None:
 
 def publish_heartbeat(meeting_id: str) -> None:
     event_broker.publish(meeting_id, build_heartbeat(meeting_id))
+
+
+def publish_meeting_state_updated(
+    meeting_id: str, *, version: int, status: str
+) -> None:
+    """meeting.state.updated — MUST be published AFTER the state row committed.
+
+    Same commit-before-publish rule as every other event here: the durable
+    Meeting State is already on disk, so a failed publish never rolls it back
+    (SSE is not a fact source). Never replayed; the client re-reads via
+    GET /api/meetings/{id}/state on connect / refresh / reconnect.
+    """
+    event_broker.publish(
+        meeting_id, build_meeting_state_updated(meeting_id, version=version, status=status)
+    )
 
 
 # --- Gap-free connect (Part 10/11) ------------------------------------------
@@ -293,6 +340,7 @@ __all__ = [
     "publish_summary_started",
     "publish_summary_completed",
     "publish_summary_failed",
+    "publish_meeting_state_updated",
 ]
 
 

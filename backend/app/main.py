@@ -74,6 +74,10 @@ app.include_router(transcript_internal_router.router, prefix="/api")
 # FINAL stream. Additive and independent — it shares no routes with the existing
 # routers, and it stays functional (empty state) even when the agent is disabled.
 app.include_router(meeting_state_router.router, prefix="/api")
+# Public read-only Meeting State (Step UI-INTEL-1): the product surface the
+# Intelligence Panel reads. Additive route, distinct path from every existing
+# one; the internal debug router above is untouched.
+app.include_router(meeting_state_router.public_router, prefix="/api")
 # Focused docs for the collaborator-facing internal ASR contract
 # (GET /api/internal/docs + /api/internal/openapi.json) — derived from the real
 # routes above, so it cannot drift from the implementation.

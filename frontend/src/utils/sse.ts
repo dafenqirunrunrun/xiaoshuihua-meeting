@@ -8,16 +8,38 @@ import type { SseEnvelope, SseEventType } from '@/types/sse'
  * 只有**未具名**帧才会。后端 `_render_frame` 每一帧都写 `event: {event_type}`
  * （契约见 docs/api-contract.md L194-195），所以 `addEventListener('message')`
  * 永远不会收到任何业务事件。必须逐事件名订阅。
+ *
+ * ⚠️ 这是**硬编码白名单**：后端新增事件类型而此处未同步时，前端会
+ * **完全静默地**收不到该事件（不报错、不告警）。因此新增事件必须三处同步：
+ *   1. 后端 `app/realtime/schemas.py` 的 `SSE_EVENT_TYPES`
+ *   2. 本文件 `SSE_EVENT_TYPES`
+ *   3. `types/sse.ts` 的 `SseEventType`
+ * 回归保护见 `backend/tests/test_meeting_state_api.py`（后端侧断言 Literal 成员）
+ * 与 `npm run typecheck`（前端侧确保字面量与类型一致）。
  */
-export const SSE_EVENT_TYPES: readonly SseEventType[] = [
+export const SSE_EVENT_TYPES = [
   'transcript.partial',
   'transcript.final',
   'meeting.status',
   'summary.started',
   'summary.completed',
   'summary.failed',
+  'meeting.state.updated',
   'heartbeat',
-] as const
+] as const satisfies readonly SseEventType[]
+
+/**
+ * 编译期穷尽性守卫：白名单必须覆盖 `SseEventType` 的**每一个**成员。
+ *
+ * `satisfies` 只能保证白名单里没有**多余的**名字，保证不了"没有遗漏"——
+ * 而遗漏恰恰是那个会静默失效的方向（后端发了，前端没订阅）。这里用
+ * `Exclude` 反查：一旦 `SseEventType` 新增成员而白名单没跟上，
+ * 该类型就不再是 `never`，下面的赋值报错，`npm run typecheck` / `build` 直接失败。
+ */
+type MissingSseEventType = Exclude<SseEventType, (typeof SSE_EVENT_TYPES)[number]>
+// 若本行报 "Type 'X' is not assignable to type 'never'"，说明 X 未加入白名单。
+const _SSE_WHITELIST_IS_EXHAUSTIVE: MissingSseEventType extends never ? true : never = true
+void _SSE_WHITELIST_IS_EXHAUSTIVE
 
 /**
  * 为一个 EventSource 订阅所有已知具名事件，统一解析为 `SseEnvelope` 后回调。
