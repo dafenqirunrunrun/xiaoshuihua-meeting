@@ -1085,6 +1085,23 @@ body {
 .summary-list li {
   margin-bottom: 4px;
 }
+/* UI-INTEL-2B：条目 + 右侧「查看原文」入口同排；正文占满剩余宽度，
+   按钮不换行、不被正文挤断。仅在 Result 纪要区出现（MeetingRoom 的面板
+   用 .intel-item，与此无关）。 */
+.summary-list__item {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+}
+.summary-list__item > span {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.summary-list__item > .intel-trace.ant-btn {
+  flex: 0 0 auto;
+  white-space: nowrap;
+}
 .summary__version {
   margin-top: 16px;
   font-size: 12px;

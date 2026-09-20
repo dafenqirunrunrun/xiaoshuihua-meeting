@@ -47,7 +47,6 @@ from __future__ import annotations
 
 import json
 import logging
-import re
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
@@ -61,7 +60,7 @@ from app.agent.final_summary_prompts import (
     build_v2_repair_prompt,
     to_legacy_schema,
 )
-from app.agent.final_summary_schemas import FinalMeetingSummary
+from app.agent.final_summary_schemas import FinalMeetingSummary, prune_code_fence
 from app.agent.summary_schemas import MeetingSummarySchema
 from app.config import settings
 from app.meeting.meeting_model import Meeting
@@ -225,10 +224,10 @@ def assess_usability(db: Session, meeting_id: str) -> StateAssessment:
 # Parsing
 # =============================================================================
 
-def _prune_code_fence(text: str) -> str:
-    """Strip a ```json ... ``` wrapper if the model added one (lenient)."""
-    m = re.search(r"```(?:json)?\s*(.*?)\s*```", text, re.DOTALL)
-    return m.group(1) if m else text
+# `_prune_code_fence` is kept as a thin alias: the READ path shares the exact
+# same unwrapping (see `final_summary_schemas.prune_code_fence`), and it must
+# not drift from the write path.
+_prune_code_fence = prune_code_fence
 
 
 def parse_v2(raw: str) -> tuple[MeetingSummarySchema, FinalMeetingSummary]:
