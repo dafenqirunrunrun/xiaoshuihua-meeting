@@ -559,3 +559,60 @@ npm run build      # tsc --noEmit && vite build
   - **零改动**：Meeting 四态机 / Freeze 语义 / Transcript 契约 / LLM Provider /
     DeepSeek / **DB 既有表（无 schema change / 无 migration）** / **前端业务代码**。
   - **本 Step 未 push**（按用户要求：可 commit 到 `dafenqi`，等待确认后再 push）。
+- **Step LLM-CONFIG-1 已完成**：Real DeepSeek Provider Wiring + FakeProvider DX Fix。
+  - **定位**：不扩展业务功能。验证 AGENT-1 + AGENT-2 在**真实 DeepSeek**（而非
+    仅 Scripted/FakeProvider）下端到端跑通，并修复 FakeProvider 的开发体验缺陷。
+  - **§2 配置解析审计（真实生效值）**：`LLM_PROVIDER=deepseek` →
+    `DeepSeekProvider(name="deepseek-v4.1-flash")`，model=`DeepSeek-V4.1-Flash`，
+    `DEEPSEEK_BASE_URL=<内部地址，见本机 .env>`；`FINAL_SUMMARY_MODEL` 为空 →
+    用 provider 自身默认模型。**Base URL 与密钥均只存在于 `backend/.env`
+    （`.gitignore:21` 已忽略，`git check-ignore` 确认；从未进入 Git / 日志 / 前端）。**
+  - **Endpoint 形状**：协作者给的 `ANTHROPIC_BASE_URL` 是 Anthropic 形状，但
+    `DeepSeekProvider` 说的是 OpenAI 兼容 `POST {base_url}/chat/completions`。
+    实测 `<base_url>/v1/chat/completions` 返回 **HTTP 200 + OpenAI 形状**
+    （`choices[0].message.content`）→ **Provider 传输层零改动**。
+  - **fail-closed 未动**：未知 `LLM_PROVIDER` 仍 → `LLMConfigurationError`，
+    **绝不回落 FakeProvider**；`DeepSeekProvider` 仍 **lazy**（构造不触网，
+    首次 `complete()` 才失败）。
+  - **✅ 修复真实缺陷：FakeProvider 单形状导致 AGENT-1 必然失败**。原 `complete()`
+    对**所有** prompt 返回 legacy summary JSON，而 AGENT-1 校验
+    `MeetingStateUpdate`（`extra="forbid"`）→ 默认配置下每次状态更新都校验失败 →
+    静默降级 `transcript_fallback` → **本地开发从未跑通过 AGENT-1 → AGENT-2 路径**。
+    修复：按真实 prompt 的**分隔符常量**分派三种确定性形状
+    （`<meeting_state>` → Final Summary V2 / `<new_transcript>` → Meeting State
+    Update / 其它 → legacy summary）。**标记从 prompt 模块 import，不硬编码
+    —— 硬编码副本会在分隔符改名时静默失配**。无新框架、无 prompt 猜测解析；
+    `responses` FIFO 与 `error` 优先级不变。FakeProvider **仍仅离线开发/CI，
+    不代表生产模型效果**。
+  - **真实链路 deterministic replay**（`scripts/replay_real_provider.py`，**故意
+    不放在 `tests/`** —— 它发真实付费非确定性请求，CI 绝不能跑）：
+    `6 段 FINAL → AGENT-1 → DeepSeek → Meeting State → finish + force flush →
+    STREAM_END → Finalizer → AGENT-2 → DeepSeek → Final Summary`。
+    **12/12 PASS**：state 非 FAILED / cursor=6 / 决策「下周三上线」/ action item
+    「后端接口联调」/ owner「小王」/ deadline「周二之前」/ risk「支付接口稳定性」/
+    `source_segment_seqs` 存在 / summary COMPLETED / meeting COMPLETED /
+    **plan 日志 `summary_source=meeting_state`** / **未走 `transcript_fallback`**
+    （后两项从**捕获的 `final_summary_plan` 日志行**断言，非从结果反推）。
+  - **§7 输出稳定性实测**（`scripts/replay_real_provider_stability.py`，CountingProvider
+    透明代理计数真实 provider）：**12/12 次运行全部一次成功（0 次 repair）**，
+    summary 与 state 各恰好 1 次调用 → **未触发 repair / retry / fallback**，
+    无需放宽 Pydantic 严格度。（`STATUS_ACTIVE` + `cursor=6`；6 段 < 阈值 8，
+    故 AGENT-1 由 force flush 合成单次调用。）
+  - **✅ 修复 `.env` 引入的回归（重要）**：新增 `backend/.env` 后，
+    `pydantic-settings` 的 `env_file=".env"` 让 `LLM_PROVIDER=deepseek` 成为
+    **所有从 `backend/` 启动进程的环境默认值**，`os.environ.setdefault` **无法**
+    覆盖（env 文件也参与读取）→ 离线回归套件开始发**真实 API 调用**甚至挂起。
+    已为 `test_summary_step7a/7b`、`test_finalize_step6` 显式
+    `os.environ["LLM_PROVIDER"]="fake"` + 清空 `DEEPSEEK_*`（含 7b/6 的
+    uvicorn 子进程 `env`）。另重写 7A `S20`：原断言「本机没有 DeepSeek 凭据」
+    是**关于开发者机器的陈述**而非代码不变式，改用显式未配置的 `DeepSeekProvider`
+    断言「构造不触网 + 首次 `complete()` 抛 `SummaryGenerationError`」。
+  - **新增契约测试**：`tests/test_fake_provider_shapes.py` **10/10 PASS**
+    （用真实 prompt builder 断言三种形状 + 三个默认值对**真实 schema** 校验 +
+    标记顺序 + FIFO/error 优先级）。**已做 mutation 验证**：删除 state 分派分支 →
+    测试立即捕获原缺陷。
+  - 测试：`pytest` **140/140 PASS**（130 + 新增 10）；回归全绿（Step5 21 +
+    Step6 21 + Step7A 28 + Step7B 36 + list 17 + ASR-A 22）；前端 typecheck + build PASS。
+  - **零改动**：Meeting 四态机 / Transcript 契约 / ASR 契约 / Freeze 语义 /
+    **DB schema（无 migration）** / **前端业务代码** / `DeepSeekProvider` 传输层。
+  - **本 Step 未 push**（按用户要求：等待确认后再 push）。

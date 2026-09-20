@@ -51,6 +51,14 @@ _TMP = tempfile.mkdtemp(prefix="step6_test_")
 os.environ["DATABASE_URL"] = f"sqlite:///{os.path.join(_TMP, 'part_a.db')}"
 os.environ.setdefault("SSE_HEARTBEAT_INTERVAL", "1.0")
 os.environ.setdefault("SSE_QUEUE_MAXSIZE", "3")
+# This suite is OFFLINE by contract. The Finalizer drives a summary generation,
+# so an inherited LLM_PROVIDER=deepseek (a developer's real backend/.env) would
+# turn a regression run into live API calls. `os.environ[...]` (not setdefault)
+# is deliberate — pydantic-settings reads the env FILE too, so setdefault would
+# not override it. Pin the provider and blank the credentials.
+os.environ["LLM_PROVIDER"] = "fake"
+os.environ["DEEPSEEK_BASE_URL"] = ""
+os.environ["DEEPSEEK_API_KEY"] = ""
 
 # --- result collector ---------------------------------------------------------
 
@@ -330,6 +338,11 @@ def _run_server() -> subprocess.Popen:
     env["DATABASE_URL"] = f"sqlite:///{os.path.join(_TMP, 'part_b.db')}"
     env["SSE_HEARTBEAT_INTERVAL"] = "1.0"
     env["SSE_QUEUE_MAXSIZE"] = "3"
+    # Part B is a black-box HTTP run and MUST stay offline (see the head of this
+    # file): the child server inherits its own environment, so pin it too.
+    env["LLM_PROVIDER"] = "fake"
+    env["DEEPSEEK_BASE_URL"] = ""
+    env["DEEPSEEK_API_KEY"] = ""
     logf = open(os.path.join(_TMP, "part_b_server.log"), "w", encoding="utf-8")
     proc = subprocess.Popen(
         [sys.executable, "-m", "uvicorn", "app.main:app", "--host", HOST, "--port", str(PORT)],

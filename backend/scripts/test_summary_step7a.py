@@ -53,6 +53,14 @@ _TMP = tempfile.mkdtemp(prefix="step7a_test_")
 os.environ["DATABASE_URL"] = f"sqlite:///{os.path.join(_TMP, 'summary.db')}"
 os.environ.setdefault("SSE_HEARTBEAT_INTERVAL", "1.0")
 os.environ.setdefault("SUMMARY_MAX_ATTEMPTS", "2")
+# This suite is OFFLINE and deterministic by contract: every generation below
+# injects its own FakeProvider. Pin the provider AND blank the credentials so a
+# developer's real backend/.env (LLM_PROVIDER=deepseek) cannot turn a regression
+# run into live API calls. `os.environ[...]` (not setdefault) is deliberate —
+# this suite must never make a network request.
+os.environ["LLM_PROVIDER"] = "fake"
+os.environ["DEEPSEEK_BASE_URL"] = ""
+os.environ["DEEPSEEK_API_KEY"] = ""
 
 from app.agent.summary_model import MeetingSummary  # noqa: E402
 from app.meeting.meeting_model import Meeting  # noqa: E402
@@ -165,9 +173,28 @@ def part_a() -> int:
                 '{"overview": "o"}'
             ).key_topics == [])
 
-    from app.config import settings as _s
+    # S20: the provider is LAZY — constructing it must not touch the network,
+    # and an unconfigured one must fail only on the first complete(). The
+    # original version asserted "this machine has no DeepSeek creds", which is a
+    # statement about the developer's environment, not about the code — it
+    # failed the moment a real backend/.env existed (LLM-CONFIG-1). Assert the
+    # actual invariant instead, with an explicitly unconfigured instance so the
+    # result does not depend on ambient config at all.
+    from app.agent.llm.deepseek import DeepSeekProvider
+    from app.agent.llm.base import SummaryGenerationError
+
+    unconfigured = DeepSeekProvider(base_url="", api_key="")
+    constructed_ok = True  # reaching this line IS the assertion: no network/raise
+    try:
+        unconfigured.complete("ping")
+        lazy_ok = False
+    except SummaryGenerationError:
+        lazy_ok = True  # failed lazily, on first use, as designed
+    except Exception:
+        lazy_ok = False  # wrong error type -> not the designed failure
     _record("S20 provider not configured is lazy (no contact before complete)",
-            not (_s.deepseek_base_url or _s.deepseek_api_key))
+            constructed_ok and lazy_ok,
+            "construct=ok, complete() raised SummaryGenerationError")
     return 0
 
 

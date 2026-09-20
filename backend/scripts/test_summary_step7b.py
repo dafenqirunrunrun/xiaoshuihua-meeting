@@ -82,6 +82,14 @@ os.environ["DATABASE_URL"] = f"sqlite:///{os.path.join(_TMP, 'summary7b.db')}"
 os.environ.setdefault("SSE_HEARTBEAT_INTERVAL", "1.0")
 os.environ.setdefault("SSE_QUEUE_MAXSIZE", "10")
 os.environ.setdefault("SUMMARY_MAX_ATTEMPTS", "2")
+# Offline + deterministic by contract (see _run_server for the Part B rationale:
+# this suite drives the Finalizer, which generates a summary). Pin the provider
+# and blank the credentials so a developer's real backend/.env cannot turn a
+# regression run into live model calls. B12 varies this itself inside a
+# try/finally, so the fail-closed case is still exercised.
+os.environ["LLM_PROVIDER"] = "fake"
+os.environ["DEEPSEEK_BASE_URL"] = ""
+os.environ["DEEPSEEK_API_KEY"] = ""
 
 from app.agent.summary_model import MeetingSummary  # noqa: E402
 from app.meeting.meeting_model import Meeting  # noqa: E402
@@ -681,6 +689,14 @@ def _run_server() -> subprocess.Popen:
     env["DATABASE_URL"] = f"sqlite:///{os.path.join(_TMP, 'part_b.db')}"
     env["SSE_HEARTBEAT_INTERVAL"] = "1.0"
     env["SSE_QUEUE_MAXSIZE"] = "3"
+    # Part B is a black-box HTTP regression run and MUST stay offline: the
+    # Finalizer triggers a summary generation on the accepted STREAM_END, so an
+    # inherited LLM_PROVIDER=deepseek (a developer's real backend/.env) would
+    # turn this suite into live API calls against the real model. Pin the child
+    # server to the deterministic FakeProvider.
+    env["LLM_PROVIDER"] = "fake"
+    env["DEEPSEEK_BASE_URL"] = ""
+    env["DEEPSEEK_API_KEY"] = ""
     logf = open(os.path.join(_TMP, "part_b_server.log"), "w", encoding="utf-8")
     proc = subprocess.Popen(
         [sys.executable, "-m", "uvicorn", "app.main:app", "--host", HOST, "--port", str(PORT)],
