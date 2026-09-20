@@ -513,7 +513,9 @@ body {
   }
 }
 
-/* 8B-4 「有新内容 · 回到底部」FAB：悬浮于转写面板右下，出现时轻升起 */
+/* 8B-4 「回到最新」FAB：悬浮于转写面板右下，出现时轻升起
+   （文案原为「有新内容 · 回到底部」，UI-INTEL-2A 收敛回 PRD §36 的「回到最新」：
+    该按钮现在也是 evidence 跳转后恢复 auto-follow 的唯一入口，不再只表示"有新内容"） */
 .transcript-jump {
   position: absolute;
   right: 16px;
@@ -1085,6 +1087,40 @@ body {
 }
 .summary__version {
   margin-top: 16px;
+  font-size: 12px;
+  color: var(--color-text-tertiary);
+}
+
+/* ============================================================
+   UI-INTEL-2A：Transcript Evidence Trace（查看原文 → 定位 + 高亮）
+   ============================================================ */
+/* 「查看原文 / 查看依据」入口：link 型按钮，弱化但可点；
+   仅在有 source_segment_seqs 的条目上渲染（无证据则完全不出现，不是 disabled）。 */
+.intel-trace.ant-btn {
+  align-self: flex-start;
+  height: auto;
+  padding: 0;
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--color-primary);
+}
+.intel-trace.ant-btn:hover {
+  color: var(--color-primary-hover);
+}
+
+/* Evidence 高亮：轻量的左侧色条 + 淡底，不做动画库、不做发光。
+   **刻意不动 padding / 尺寸** —— 改内边距会让正文在每次高亮时跳一下，
+   比不高亮更烦人。色条用 inset shadow 画在最左缘，不占布局。 */
+.transcript-segment--evidence {
+  background: var(--color-primary-light);
+  box-shadow: inset 3px 0 0 0 var(--color-primary);
+  border-radius: 6px;
+  transition: background var(--motion-base) ease, box-shadow var(--motion-base) ease;
+}
+
+/* 定位提示（不可定位 / 正在加载原始记录）：轻，不拦截操作 */
+.transcript-note {
+  padding: 8px 20px 0;
   font-size: 12px;
   color: var(--color-text-tertiary);
 }

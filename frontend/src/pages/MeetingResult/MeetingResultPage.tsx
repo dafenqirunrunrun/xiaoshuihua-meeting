@@ -480,7 +480,13 @@ export function MeetingResultPage() {
       <div className="transcript-surface transcript-surface--top">
         <ol className="transcript-segments">
           {segments.map((seg) => (
-            <li key={seg.segment_seq} className="transcript-segment">
+            <li
+              key={seg.segment_seq}
+              className="transcript-segment"
+              /* 与 MeetingRoom 用同一个稳定标识，为 UI-INTEL-2B（会后证据溯源）
+                 预留；本步 Result 页不接线 evidence 交互。 */
+              data-segment-seq={seg.segment_seq}
+            >
               <span className="transcript-segment__speaker">{seg.speaker_id}</span>
               <span className="transcript-segment__text">{seg.text}</span>
             </li>

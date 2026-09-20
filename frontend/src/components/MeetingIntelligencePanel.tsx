@@ -1,6 +1,7 @@
 import { Button, Skeleton, Tag } from 'antd'
 import { BulbOutlined, ReloadOutlined } from '@ant-design/icons'
 import { EmptyPlaceholder } from '@/components/EmptyPlaceholder'
+import { EvidenceTraceButton } from '@/components/EvidenceTraceButton'
 import type { MeetingState, MeetingStateStatus } from '@/types/meetingState'
 
 /**
@@ -18,8 +19,12 @@ import type { MeetingState, MeetingStateStatus } from '@/types/meetingState'
  *  3. **失败不清空**：有 last-good 内容时继续展示 + 轻量不可用提示，不闪烁成空白。
  *
  * 本组件不请求数据、不管 SSE、不碰 store —— 全部由调用方通过 props 传入。
- * `source_segment_seqs` 已在类型里保留，但**本 Step 不实现**点击溯源跳转
- * （属 UI-INTEL-2）。
+ *
+ * UI-INTEL-2A：每条 decision / action item / risk / open question 带「查看原文」
+ * 入口，点击只把 `source_segment_seqs` 交给 `onTraceEvidence`。**没有 evidence
+ * 的条目根本不渲染入口**（不是 disabled 假按钮）；定位逻辑不在这里，
+ * 收在 `useTranscriptEvidenceNavigation`。会中证据链依赖的
+ * `source_segment_seqs` 来自服务端 Meeting State，前端绝不自行推导。
  */
 
 const STATUS_LABEL: Record<MeetingStateStatus, string> = {
@@ -67,10 +72,19 @@ function ListBlock({
 }
 
 /** 纯文本条目（decision / open question / risk 共用） */
-function TextItem({ text }: { text: string }) {
+function TextItem({
+  text,
+  sourceSegmentSeqs,
+  onTrace,
+}: {
+  text: string
+  sourceSegmentSeqs: readonly number[] | null | undefined
+  onTrace: (seqs: number[]) => void
+}) {
   return (
     <li className="intel-item">
       <span className="intel-item__text">{text}</span>
+      <EvidenceTraceButton sourceSegmentSeqs={sourceSegmentSeqs} onTrace={onTrace} />
     </li>
   )
 }
@@ -80,10 +94,14 @@ function ActionItemRow({
   task,
   owner,
   deadline,
+  sourceSegmentSeqs,
+  onTrace,
 }: {
   task: string
   owner: string | null
   deadline: string | null
+  sourceSegmentSeqs: readonly number[] | null | undefined
+  onTrace: (seqs: number[]) => void
 }) {
   return (
     <li className="intel-item">
@@ -92,16 +110,33 @@ function ActionItemRow({
         <span className="intel-meta">负责人：{owner ?? '待确认'}</span>
         <span className="intel-meta">截止时间：{deadline ?? '待确认'}</span>
       </span>
+      {/* 一条待办常由多句转写支撑（如 [4,5]）——按钮文案用「查看依据」更准确 */}
+      <EvidenceTraceButton
+        sourceSegmentSeqs={sourceSegmentSeqs}
+        onTrace={onTrace}
+        label="查看依据"
+      />
     </li>
   )
 }
 
 /** 当前议题：title + summary（后端 current_topic 只给标题，此处用 topics 里的匹配项补全） */
-function TopicItem({ title, summary }: { title: string; summary: string }) {
+function TopicItem({
+  title,
+  summary,
+  sourceSegmentSeqs,
+  onTrace,
+}: {
+  title: string
+  summary: string
+  sourceSegmentSeqs: readonly number[] | null | undefined
+  onTrace: (seqs: number[]) => void
+}) {
   return (
     <li className="intel-item">
       <span className="intel-item__text">{title}</span>
       {summary ? <span className="intel-item__sub">{summary}</span> : null}
+      <EvidenceTraceButton sourceSegmentSeqs={sourceSegmentSeqs} onTrace={onTrace} />
     </li>
   )
 }
@@ -111,6 +146,12 @@ interface MeetingIntelligencePanelProps {
   loading: boolean
   error: string
   onRefresh: () => void
+  /**
+   * 「查看原文」回调（Step UI-INTEL-2A）。只把 `source_segment_seqs` 交给调用方，
+   * 组件本身不做定位、不碰 DOM —— 定位能力收在
+   * `useTranscriptEvidenceNavigation`（§8：不在每个 item 里复制 querySelector）。
+   */
+  onTraceEvidence: (sourceSegmentSeqs: number[]) => void
 }
 
 export function MeetingIntelligencePanel({
@@ -118,6 +159,7 @@ export function MeetingIntelligencePanel({
   loading,
   error,
   onRefresh,
+  onTraceEvidence,
 }: MeetingIntelligencePanelProps) {
   // ---- 首次加载（还没有任何可用内容）----
   if (!state && loading) {
@@ -245,9 +287,15 @@ export function MeetingIntelligencePanel({
                   <TopicItem
                     title={currentTopicMatch.title}
                     summary={currentTopicMatch.summary}
+                    sourceSegmentSeqs={currentTopicMatch.source_segment_seqs}
+                    onTrace={onTraceEvidence}
                   />
                 ) : (
-                  <TextItem text={current_topic} />
+                  /* current_topic 是标量、结构性没有 evidence（§8：不为它单独做）。
+                     命中 topics 时走上面的 TopicItem 才有证据入口。 */
+                  <li className="intel-item">
+                    <span className="intel-item__text">{current_topic}</span>
+                  </li>
                 )}
               </ul>
             </div>
@@ -255,7 +303,12 @@ export function MeetingIntelligencePanel({
 
           <ListBlock title="已确认决策" count={decisions.length}>
             {decisions.map((d, i) => (
-              <TextItem key={`d-${i}`} text={d.text} />
+              <TextItem
+                key={`d-${i}`}
+                text={d.text}
+                sourceSegmentSeqs={d.source_segment_seqs}
+                onTrace={onTraceEvidence}
+              />
             ))}
           </ListBlock>
 
@@ -266,19 +319,31 @@ export function MeetingIntelligencePanel({
                 task={a.task}
                 owner={a.owner}
                 deadline={a.deadline}
+                sourceSegmentSeqs={a.source_segment_seqs}
+                onTrace={onTraceEvidence}
               />
             ))}
           </ListBlock>
 
           <ListBlock title="未决问题" count={open_questions.length}>
             {open_questions.map((q, i) => (
-              <TextItem key={`q-${i}`} text={q.text} />
+              <TextItem
+                key={`q-${i}`}
+                text={q.text}
+                sourceSegmentSeqs={q.source_segment_seqs}
+                onTrace={onTraceEvidence}
+              />
             ))}
           </ListBlock>
 
           <ListBlock title="风险 / 顾虑" count={risks.length}>
             {risks.map((r, i) => (
-              <TextItem key={`r-${i}`} text={r.text} />
+              <TextItem
+                key={`r-${i}`}
+                text={r.text}
+                sourceSegmentSeqs={r.source_segment_seqs}
+                onTrace={onTraceEvidence}
+              />
             ))}
           </ListBlock>
         </>
