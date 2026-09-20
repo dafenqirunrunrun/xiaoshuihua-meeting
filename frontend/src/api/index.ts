@@ -1,4 +1,5 @@
 export { http, normalizeApiError, ApiError } from './http'
 export * from './meeting'
+export * from './meetingState'
 export * from './transcript'
 export * from './summary'

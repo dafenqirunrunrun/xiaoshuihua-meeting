@@ -133,6 +133,31 @@ class MeetingState(MeetingStateContent):
     updated_at: str | None = None
 
 
+class MeetingStatePublic(MeetingStateContent):
+    """The READ-ONLY product projection of the meeting state (Step UI-INTEL-1).
+
+    Returned by `GET /api/meetings/{meeting_id}/state`. Identical substance to
+    `MeetingState` minus the engineering-only field:
+
+      - `model_name` is DROPPED. It names the provider that produced the state
+        (traceability for operators), which is not a product fact and must not
+        reach the browser.
+
+    `last_error` is not a field on either model (it lives only on the ORM row),
+    so there is nothing to strip for it — the public surface structurally cannot
+    leak an internal failure detail. The internal debug endpoint keeps returning
+    the full `MeetingState`; this projection is additive and does not replace it.
+    """
+
+    model_config = ConfigDict(from_attributes=True)
+
+    meeting_id: str
+    version: int = 0
+    last_processed_segment_seq: int = 0
+    status: str = "EMPTY"
+    updated_at: str | None = None
+
+
 __all__ = [
     "TopicState",
     "DecisionItem",
@@ -142,4 +167,5 @@ __all__ = [
     "MeetingStateContent",
     "MeetingStateUpdate",
     "MeetingState",
+    "MeetingStatePublic",
 ]

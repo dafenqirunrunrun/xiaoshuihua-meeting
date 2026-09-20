@@ -14,9 +14,11 @@ import {
 } from '@ant-design/icons'
 import { EmptyPlaceholder } from '@/components/EmptyPlaceholder'
 import { InfoRow } from '@/components/InfoRow'
+import { MeetingIntelligencePanel } from '@/components/MeetingIntelligencePanel'
 import { MeetingStatusTag } from '@/components/MeetingStatusTag'
 import { useMeetingStore } from '@/stores/meetingStore'
 import { useMeetingLoad } from '@/hooks/useMeetingLoad'
+import { useMeetingIntelligence } from '@/hooks/useMeetingIntelligence'
 import { useTranscriptSnapshot } from '@/hooks/useTranscriptSnapshot'
 import { useMeetingStream } from '@/hooks/useMeetingStream'
 import { useAutoScroll } from '@/hooks/useAutoScroll'
@@ -299,12 +301,23 @@ export function MeetingRoomPage() {
     ? finalSegments[finalSegments.length - 1].segment_seq
     : 0
 
+  // UI-INTEL-1：Meeting State（AI 工作记忆）。独立数据域、独立错误域 ——
+  // 数据留在 hook 内（不进全局 store），失败只降级本面板，绝不影响转写 / 生命周期。
+  // 不连流时（CREATED / COMPLETED）不拉取：CREATED 还没有内容，COMPLETED 属归档态。
+  const intelligence = useMeetingIntelligence(
+    meetingId,
+    !!meeting && meeting.status !== 'CREATED',
+  )
+
   // 8B-4：SSE 流（含 Snapshot-first 连接、断线恢复、meeting.status→GET Meeting）
+  // UI-INTEL-1：**复用同一条 /events 连接**承接 meeting.state.updated 失效通知，
+  // 收到后 refreshState() 重新 GET /state —— 不新增第二条 EventSource。
   useMeetingStream({
     meetingId,
     status: meeting?.status,
     snapshotReady,
     maxSegmentSeq,
+    onStateInvalidated: intelligence.refreshState,
   })
 
   // 8B-4：自动滚动（跟随底部 / 向上查历史暂停 / 回到底部 FAB）
@@ -574,6 +587,15 @@ export function MeetingRoomPage() {
         </section>
 
         <aside className="room__rail">
+          {/* UI-INTEL-1：AI 会议理解（会议进行中的结构化工作记忆）。
+              放在轨首 —— 这是本 Step 新增的核心信息，会议状态等元信息仍是次要。 */}
+          <MeetingIntelligencePanel
+            state={intelligence.state}
+            loading={intelligence.loading}
+            error={intelligence.error}
+            onRefresh={intelligence.refreshState}
+          />
+
           <div className="rail-section">
             <div className="rail-title">会议状态</div>
             <InfoRow label="会议状态" value={<MeetingStatusTag status={meeting.status} />} />

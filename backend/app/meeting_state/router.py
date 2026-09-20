@@ -1,14 +1,21 @@
-"""Internal debug API for Meeting State (Step AGENT-1).
+"""Meeting State HTTP surface (Step AGENT-1 internal + Step UI-INTEL-1 public).
 
 ::
 
-    GET  /api/internal/meetings/{meeting_id}/state                  -> current state
-    POST /api/internal/meetings/{meeting_id}/state/process-pending  -> force a drain
+    Public   GET /api/meetings/{meeting_id}/state            -> product projection
+    Internal GET  /api/internal/meetings/{meeting_id}/state  -> full debug state
+    Internal POST /api/internal/meetings/{meeting_id}/state/process-pending
 
-Both endpoints are for development / debugging ONLY. They are NOT a product UI
-surface and the frontend does not use them (the step spec is explicit: build the
-backend chain first, decide on any UI later). They live under `/api/internal`
-alongside the other internal contracts so the product surface stays clean.
+The two surfaces answer the same question at different levels of detail and are
+BOTH kept:
+
+  - The internal pair is the engineering/debug surface (it still exposes
+    `model_name`, and still raises on a corrupt row so the problem stays loud).
+    The frontend does not use it.
+  - The public single endpoint is the one the product UI reads. It returns
+    `MeetingStatePublic` — no `model_name`, no internal error detail — and
+    degrades a corrupt row to `status=FAILED` rather than turning a data-integrity
+    problem into a product 500 (see `service.get_public_state`).
 
 `process-pending` exists because the batch thresholds deliberately mean "the
 state may lag the transcript"; without a way to force a drain, an operator
@@ -24,9 +31,31 @@ from sqlalchemy.orm import Session
 
 from app.db import get_db
 from app.meeting_state import service as state_service
-from app.meeting_state.schemas import MeetingState
+from app.meeting_state.schemas import MeetingState, MeetingStatePublic
 
+# Product surface (Step UI-INTEL-1). Read-only; the pipeline remains the only
+# writer of Meeting State.
+public_router = APIRouter(tags=["meeting-state"])
+
+# Internal debug surface (Step AGENT-1). Unchanged and still functional.
 router = APIRouter(tags=["internal"])
+
+
+@public_router.get("/meetings/{meeting_id}/state", response_model=MeetingStatePublic)
+def get_public_meeting_state(
+    meeting_id: str, db: Session = Depends(get_db)
+) -> MeetingStatePublic:
+    """Current Meeting State for the meeting (working memory), product view.
+
+    This is the SOURCE OF TRUTH the Intelligence Panel renders on load, refresh
+    and reconnect. `meeting.state.updated` only says "re-read this".
+
+    Returns an empty state (version 0, status EMPTY) when nothing has been
+    processed yet — a legitimate answer, not a 404, and the common case early in
+    a meeting while the agent's batch thresholds have not been reached. A missing
+    MEETING is a 404, consistent with the rest of the API.
+    """
+    return state_service.get_public_state(db, meeting_id)
 
 
 @router.get("/internal/meetings/{meeting_id}/state", response_model=MeetingState)

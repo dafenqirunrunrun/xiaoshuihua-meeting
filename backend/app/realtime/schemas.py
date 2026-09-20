@@ -10,10 +10,10 @@ data: {event_type, meeting_id, emitted_at, payload}
 ```
 
 Event types produced in this step:
-  - transcript.partial   (live only, no replay)
-  - transcript.final     (persisted; replayed via catch-up)
-  - meeting.status       (live only, no replay)
-  - heartbeat            (liveness signal, no `id:`)
+  - transcript.partial      (live only, no replay)
+  - transcript.final        (persisted; replayed via catch-up)
+  - meeting.status          (live only, no replay)
+  - heartbeat               (liveness signal, no `id:`)
 
 Reserved for later steps (never produced here; NOT in the Literal so a stray
 publish is a typing error): summary.started / summary.completed / summary.failed.
@@ -21,6 +21,13 @@ publish is a typing error): summary.started / summary.completed / summary.failed
 NOTE: PRD §30 does NOT list transcript.stream_end among SSE events, so the
 stream-end signal is NOT broadcast (Step 5 Part 19). It stays an internal
 Finalizer control signal.
+
+Step UI-INTEL-1 added `meeting.state.updated`: a pure INVALIDATION signal for
+the Meeting Intelligence Panel. It carries only `{version, status}` — never the
+state itself. The durable Meeting State is read over HTTP
+(GET /api/meetings/{id}/state); this event just says "re-read it". Like
+`summary.*` it is non-durable, never replayed, and does NOT extend the
+`after_segment_seq` recovery protocol.
 """
 
 from typing import Any, Literal
@@ -35,6 +42,7 @@ SSE_EVENT_TYPES = Literal[
     "summary.started",
     "summary.completed",
     "summary.failed",
+    "meeting.state.updated",
     "heartbeat",
 ]
 
@@ -45,6 +53,18 @@ FINAL_ID_PREFIX = "final:"
 # Stable SSE `id:` prefix for a summary lifecycle event (Step 7B §14):
 #   summary:<meeting_id>:<version>:started|completed|failed
 SUMMARY_ID_PREFIX = "summary:"
+
+# Stable SSE `id:` prefix for a Meeting State change (Step UI-INTEL-1):
+#   state:<meeting_id>:<version>:active|failed|frozen|empty
+#
+# NOTE the trailing status. Unlike a FINAL, a state change is NOT uniquely
+# identified by (meeting, version): a FAILED update deliberately does NOT bump
+# `version` (see meeting_state.repository.mark_failed), so ACTIVE@4 and FAILED@4
+# are two DIFFERENT durable states with the same version. Including the status
+# keeps every distinct change distinguishable without inventing a new persisted
+# event sequence — and this id is only ever a client-side dedup key, since the
+# event itself is non-durable and never replayed.
+STATE_ID_PREFIX = "state:"
 
 
 class SSEEventEnvelope(BaseModel):
