@@ -24,6 +24,7 @@ import threading
 import uuid
 from datetime import datetime, timezone
 
+from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -31,6 +32,13 @@ from app.meeting.meeting_model import Meeting
 from app.common.exceptions import InvalidMeetingStateTransition, MeetingNotFoundError
 from app.meeting import schemas as meeting_schemas
 from app.realtime import sse_service  # publish AFTER db.commit() only
+
+# 合法 Meeting 状态（PRD §11，四态）。列表 status filter 只接受这些值。
+VALID_MEETING_STATUSES = ("CREATED", "IN_PROGRESS", "FINALIZING", "COMPLETED")
+
+# 列表默认 / 上限（Step 8B-6 §3）：一次不返回无限历史。
+LIST_DEFAULT_LIMIT = 20
+LIST_MAX_LIMIT = 100
 
 
 def _now() -> datetime:
@@ -76,6 +84,35 @@ def get_meeting(db: Session, meeting_id: str) -> Meeting:
     if meeting is None:
         raise MeetingNotFoundError(meeting_id)
     return meeting
+
+
+def list_meetings(
+    db: Session,
+    *,
+    status: str | None = None,
+    limit: int = LIST_DEFAULT_LIMIT,
+    offset: int = 0,
+) -> tuple[list[Meeting], int]:
+    """Meeting 列表（Step 8B-6，Meeting Discovery）。
+
+    - 按 `updated_at DESC, created_at DESC` 稳定排序（最近更新优先）。
+    - 可选 status filter（四态之一），由 router 负责 422 校验（无效值不达这里）。
+    - MVP 无用户体系：返回当前业务库全部会议，不做 owner 隔离
+      （后续接公司统一身份再扩展 user_id / tenant_id，见 architecture.md）。
+    - limit 由 router 收敛到 [1, LIST_MAX_LIMIT]（默认 LIST_DEFAULT_LIMIT）。
+    """
+    q = select(Meeting)
+    if status is not None:
+        q = q.where(Meeting.status == status)
+    total = db.scalar(select(func.count()).select_from(q.subquery()))
+    rows = list(
+        db.scalars(
+            q.order_by(Meeting.updated_at.desc(), Meeting.created_at.desc())
+            .offset(offset)
+            .limit(limit)
+        )
+    )
+    return rows, total or 0
 
 
 def start_meeting(db: Session, meeting_id: str) -> Meeting:

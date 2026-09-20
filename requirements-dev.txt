@@ -1,0 +1,40 @@
+# ====================================================================
+# 小水华会议助手 MVP V0.1 —— 开发 / 测试依赖
+# ====================================================================
+# 更新时间：ASR-0B（2026-09-19）—— 引入 pytest，测试收口。
+#
+# 历史说明：本项目早期不使用第三方测试框架，Step 5/6/7A/7B 与会议列表的
+# 回归测试是 `backend/scripts/test_*.py` 手写脚本（自带 `__main__` 入口，
+# 直接运行）。ASR-0B 起新增 pytest 套件，两者**并存且都必须保持全绿**：
+#
+#   pytest（新，推荐）：
+#     cd backend && .venv/Scripts/python -m pytest
+#     → backend/tests/
+#         test_asr_contract_freeze.py     ASR-0B 五项冻结决策回归（35 cases）
+#         test_asr_e2e_acceptance.py      Mock→Adapter→Transcript→SSE→Summary（20 cases）
+#     共 55 cases（freeze 35 + E2E 20）
+#
+#   手写脚本（历史，仍为早前 Step 的权威回归记录）：
+#     python scripts/test_sse_step5.py          Step 5  SSE 21/21
+#     python scripts/test_finalize_step6.py     Step 6  Freeze 21/21
+#     python scripts/test_summary_step7a.py     Step 7A Summary 28/28
+#     python scripts/test_summary_step7b.py     Step 7B Finalizer 36/36
+#     python scripts/test_list_meetings.py      Step 8B-6 列表 17/17
+#     python scripts/test_asr_adapter.py        ASR-0A ASR-A01~A20 22/22
+#     python scripts/e2e_asr_browser.py         真实浏览器 CDP E2E（需 Chrome:9222）
+#
+# 注意：
+#   - `e2e_asr_browser.py` 需要真实 Chrome + 运行中的后端/前端，**不进 CI**。
+#   - 后续计划：把 scripts/ 下的手写脚本逐步迁移进 backend/tests/。
+#     迁移完成前，CI 同时跑 pytest 与 legacy 脚本两个 job
+#     （见 `.github/workflows/backend-tests.yml`）。
+#   - 测试全程离线：LLM_PROVIDER=fake，不触网、不需要真实密钥。
+# ====================================================================
+
+# --- 测试框架 ---
+pytest==9.1.1
+
+# --- 说明 ---
+# 不引入 pytest-asyncio / pytest-timeout / coverage 等插件：
+# 当前套件全部是同步 TestClient 测试 + 一个 subprocess E2E，
+# 无需异步或超时插件。若后续需要，作为显式依赖加入此处。

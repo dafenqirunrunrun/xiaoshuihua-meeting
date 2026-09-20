@@ -32,6 +32,43 @@ Response `201 / Meeting`：
 
 ---
 
+### GET /api/meetings — 会议列表（Step 8B-6，Meeting Discovery）
+
+Query 参数（全部可选）：
+
+- `status`：`CREATED | IN_PROGRESS | FINALIZING | COMPLETED`（四态之一；非法值 → **422**）。
+- `limit`：`1..100`，默认 `20`（`LIST_DEFAULT_LIMIT`），最大 `100`（`LIST_MAX_LIMIT`）；越界 → 422。
+- `offset`：`>=0`，默认 `0`；负数 → 422。
+
+排序：`updated_at DESC, created_at DESC`（最近更新的在前）。不带 `status` 返回全部四态。
+
+Response `200 / MeetingListOut`（复用 `MeetingOut`，无新增派生字段）：
+
+```json
+{
+  "items": [
+    {
+      "id": "meeting_abc123",
+      "title": "小水华 MVP 方案讨论",
+      "description": null,
+      "status": "IN_PROGRESS",
+      "started_at": "2026-09-17T02:04:34",
+      "ended_at": null,
+      "completed_at": null,
+      "created_at": "2026-09-17T02:04:34",
+      "updated_at": "2026-09-17T02:04:34"
+    }
+  ],
+  "total": 3,
+  "limit": 20,
+  "offset": 0
+}
+```
+
+- `total` 为满足过滤条件的总条数（不计 limit/offset）。
+- 路由顺序：`GET /api/meetings` 必须先于 `GET /api/meetings/{meeting_id}` 注册。
+- 语义：Meeting Discovery / Resume 的**唯一**入口；`POST /resume` 不存在（见 architecture §13）。
+
 ### POST /api/meetings/{meeting_id}/start
 
 - `CREATED → IN_PROGRESS`，记录 `started_at`。
@@ -72,8 +109,78 @@ PARTIAL 永远不会出现在此接口。Meeting 不存在 → **404**。
 ## 2. Internal Transcript Ingress（`/api/internal`）
 
 > 供 ASR / Mock Transcript Producer 调用；是跨团队正式契约。PRD §21 / §48。
+> **两个 ingress 并存（Step ASR-0A）**：`/transcript-events` 是**内部**契约
+> （snake_case，`segment_seq` 由 Producer 提供，PRD §15 原文不变）；
+> `/asr-events` 是**外部协作者**契约（camelCase，无 `segmentSeq`，由 Transcript
+> Domain 分配顺序）。详见 arch §17。
 
-### POST /api/internal/meetings/{meeting_id}/transcript-events
+### POST /api/internal/meetings/{meeting_id}/asr-events（外部 ASR 输入，ASR-0A）
+
+> 标准化 ASR 输出的正式入口。**不接收 `segmentSeq`**——顺序是 Transcript Domain
+> 的职责。适配与顺序分配见 arch §17。
+
+Request（协作者 camelCase 格式）：
+
+```json
+{
+  "type": "transcript.partial",
+  "meetingId": "meeting_001",
+  "asrSessionId": "sess-001",
+  "sentenceId": 2,
+  "speakerId": -1,
+  "startMs": 950,
+  "endMs": 6480,
+  "text": "我们今天讨论会议助手",
+  "provider": "tencent"
+}
+```
+
+`type` 取值 `transcript.partial` | `transcript.final`（FINAL 用同格式，`speakerId`
+通常已解析为 `>= 0`）。
+
+| 字段 | 类型 | 规则 |
+|---|---|---|
+| type | str | `transcript.partial` \| `transcript.final` |
+| meetingId | str | 必须与 path `meeting_id` 一致，否则 **400** |
+| asrSessionId | str | 1..**48**（硬约束，见下）；派生 `utterance_id` 必须落在 64 字符界内 |
+| sentenceId | int | ≥ 0；**session 内**句子编号，**不等于** `segment_seq` |
+| speakerId | int | ≥ -1；**-1 = 说话人暂未知**，合法，映射为内部 `unknown` |
+| startMs / endMs | int | ≥ 0 且 `endMs >= startMs`；**session-local 相对偏移** |
+| text | str | ≤ 4000 |
+| provider | str | 不透明；不得据此硬编码厂商逻辑 |
+
+> **`asrSessionId` 上限 48 是契约硬约束（ASR-0B 决策 5）**：
+> `utterance_id = f"{asrSessionId}:{sentenceId}"` 最坏长度 = 48 + 1 + 10 = 59 ≤ 64。
+> 超过 → 422。该约束已同步暴露在 OpenAPI schema（`maxLength: 48`）。
+> 理由：保持派生 identity **精确单射**，优于静默哈希/截断一个 identity。
+
+> **时间轴语义（ASR-0B 决策 3）**：`startMs/endMs` 是**每个 ASR session 内的相对偏移**，
+> **跨 session 不可比较**（重连后上游可能归零）。排序**永远只认 `segment_seq`**；
+> 这两个字段只用于存储 / 回显 / 展示，**绝不参与排序或完整性判断**。MVP **不做 rebase**。
+> ⏳ V0.2 known limitation：会议级全局时间轴重建需先持久化 session 元数据
+> （当前 `provider`/`asrSessionId`/`sentenceId` **不落库**）。
+
+**拒绝规则**：未知字段（如 `segmentSeq`）或 snake_case 写法 → **422**（`extra="forbid"`，
+契约漂移必须大声失败）。
+
+**派生（客户端不提供）**：
+
+```text
+utterance_id  = f"{asrSessionId}:{sentenceId}"   ← PARTIAL 原地覆盖 & PARTIAL→FINAL 交接
+FINAL event_id = 确定性摘要(meetingId|asrSessionId|sentenceId|FINAL)
+```
+
+状态码：`200` 接收成功 / `422` payload 校验失败 / `400` meetingId 不一致 /
+`404` meeting 不存在 / `409` 状态不允许或幂等冲突。
+
+> **协作者专用文档（ASR-0B）**：`GET /api/internal/docs`（Swagger UI）与
+> `GET /api/internal/openapi.json`，仅覆盖三个 internal ASR 端点，**从真实路由派生**
+> （不手写、不会漂移）。主 `/docs` 仍描述全部端点；此为**附加**视图，无路由搬迁。
+
+**`segment_seq`**：FINAL 由 Backend 在 meeting lock 内分配 `max + 1`；
+幂等重试复用已存 seq，不消耗新号。见 arch §17.3。
+
+### POST /api/internal/meetings/{meeting_id}/transcript-events（内部契约）
 
 Request（Transcript Event Contract，PRD §15）：
 
@@ -127,6 +234,12 @@ Request（Transcript Event Contract，PRD §15）：
 - 只进进程内 `live_utterance_cache`（key = meeting_id + utterance_id），**不写库**。
 - 同一 utterance 的后续 PARTIAL 覆盖旧值（PRD §22）。
 - 收到该 utterance 的 FINAL 后，cache 条目删除（PRD §23，Part 8）。
+- **Utterance 关闭（ASR-0B 决策 4）**：一旦该 utterance 收到 FINAL，即视为 **closed**；
+  此后同 `utterance_id` 的 PARTIAL → **409**，**不写入 live cache**。
+  理由：若接受，前端会渲染一条永远无法收敛的"识别中"行（它等待的 FINAL 已到达，
+  且不会再作为 live 帧重发）。遵循"契约漂移必须大声失败"原则。
+  该不变式是**领域级**的，在 `/asr-events` 与 `/transcript-events` 两个 ingress 上都生效
+  （`transcript_service._ensure_utterance_open`）。
 
 ### FINAL 语义（PRD §23-§24）
 
@@ -156,6 +269,10 @@ Receive → Validate(status/meeting/seq) → Idempotency Check → Persist → C
   （catch-up）、后注册订阅——与 FINAL ingest 同锁互斥，故无丢失 / 无重复窗口。
 - **帧（envelope）**：`{sse_id?, event_type, meeting_id, emitted_at, payload}`；
   每帧包含可选的 `id:`、`event:`、`data:` 行 + 空行。
+- **客户端订阅注意（具名帧）**：每帧都带 `event: {event_type}`，属于**具名帧**。
+  按 SSE 规范具名帧**不触发 `onmessage`**，必须
+  `es.addEventListener('<event_type>', h)` 逐事件名订阅（前端统一封装在
+  `frontend/src/utils/sse.ts` 的 `subscribeSseEnvelopes`）。
 - **事件类型**（本 Step 产出）：`transcript.partial`、`transcript.final`、
   `meeting.status`、`heartbeat`。`summary.*`（started/completed/failed）在 Step 7B
   产出（见 §4 Step 状态；payload 仅 `{version,status}`，非 durable，不回放）。
@@ -177,8 +294,9 @@ Receive → Validate(status/meeting/seq) → Idempotency Check → Persist → C
 ### POST /api/internal/meetings/{meeting_id}/stream-end
 
 > 终端 STREAM_END；**持久化落盘**（`transcript_stream` 表），重启不丢失。Step 4。
+> **ASR-0B 更新**：`last_segment_seq` 改为**可选**且 `ge=0`。
 
-Request（PRD §25，event_id/meeting_id 必须）：
+Request（PRD §25，`event_id` / `meeting_id` 必须）：
 
 ```json
 {
@@ -191,6 +309,13 @@ Request（PRD §25，event_id/meeting_id 必须）：
 
 - `event_type` 严格要求为 `"TRANSCRIPT_STREAM_END"`（常量），否则 400。
 - `path meeting_id == payload meeting_id`，否则 400（§49.1 精神）。
+- **`last_segment_seq` 可选（ASR-0B 决策 1/2）**：
+  - **省略** → 后端派生终值 `max(segment_seq) or 0`（`stream_service._resolve_terminal_seq`）。
+  - **提供** → 保留完整 gap / overrun 校验（兼容与额外一致性检查能力）。
+  - 范围 `ge=0`：**空会议**（无任何 FINAL）以 `last_segment_seq = 0` 正常 freeze。
+  - 依据：`segment_seq` 是 Transcript-owned，上游不应被要求反向查询我方排序。
+  - 修正背景：早期 `ge=1` + 必填使**零 segment 会议永久卡在 FINALIZING**
+    （0 → 422；1 → 409 missing [1]），见 `protocols/realtime-events.md §6.2`。
 
 Response `200 / StreamEndOut`：
 
@@ -205,13 +330,17 @@ Response `200 / StreamEndOut`：
 状态码：
 
 - `200` — 首次接受（已落盘 & 完整性通过），或幂等命中
-- `400` — event_type 非法 / last_segment_seq 缺失 / path≠payload meeting_id
+- `400` — event_type 非法 / path≠payload meeting_id
 - `404` — meeting 不存在
 - `409` —
   - meeting 状态不允许（必须 FINALIZING；CREATED/IN_PROGRESS 拒绝）
   - Transcript 不完整，存在缺口（`missing segments: [2]`）
   - DB 已存在比 last 更大的 seq（overrun，禁止静默忽略）
   - 已经接受过一个不同的 `last_segment_seq`（一个 Stream 只有一个终点）
+
+> ⏳ **PENDING（未冻结）**：真实协作方的 STREAM_END **发送者身份与发送时机**
+> 双方尚未确认。MVP 阶段该信号由内部 mock 发出，**仅供 E2E 回归**，代码已标注
+> "这不是最终协作契约"。见 `protocols/realtime-events.md §6.5`。
 
 状态约束（Part 4）：
 
@@ -254,7 +383,73 @@ FINAL after Stream End（Part 8）：
 
 ---
 
-## 3. 领域异常 → HTTP 映射
+## 3. Meeting State Debug API（`/api/internal`，Step AGENT-1）
+
+> **仅开发 / 调试用，非产品 UI 契约**；前端不调用（本 Step 零前端改动）。
+> Agent 是 Transcript 的下游消费者：**没有** agent 相关的写入口，状态由 FINAL 提交
+> 或 `POST /finish` 后台推进。详见 `architecture.md §19`。
+
+### GET /api/internal/meetings/{meeting_id}/state
+
+返回该会议的**当前工作记忆**（Meeting State），最新版本，非 append-only 历史。
+
+- 从未处理过任何 FINAL → **200**，返回空状态（`version=0`、`status="EMPTY"`、
+  各列表为空）。这是合法答案，不是 404。
+- meeting 不存在 → **404**。
+
+```json
+{
+  "meeting_id": "meeting_001",
+  "version": 3,
+  "last_processed_segment_seq": 6,
+  "status": "ACTIVE",
+  "model_name": "fake",
+  "updated_at": "2026-09-19T10:00:00Z",
+  "current_topic": "上线安排",
+  "topics": [
+    { "title": "上线安排", "summary": "讨论上线时间与稳定性", "source_segment_seqs": [1, 2] }
+  ],
+  "decisions": [
+    { "text": "定下周三上线", "source_segment_seqs": [3] }
+  ],
+  "action_items": [
+    { "task": "后端接口联调", "owner": "小王", "deadline": "周二之前", "source_segment_seqs": [4, 5] }
+  ],
+  "open_questions": [
+    { "text": "支付接口稳定性需要确认", "source_segment_seqs": [6] }
+  ],
+  "risks": []
+}
+```
+
+- `status` ∈ `EMPTY` / `ACTIVE` / `FAILED` / `FROZEN`（Agent 内部状态，
+  **不是** Meeting 状态机的一部分 —— Meeting 仍然只有四态）。
+- `version` 与 `last_processed_segment_seq` 由**系统维护**，模型不可写。
+- `FAILED` 时 `last_error` 有值，且内容/游标**保持失败前**的值。
+
+### POST /api/internal/meetings/{meeting_id}/state/process-pending
+
+调度一次后台 drain（自己的 DB session，不阻塞请求），把 pending FINAL 折叠进状态。
+**幂等**：无 pending → 后台报告 `NO_WORK`，零状态变化、零 LLM 调用。
+
+Response **200**：
+
+```json
+{
+  "meeting_id": "meeting_001",
+  "scheduled": true,
+  "version_before": 3,
+  "last_processed_segment_seq": 6
+}
+```
+
+- meeting 不存在 → **404**。
+- `MEETING_AGENT_ENABLED=false` 时该调用为 no-op（后台直接返回 `DISABLED`），
+  主链路行为与变更前完全一致。
+
+---
+
+## 4. 领域异常 → HTTP 映射
 
 | 领域异常 | HTTP |
 |---|---|
@@ -265,7 +460,32 @@ FINAL after Stream End（Part 8）：
 
 ---
 
-## 4. Step 状态
+## 5. Step 状态
+
+> **Step AGENT-2 已完成**：Final Summary V2（Meeting State 作为纪要主输入）。
+> **本步不新增 / 不修改任何 HTTP / SSE 契约** —— 这是刻意的设计结果，不是遗漏：
+>
+> - **`GET /api/meetings/{id}/summary` 的响应形状完全不变**（仍是
+>   `SummaryOut`：overview / key_topics / conclusions / open_questions …）。
+>   V2 的富结果（decisions / action_items / risks / evidence）**扁平化投影**回
+>   既有字段（见 `architecture.md §20.7`），因此**前端零改动**。
+> - **SSE `summary.*` 不变**（仍是 `{version, status}`）。
+> - **Meeting 状态机不变**（四态，无新状态）。
+> - **无 DB schema change / 无 migration**：V2 明细写在既有
+>   `raw_model_output` 列内（Known Limitation，见 `architecture.md §20.8`）。
+> - 新增的只有**内部**模块（`final_summary_service` / `final_summary_prompts` /
+>   `final_summary_schemas` / `evidence`）与 settings，**不对外暴露**。
+> - **`GET /api/internal/meetings/{id}/state`（§3）不变**，仍是 AGENT-1 的形状。
+>
+> 影响到的既有行为：`finalize_for_meeting` 现在会**先同步强制 flush Meeting State**
+> 再生成纪要（§2 排序不变式）—— 见 `architecture.md §20.2`。这改变的是**触发时序**，
+> 不改变任何对外契约。
+
+> **Step AGENT-1 已完成**：Meeting State Agent（会议工作记忆）。新增
+> `GET/POST /api/internal/meetings/{id}/state[/process-pending]`（调试用，见 §3）；
+> FINAL 首次提交与 `POST /finish` 会后台推进状态；新增 1 张表（`meeting_state`，
+> 无 migration）；Meeting 四态机 / Freeze 语义 / Transcript 契约 / LLM Provider /
+> 前端**零改动**。见 `architecture.md §19`。
 
 > Step 6 已完成：Transcript Freeze（durable 边界）+ Finalization Readiness
 > （service 层派生，无公开 API）—— 见 `architecture.md §7.0/§7.3` 与 `ADR-001 D13`。

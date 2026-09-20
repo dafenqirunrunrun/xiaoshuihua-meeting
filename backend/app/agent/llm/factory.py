@@ -29,10 +29,18 @@ from .fake import FakeProvider
 _VALID = frozenset({"fake", "deepseek"})
 
 
-def get_provider() -> LLMProvider:
+def get_provider(model: str | None = None) -> LLMProvider:
+    """Resolve the provider. `model` optionally overrides the provider's model.
+
+    The override exists for the Final Summary, which may legitimately want a
+    different (e.g. stronger) model than the incremental Meeting State updates
+    (``FINAL_SUMMARY_MODEL``). It defaults to None, so every existing caller —
+    including AGENT-1's state updates and the test-injection path — is
+    unaffected. Only DeepSeek uses it; Fake has no model to select.
+    """
     kind = (settings.llm_provider or "").strip().lower()
     if kind == "deepseek":
-        return DeepSeekProvider()
+        return DeepSeekProvider(model=model)
     if kind == "fake":
         return FakeProvider()
     raise LLMConfigurationError(

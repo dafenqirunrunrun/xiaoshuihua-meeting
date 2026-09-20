@@ -35,6 +35,21 @@ def get_by_seq(db: Session, meeting_id: str, segment_seq: int) -> TranscriptSegm
     )
 
 
+def get_by_utterance_id(
+    db: Session, meeting_id: str, utterance_id: str
+) -> TranscriptSegment | None:
+    """The persisted FINAL for this utterance, if any (ASR-0B utterance closure).
+
+    One utterance has at most one FINAL; the first match is authoritative.
+    """
+    return db.scalar(
+        select(TranscriptSegment).where(
+            TranscriptSegment.meeting_id == meeting_id,
+            TranscriptSegment.utterance_id == utterance_id,
+        )
+    )
+
+
 def list_sorted(db: Session, meeting_id: str) -> list[TranscriptSegment]:
     """All FINAL segments ordered by segment_seq ASC (PRD §9/ §39, arch §6)."""
     return list(

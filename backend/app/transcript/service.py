@@ -11,6 +11,8 @@ Business rules (PRD §15-§24, ADR D4/D5, architecture §5):
 This layer raises domain exceptions only; it never imports FastAPI.
 """
 
+from typing import NamedTuple
+
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -31,6 +33,48 @@ from app.realtime import sse_service  # publish AFTER db.commit() only
 # Meeting statuses that are allowed to receive transcript events (arch §4).
 # IN_PROGRESS: normal receive. FINALIZING: ASR may still emit last few FINALs.
 ACCEPTING_STATUSES = frozenset({"IN_PROGRESS", "FINALIZING"})
+
+
+class FinalApplied(NamedTuple):
+    """A FINAL that this call actually committed for the first time.
+
+    Returned by `handle_event` so the HTTP application layer can react to the
+    commit WITHOUT this domain layer knowing what reacts to it. `event_id` is
+    carried for an exact idempotency check across a background hop (the seq
+    alone cannot distinguish a re-delivery whose content conflicted).
+
+    `segment_seq` is the Transcript-owned ordering (ASR-0B) — the only ordering
+    any consumer is allowed to reason about.
+    """
+
+    segment_seq: int
+    event_id: str
+
+
+def _schedule_agent(background_tasks, meeting_id: str, applied: FinalApplied) -> None:
+    """Hand a newly committed FINAL to the meeting-state consumer.
+
+    Deliberately scheduled from the HTTP application layer, on the SAME
+    BackgroundTasks mechanism the Finalizer already uses (Step 7B), and NOT via
+    a callback inside the ASR adapter:
+
+        ASR adapter  ->  Transcript Domain  ->  [application layer]  ->  agent
+
+    The adapter never learns that an agent exists; the agent only ever reads
+    persisted FINAL rows. `app.meeting_state.service` is imported lazily inside
+    the function so the transcript package keeps NO import-time dependency on
+    the agent package (and cannot grow an import cycle with it).
+
+    A missing `background_tasks` (direct service callers: the legacy scripts)
+    simply means no scheduling — the same "downstream, never blocking" stance.
+    """
+    if background_tasks is None:
+        return
+    from app.meeting_state import service as meeting_state_service
+
+    background_tasks.add_task(
+        meeting_state_service.run_agent_background, meeting_id
+    )
 
 
 def _canonical(seg: TranscriptSegment) -> tuple[str, str, int | None, int | None]:
@@ -54,8 +98,15 @@ def handle_event(
     db: Session,
     path_meeting_id: str,
     event: transcript_schemas.TranscriptEvent,
-) -> None:
+    *,
+    background_tasks=None,
+) -> FinalApplied | None:
     """Validate, gate, and apply a single transcript event.
+
+    Returns a `FinalApplied` when this call committed a FINAL for the first time,
+    else None (PARTIAL, or an idempotent FINAL retry). The return value is how a
+    downstream consumer learns "a new FINAL landed, at seq N" without this layer
+    knowing anything about that consumer.
 
     Both PARTIAL and FINAL run under the meeting's shared lock (lock_registry)
     so they are atomic w.r.t. the STREAM_END integrity check for the same
@@ -75,6 +126,7 @@ def handle_event(
             f"path meeting_id {path_meeting_id} != payload meeting_id {event.meeting_id}"
         )
 
+    applied: FinalApplied | None = None
     with meeting_lock(path_meeting_id):
         if event.status == "PARTIAL":
             # --- Meeting existence + accepting state -------------------------
@@ -92,7 +144,13 @@ def handle_event(
             # COMPLETED meeting (stream_service). Only NEW FINAL is gated.
             if not _existing_final(db, path_meeting_id, event):
                 _require_meeting_accepting(db, path_meeting_id)
-            handle_final(db, path_meeting_id, event)
+            applied = handle_final(db, path_meeting_id, event)
+
+    # Scheduled OUTSIDE the lock: `background_tasks.add_task` only registers a
+    # callback (no business work happens here, and no lock is needed to do it).
+    if applied is not None:
+        _schedule_agent(background_tasks, path_meeting_id, applied)
+    return applied
 
 
 def _transcript_frozen(db: Session, meeting_id: str) -> bool:
@@ -117,6 +175,42 @@ def _ensure_transcript_not_frozen(db: Session, meeting_id: str) -> None:
         )
 
 
+def _ensure_utterance_open(meeting_id: str, utterance_id: str) -> None:
+    """Reject PARTIAL for an utterance that already has a persisted FINAL.
+
+    ASR-0B freeze (decision 4): once an utterance reaches FINAL it is CLOSED.
+    A later PARTIAL for the same utterance — the normal shape of an out-of-order
+    or post-reconnect delivery — must NOT be accepted into the live cache:
+    the frontend would render a permanent "识别中" line that can never be
+    resolved, because the FINAL it waits for already arrived and will not be
+    re-sent as a live frame.
+
+    This follows the existing "contract drift must fail loudly" principle
+    (no silent no-op): the caller learns the utterance is closed.
+
+    Must be called under the meeting lock.
+    """
+    from app.db import SessionLocal
+
+    db = SessionLocal()
+    try:
+        closed = (
+            transcript_repository.get_by_utterance_id(db, meeting_id, utterance_id)
+            is not None
+        )
+    finally:
+        db.close()
+    if closed:
+        raise TranscriptConflictError(
+            meeting_id,
+            "",
+            message=(
+                f"utterance {utterance_id} already reached FINAL and is closed; "
+                f"PARTIAL for a finalized utterance is rejected"
+            ),
+        )
+
+
 def handle_partial(
     db: Session,
     meeting_id: str,
@@ -129,6 +223,7 @@ def handle_partial(
     and is never replayed. This is a cache-only operation — no DB commit to
     wait on — so publishing from here is safe and non-blocking.
     """
+    _ensure_utterance_open(meeting_id, event.utterance_id)
     live_utterance_cache.upsert(
         meeting_id,
         event.utterance_id,
@@ -186,8 +281,13 @@ def handle_final(
     db: Session,
     meeting_id: str,
     event: transcript_schemas.TranscriptEvent,
-) -> None:
-    """FINAL: idempotency -> persist -> commit -> (future) broadcast. PRD §23, ADR D5."""
+) -> FinalApplied | None:
+    """FINAL: idempotency -> persist -> commit -> broadcast. PRD §23, ADR D5.
+
+    Returns a `FinalApplied` ONLY when a new row was committed; idempotent
+    retries (Case A / Case C) return None so no downstream consumer is woken for
+    a FINAL it has already seen.
+    """
     if event.segment_seq is None:
         raise TranscriptValidationError(
             f"FINAL event {event.event_id} missing segment_seq"
@@ -205,12 +305,12 @@ def handle_final(
     # Case A: same event_id already persisted.
     if existing_by_event is not None:
         _ensure_identical(existing_by_event, event, event_id_conflict=True)
-        return  # idempotent retry, no re-INSERT (PRD §24 / Case A)
+        return None  # idempotent retry, no re-INSERT (PRD §24 / Case A)
 
     # Case C: same (meeting_id, segment_seq) already persisted (different event_id).
     if existing_by_seq is not None:
         _ensure_identical(existing_by_seq, event, event_id_conflict=False)
-        return  # same seq + same canonical content -> idempotent
+        return None  # same seq + same canonical content -> idempotent
 
     # New FINAL: create + persist + commit. Broadcast hook point below.
     segment = TranscriptSegment(
@@ -246,6 +346,7 @@ def handle_final(
     # already committed. Only now do we broadcast. If a subscriber is slow/full
     # it is EVICTED (event_broker) — propagation never blocks this business path.
     sse_service.publish_final(meeting_id, segment)
+    return FinalApplied(segment_seq=segment.segment_seq, event_id=segment.event_id)
 
 
 def _ensure_identical(

@@ -68,6 +68,24 @@ def finalize_for_meeting(db: Session, meeting_id: str, *, provider=None) -> bool
         # already done — even if a retry arrives mid-work, never re-run LLM.
         return True
 
+    # Step 0 (Step AGENT-2 §2): make the Meeting State CURRENT before the
+    # summary reads it.
+    #
+    #     finish -> flush remaining FINAL -> state current -> summary
+    #
+    # `POST /finish` already schedules a forced flush, but it runs on ITS OWN
+    # background task and may have failed, raced, or never run (e.g. a trailing
+    # FINAL arrived after finish). The summary must never be generated from a
+    # state that has not absorbed the end of the meeting, so we flush HERE,
+    # synchronously, immediately before generating.
+    #
+    # This is best-effort by construction: `process_pending` records its own
+    # failures and never raises for business reasons. If the flush does not
+    # close the gap, `final_summary_service.assess_usability` sees a stale state
+    # and the summary falls back to the full transcript — degraded, but never
+    # silently under-reported. An agent failure must not block completion (§18).
+    _flush_meeting_state(db, meeting_id)
+
     # Step 1: ensure the initial summary is terminal (generate is idempotent —
     # a terminal v1 returns immediately → crash-gap retry runs ZERO LLM calls).
     # Generate emits summary.started itself (after the GENERATING commit).
@@ -98,6 +116,68 @@ def finalize_for_meeting(db: Session, meeting_id: str, *, provider=None) -> bool
     return True
 
 
+def _flush_meeting_state(db: Session, meeting_id: str) -> None:
+    """Force the Meeting State to absorb the end of the meeting (Step AGENT-2 §2).
+
+    The §2 ordering rule is::
+
+        finish -> flush remaining FINAL -> state current -> summary
+
+    This closes the last hop. `POST /finish` already asks AGENT-1 for a forced
+    flush, but that runs in ITS OWN background task: it can fail, race with a
+    trailing FINAL, or simply never have been scheduled (crash-gap recovery).
+    The Finalizer therefore flushes again, synchronously, immediately before the
+    summary is generated. `process_pending(force_flush=True)` treats any
+    remaining tail as one final batch regardless of the batching thresholds.
+
+    Best-effort by construction: `process_pending` never raises for business
+    reasons — it records the failure on the state row and reports it. That is
+    exactly what we want here. If the flush cannot close the gap,
+    `final_summary_service.assess_usability` will observe a stale cursor and the
+    summary will fall back to the full transcript: DEGRADED, never silently
+    under-reported (§2/§9). An agent failure must never block completion (§18).
+
+    Runs on the caller's session so the flush and the summary that follows see a
+    consistent view; the flush commits its own transaction.
+
+    Deliberately does NOT thread the summary's provider through: the flush is
+    AGENT-1's own LLM call and resolves its provider the way it always does
+    (the factory). In production both resolve to the same provider object; in
+    tests this keeps the state-agent queue and the summary queue independent, so
+    scripting one cannot silently consume the other's responses.
+    """
+    from app.meeting_state import service as meeting_state_service
+
+    try:
+        report = meeting_state_service.process_pending(db, meeting_id, force_flush=True)
+    except Exception:  # pragma: no cover - defensive; process_pending absorbs
+        logger.exception(
+            "meeting state flush failed for %s before summary; the summary will "
+            "fall back to the full transcript if the state is stale",
+            meeting_id,
+        )
+        return
+
+    outcome = report.get("outcome")
+    if outcome in (
+        meeting_state_service.OUTCOME_OK,
+        meeting_state_service.OUTCOME_NO_WORK,
+        # The agent is switched off: not a flush failure, just no rich path. The
+        # summary falls back to the transcript by design (§9).
+        meeting_state_service.OUTCOME_DISABLED,
+    ):
+        return
+    # SUPERSEDED / BATCH_LIMIT_REACHED / BATCH_TOO_LARGE / FAILED / NOT_FOUND:
+    # the state may lag the transcript or be unusable. Not fatal — the caller's
+    # `assess_usability` decides, and a genuinely stale state degrades to the
+    # transcript path rather than being summarized as if complete.
+    logger.warning(
+        "meeting state flush for %s did not converge before summary "
+        "(outcome=%s, reason=%s); summary may fall back to transcript",
+        meeting_id, outcome, report.get("reason"),
+    )
+
+
 def run_finalizer_background(meeting_id: str) -> None:
     """BackgroundTasks entry point — owns its own DB session (§23).
 
@@ -124,10 +204,18 @@ def run_regenerate_background(meeting_id: str) -> None:
     persistence) on OUR OWN DB session (never the request's). The meeting is
     already COMPLETED for a normal regenerate, so there is NO Finalizer
     meeting-step — only the summary becomes terminal.
+
+    Terminal SSE: like the Finalizer path, we publish `summary.completed` /
+    `summary.failed` AFTER the terminal row is durable (commit-before-publish).
+    `complete_generation` only emits `summary.started`, so without this the
+    Result page would never be notified that a regenerated version finished.
+    Publish failure must NEVER abort the durable result (SSE is not a fact
+    source) — the client recovers the truth via GET /summary on reconnect.
     """
     from app.db import SessionLocal
     from app.agent import summary_repository
     from app.agent.summary_service import complete_generation
+    from app.realtime import sse_service
 
     db = SessionLocal()
     try:
@@ -136,7 +224,22 @@ def run_regenerate_background(meeting_id: str) -> None:
         if item is None or item.status != "GENERATING":
             # nothing in flight (or an idempotent retry already finished)
             return
-        complete_generation(db, meeting_id, item.version)
+        result = complete_generation(db, meeting_id, item.version)
+
+        # Terminal SSE — only after the terminal summary is durable (Step 7B
+        # §11/B18: DB commit -> SSE publish). Same ordering contract as the
+        # Finalizer: summary.started ... then summary.completed|failed.
+        try:
+            if result.status == "COMPLETED":
+                sse_service.publish_summary_completed(meeting_id, version=result.version)
+            elif result.status == "FAILED":
+                sse_service.publish_summary_failed(meeting_id, version=result.version)
+        except Exception:  # pragma: no cover - defensive; never blocks durability
+            logger.exception(
+                "summary.%s SSE publish failed for regenerated meeting %s "
+                "(SSE is not a fact source; the durable summary already committed)",
+                result.status.lower(), meeting_id,
+            )
     except Exception:  # pragma: no cover - defensive
         logger.exception("regenerate background failed for meeting %s (retry-safe)", meeting_id)
     finally:

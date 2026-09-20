@@ -1,7 +1,7 @@
 import { useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { Form, Input, Modal, message } from 'antd'
-import { createMeeting, startMeeting } from '@/api'
+import { createMeeting } from '@/api'
 import { normalizeApiError } from '@/api'
 
 interface CreateMeetingModalProps {
@@ -9,7 +9,11 @@ interface CreateMeetingModalProps {
   onClose: () => void
 }
 
-/** 创建会议 Modal（fronted_designer §11）。点击「创建并开始」→ POST /meetings → POST /start → 进入 Meeting Room。 */
+/**
+ * 创建会议 Modal（fronted_designer §11，8B-1 修订）。
+ * 点击「创建会议」→ POST /api/meetings → meeting.status = CREATED → navigate(Meeting Room)。
+ * 不自动 /start —— 创建 ≠ 开始；开始由用户在会前准备页主动触发（8B-2）。
+ */
 export function CreateMeetingModal({ open, onClose }: CreateMeetingModalProps) {
   const [form] = Form.useForm()
   const [submitting, setSubmitting] = useState(false)
@@ -20,22 +24,15 @@ export function CreateMeetingModal({ open, onClose }: CreateMeetingModalProps) {
       const values = await form.validateFields()
       setSubmitting(true)
       const created = await createMeeting(values)
-      const started = await startMeeting(created.id)
       message.success('会议已创建')
       onClose()
-      navigate(`/meetings/${started.id}`)
+      navigate(`/meetings/${created.id}`)
     } catch (error: unknown) {
       // 表单校验失败：error 是 { errorFields }，直接放行，不弹错误
       if (typeof error === 'object' && error !== null && 'errorFields' in error) {
         return
       }
-      if (error instanceof Error && 'kind' in error) {
-        message.error(normalizeApiError(error).message)
-      } else if (error && typeof error === 'object' && 'response' in (error as object)) {
-        message.error(normalizeApiError(error).message)
-      } else {
-        message.error('创建失败，请稍后重试')
-      }
+      message.error(normalizeApiError(error).message)
     } finally {
       setSubmitting(false)
     }
@@ -50,7 +47,7 @@ export function CreateMeetingModal({ open, onClose }: CreateMeetingModalProps) {
         form.resetFields()
         onClose()
       }}
-      okText="创建并开始"
+      okText="创建会议"
       cancelText="取消"
       confirmLoading={submitting}
       destroyOnClose

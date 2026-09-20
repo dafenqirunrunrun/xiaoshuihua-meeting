@@ -132,10 +132,35 @@ def is_finalization_ready(db: Session, meeting_id: str) -> bool:
 
 
 def _find_gaps(db: Session, meeting_id: str, last_seq: int) -> list[int]:
-    """Explicit missing seqs in [1..last_seq] given the persisted FINAL set."""
+    """Explicit missing seqs in [1..last_seq] given the persisted FINAL set.
+
+    `last_seq=0` (empty transcript) legitimately yields no gaps: range(1, 1)
+    is empty — that is the transcript being complete-but-empty, not a failure.
+    """
     segs = transcript_repository.list_sorted(db, meeting_id)
     present = {s.segment_seq for s in segs if s.segment_seq <= last_seq}
     return [seq for seq in range(1, last_seq + 1) if seq not in present]
+
+
+def _resolve_terminal_seq(
+    db: Session, meeting_id: str, declared: int | None
+) -> int:
+    """Effective terminal segment_seq for this stream-end (ASR-0B freeze).
+
+    `segment_seq` is Transcript-owned, so the collaborator is NOT required to
+    reverse-query the server's ordering (ASR-0B decision 2). When the caller
+    omits `last_segment_seq` we derive the terminal point from what is actually
+    persisted. An empty transcript ends at 0 — a legal terminal value that lets
+    the meeting leave FINALIZING (previously impossible: `ge=1` + "required"
+    made zero-segment meetings permanently stuck in FINALIZING).
+
+    A caller that DOES supply the value still gets the full gap/overrun
+    validation — the explicit field is retained purely as an extra
+    consistency-checking capability (decision 2).
+    """
+    if declared is not None:
+        return declared
+    return transcript_repository.max_seq(db, meeting_id) or 0
 
 
 def handle_stream_end(
@@ -156,8 +181,6 @@ def handle_stream_end(
         raise TranscriptValidationError(
             f"event_type must be TRANSCRIPT_STREAM_END, got {payload.event_type}"
         )
-    if payload.last_segment_seq is None:
-        raise TranscriptValidationError("last_segment_seq is required")
     if payload.meeting_id != meeting_id:
         raise TranscriptValidationError(
             f"path meeting_id {meeting_id} != payload meeting_id {payload.meeting_id}"
@@ -168,11 +191,13 @@ def handle_stream_end(
         if meeting is None:
             raise MeetingNotFoundError(meeting_id)
 
+        terminal_seq = _resolve_terminal_seq(db, meeting_id, payload.last_segment_seq)
+
         existing = transcript_repository.get_stream_end(db, meeting_id)
 
         # --- Idempotency (Part 7) ------------------------------------------
         if existing is not None:
-            if existing.last_segment_seq == payload.last_segment_seq:
+            if existing.last_segment_seq == terminal_seq:
                 # identical retry -> 200, no state change, keep first received_at
                 return meeting, existing, True, False
             raise TranscriptConflictError(
@@ -180,7 +205,7 @@ def handle_stream_end(
                 "",
                 message=(
                     f"stream end already accepted with last_segment_seq={existing.last_segment_seq}, "
-                    f"cannot replace with {payload.last_segment_seq} (one terminal point per stream)"
+                    f"cannot replace with {terminal_seq} (one terminal point per stream)"
                 ),
             )
 
@@ -194,16 +219,16 @@ def handle_stream_end(
         # --- Integrity check (Part 6) ---------------------------------------
         max_seq = transcript_repository.max_seq(db, meeting_id)
         # overrun: more FINAL in DB than the declared end
-        if max_seq is not None and max_seq > payload.last_segment_seq:
+        if max_seq is not None and max_seq > terminal_seq:
             raise TranscriptConflictError(
                 meeting_id,
                 "",
                 message=(
                     f"transcript overruns stream-end: DB max seq={max_seq} > "
-                    f"last_segment_seq={payload.last_segment_seq}"
+                    f"last_segment_seq={terminal_seq}"
                 ),
             )
-        gaps = _find_gaps(db, meeting_id, payload.last_segment_seq)
+        gaps = _find_gaps(db, meeting_id, terminal_seq)
         if gaps:
             raise TranscriptConflictError(
                 meeting_id,
@@ -216,7 +241,7 @@ def handle_stream_end(
         # durable (ACCEPTED + last_segment_seq). Only AFTER this commit succeeds
         # may we touch the transient PARTIAL cache (constraint 5).
         stream_row = transcript_repository.insert_stream_end(
-            db, meeting_id, payload.last_segment_seq
+            db, meeting_id, terminal_seq
         )
         # Durable freeze success -> clear this meeting's transient PARTIAL cache.
         # This is TEMPORARY-STATE cleanup only, NOT the source of truth for
