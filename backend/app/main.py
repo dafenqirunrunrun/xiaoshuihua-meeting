@@ -20,7 +20,9 @@ from app.agent import router as agent_router
 from app.audio import router as audio_router
 from app.common import health_router
 from app.meeting import router as meeting_router
+from app.meeting_state import router as meeting_state_router
 from app.realtime import router as realtime_router
+from app.transcript import internal_docs as transcript_internal_docs
 from app.transcript import internal_router as transcript_internal_router
 from app.transcript import router as transcript_router
 
@@ -70,4 +72,12 @@ app.include_router(realtime_router.router, prefix="/api")
 app.include_router(agent_router.router, prefix="/api")
 app.include_router(transcript_internal_router.router, prefix="/api")
 app.include_router(audio_router.router)
+# Meeting State agent debug surface (Step AGENT-1): a downstream consumer of the
+# FINAL stream. Additive and independent — it shares no routes with the existing
+# routers, and it stays functional (empty state) even when the agent is disabled.
+app.include_router(meeting_state_router.router, prefix="/api")
+# Focused docs for the collaborator-facing internal ASR contract
+# (GET /api/internal/docs + /api/internal/openapi.json) — derived from the real
+# routes above, so it cannot drift from the implementation.
+app.include_router(transcript_internal_docs.router, prefix="/api")
 

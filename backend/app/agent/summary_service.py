@@ -48,6 +48,11 @@ from app.common.exceptions import (
     TranscriptConflictError,
 )
 from app.agent import summary_repository
+from app.agent.final_summary_service import (
+    FinalSummarySchemaError,
+    SummaryPlanError,
+    build_plan,
+)
 from app.transcript import repository as transcript_repository
 from app.agent.summary_schemas import MeetingSummarySchema
 from app.transcript import stream_service
@@ -55,6 +60,7 @@ from app.agent.llm.base import LLMProvider, SummaryGenerationError
 from app.agent.llm.factory import get_provider
 from app.common.meeting_lock import meeting_lock
 from app.transcript.live_cache import live_utterance_cache
+from app.db import SessionLocal
 
 if TYPE_CHECKING:
     from sqlalchemy.orm import Session
@@ -385,7 +391,12 @@ def _run_generation(
     if version < 1:
         raise ValueError("version must be >= 1")
 
-    comp = provider if provider is not None else get_provider()
+    # `FINAL_SUMMARY_MODEL` (Step AGENT-2 §20) optionally selects a different
+    # model for the FINAL SUMMARY than the one AGENT-1 uses for its incremental
+    # state updates. Empty -> the provider's own default, i.e. exactly the
+    # pre-AGENT-2 behaviour. Tests that inject a provider are unaffected.
+    model_override = (settings.final_summary_model or "").strip() or None
+    comp = provider if provider is not None else get_provider(model_override)
 
     # --- Phase A: gate + idempotency ---------------------------------------
     with meeting_lock(path_meeting_id):
@@ -445,36 +456,52 @@ def _run_generation(
         sse_service.publish_summary_started(path_meeting_id, version=version)
 
     # --- Phase B: LLM call — NO lock, NO transaction ------------------------
-    # The transcript is read AFTER Phase A released the lock, on a FRESH
-    # short-lived session, so the provider call never sits inside any DB
-    # transaction or lock. The meeting is FROZEN (post STREAM_END), so the
-    # segment snapshot cannot drift while we read it.
+    # Material selection (Step AGENT-2) happens here, outside the lock: the
+    # Final Summary is generated from the Meeting State + selected evidence when
+    # that state is usable, and from the full transcript otherwise. The choice,
+    # and why, is reported as `summary_source` / `fallback_reason`.
     raw = None
     parsed: MeetingSummarySchema | None = None
     reason: str | None = None
+    summary_source: str | None = None
+    fallback_reason: str | None = None
     try:
-        prompt, transcript_body = _build_prompt_outside_lock(meeting, path_meeting_id)
+        plan = _build_plan(meeting, path_meeting_id)
+        summary_source = plan.source
+        fallback_reason = plan.fallback_reason
     except SummaryErrorBase as exc:
         reason = str(exc)  # e.g. transcript too large — no LLM call at all
-        prompt, transcript_body = "", ""
+        plan = None
+    except SummaryPlanError as exc:
+        # V2 material too large — also refuse rather than truncate.
+        reason = str(exc)
+        plan = None
 
-    attempt = 0
-    max_attempts = settings.summary_max_attempts
-    if reason is None:
+    if plan is not None and plan.precomputed is not None:
+        # §16 empty meeting: a deterministic, LLM-free result. Recorded as a
+        # normal COMPLETED summary so the meeting reaches a terminal state.
+        raw = plan.precomputed_raw
+        parsed = plan.precomputed
+    elif plan is not None:
+        prompt = plan.prompt
+        assert plan.parse is not None and plan.build_repair is not None
+        attempt = 0
+        max_attempts = settings.summary_max_attempts
         while attempt < max_attempts:
             attempt += 1
             try:
-                raw = _call_provider(comp, prompt if not reason else build_repair_prompt(
-                    prompt, transcript_body, raw if raw else "", reason or ""
-                ))
-                parsed = parse_and_validate(raw)
+                raw = _call_provider(
+                    comp,
+                    prompt if attempt == 1 else plan.build_repair(raw or "", reason or ""),
+                )
+                parsed = plan.parse(raw)
                 break  # success criterion met
             except SummaryErrorBase as exc:
                 # Provider-level failure (config/timeout/HTTP) — no repair; mark
                 # FAILED in Phase C.
                 reason = str(exc)
                 break
-            except (ValidationError, json.JSONDecodeError, SummarySchemaError) as exc:
+            except (ValidationError, json.JSONDecodeError, SummarySchemaError, FinalSummarySchemaError) as exc:
                 reason = _describe_parse_error(exc, raw)
                 if not settings.summary_parse_repair:
                     break  # repair disabled -> FAILED after first failure
@@ -513,35 +540,56 @@ def _run_generation(
 
 # --- Phase B helpers (run WITHOUT the meeting lock) -------------------------
 
+def _build_plan(meeting: Meeting, meeting_id: str):
+    """Select the summary material (Step AGENT-2) on a short-lived session.
+
+    The legacy full-transcript prompt is built lazily via a thunk, so it is only
+    paid for when the plan actually falls back to it. All ORM objects are
+    consumed inside the session — nothing from it is returned.
+    """
+    read_db = SessionLocal()
+    try:
+        return build_plan(
+            read_db,
+            meeting,
+            legacy_material=lambda: _legacy_material(read_db, meeting, meeting_id),
+        )
+    finally:
+        read_db.close()
+
+
+def _legacy_material(
+    read_db: "Session", meeting: Meeting, meeting_id: str
+) -> tuple[str, str]:
+    """The pre-AGENT-2 material: the FULL transcript (frozen, ASC).
+
+    Kept byte-for-byte compatible with the original Phase B behaviour so the
+    fallback path is genuinely the old pipeline and not an approximation of it.
+    """
+    segments = transcript_repository.list_sorted(read_db, meeting_id)
+    total_chars = sum(len(seg.text) for seg in segments)
+    if total_chars > MAX_TRANSCRIPT_CHARS:
+        raise SummaryErrorBase(
+            f"transcript too large ({total_chars} chars > {MAX_TRANSCRIPT_CHARS}); "
+            "refusing to silently truncate. Split the meeting or raise the bound."
+        )
+    body = "\n".join(
+        f"[{i}] <{seg.speaker_id}> {seg.text}" for i, seg in enumerate(segments, start=1)
+    )
+    return build_summary_prompt(meeting.title, segments), body
+
+
 def _build_prompt_outside_lock(
     meeting: Meeting, meeting_id: str
 ) -> tuple[str, str]:
-    """Build the prompt from persisted FINAL ASC, returning plain strings.
+    """Legacy prompt builder — retained for the fallback path and its callers."""
+    from app.db import SessionLocal as _SessionLocal
 
-    Runs in Phase B (outside the lock) with its own short-lived session. The
-    FROZEN transcript cannot change (post STREAM_END no new FINALs are
-    accepted, Step 6), so a moment-of-read snapshot is safe. Everything that
-    could raise a domain error is produced here inside the session — nothing
-    ORM is returned (a closed session would expire it).
-    """
-    from app.db import SessionLocal
-
-    read_db = SessionLocal()
+    read_db = _SessionLocal()
     try:
-        segments = transcript_repository.list_sorted(read_db, meeting_id)
-        total_chars = sum(len(seg.text) for seg in segments)
-        if total_chars > MAX_TRANSCRIPT_CHARS:
-            raise SummaryErrorBase(
-                f"transcript too large ({total_chars} chars > {MAX_TRANSCRIPT_CHARS}); "
-                "refusing to silently truncate. Split the meeting or raise the bound."
-            )
-        body = "\n".join(
-            f"[{i}] <{seg.speaker_id}> {seg.text}" for i, seg in enumerate(segments, start=1)
-        )
-        prompt = build_summary_prompt(meeting.title, segments)
+        return _legacy_material(read_db, meeting, meeting_id)
     finally:
         read_db.close()
-    return prompt, body
 
 
 def _call_provider(comp: LLMProvider, prompt: str) -> str:

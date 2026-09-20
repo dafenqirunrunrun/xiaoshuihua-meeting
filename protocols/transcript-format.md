@@ -1,403 +1,182 @@
-# 小水华会议助手：字幕链路协作说明
+# 字幕格式协议（Transcript Format）
 
-## 1. 目的
+> 状态：**✅ FROZEN**（ASR-0B，2026-09-19）
+> 适用：上游 Audio / ASR 流水线 → 后端 Transcript Domain
+> 对应实现：`backend/app/transcript/asr_schemas.py`、`asr_adapter.py`、`asr_service.py`
 
-本文用于约定 **音频/ASR 链路** 与 **会议业务/前端链路** 之间的边界。
+---
 
-核心原则：
-
-> 音频链路负责把声音变成“标准字幕事件”；会议业务和前端只消费标准字幕事件，不关心 ESP32、PCM、腾讯云 ASR 的具体实现。
-
-## 2. 两边职责
-
-### 我负责：Audio / Speech → Transcript 输入
-
-负责链路：
+## 1. 边界
 
 ```text
-IM73D122
-→ ESP32-S3
-→ PCM
-→ FastAPI Audio
-→ 腾讯云实时 ASR
-→ ASR 结果标准化
-→ Transcript Service
+Audio / ASR（厂商无关）
+  ↓  归一化 PARTIAL / FINAL          ← 上游负责
+[ 本协议：外部 DTO，camelCase ]      ← 契约边界，唯一跨团队面
+  ↓
+Adapter（纯字段翻译 + identity 派生）
+  ↓
+Internal Transcript Domain（snake_case）
+  ↓
+Transcript 持久化 / SSE / React
 ```
 
-主要负责：ESP32 音频上传、FastAPI 接收 PCM、原始音频保存、腾讯云实时 ASR、解析 PARTIAL / FINAL、Speaker ID 与时间戳解析、把腾讯云返回结果转换成统一 Transcript Event，并交给 `transcript` 模块。
+**上游不负责**：`segmentSeq`（会议内排序）、DB id、repository、SSE、前端、Summary。
+**上游不需要也不应该**反向查询后端生成的排序结果。
 
-### 协作者负责：Transcript → 页面 / Agent / 会议业务
+---
 
-负责链路：
+## 2. 端点
 
 ```text
-Transcript
-→ Realtime SSE
-→ React 实时字幕
-→ Discussion Node
-→ Meeting Agent
-→ Summary / Todo / Decision
+POST /api/internal/meetings/{meeting_id}/asr-events
 ```
 
-主要负责 React 实时字幕页面、会议页面、会议状态、Discussion Node、Agent、会后 Summary / Todo / Decision、历史 Transcript 查询。
+`meeting_id` 必须与 payload `meetingId` 一致，否则 `400`。
 
-协作者不需要关心 PDM、PCM、ESP32、腾讯云 WebSocket、腾讯云签名和腾讯云原始 JSON。
+---
 
-## 3. 双方唯一核心交界面
+## 3. 事件格式 ✅ FROZEN
 
-双方以 **Transcript Event** 作为主要接口。
-
-```text
-腾讯云 ASR
-   ↓
-speech/
-   ↓
-统一 Transcript Event
-   ↓
-transcript/
-   ├── 实时推送
-   └── FINAL 落库
-```
-
-协作者只需要认识我们自己定义的 Transcript Event。
-
-## 4. PARTIAL 字幕格式
-
-PARTIAL 表示腾讯云当前正在识别、后续仍可能发生变化的临时字幕。
+PARTIAL（说话人可能未知）：
 
 ```json
 {
   "type": "transcript.partial",
-  "meetingId": "M202609180001",
-  "asrSessionId": "0139ec51-b32b-11f1-99ee-7008108bf18b",
+  "meetingId": "meeting_001",
+  "asrSessionId": "sess-001",
   "sentenceId": 2,
   "speakerId": -1,
   "startMs": 950,
   "endMs": 6480,
-  "text": "我们现在正在测试小水华实时语音识别",
+  "text": "我们今天讨论会议助手",
   "provider": "tencent"
 }
 ```
 
-字段说明：
-
-| 字段 | 含义 |
-|---|---|
-| `type` | 固定为 `transcript.partial` |
-| `meetingId` | 当前会议 ID |
-| `asrSessionId` | 一次腾讯 ASR WebSocket 会话 ID |
-| `sentenceId` | 腾讯当前句子编号 |
-| `speakerId` | 说话人编号，PARTIAL 阶段可能为 `-1` |
-| `startMs` | 相对会议/ASR 会话的起始时间 |
-| `endMs` | 当前识别到的结束时间 |
-| `text` | 当前临时文本 |
-| `provider` | 当前为 `tencent` |
-
-PARTIAL 的处理规则：
-
-```text
-PARTIAL
-→ 不正式落数据库
-→ 写入 Live Cache
-→ 立即通过 SSE 推送前端
-→ 同 sentenceId 的新 PARTIAL 覆盖旧 PARTIAL
-```
-
-因此前端不应该把同一句话的 PARTIAL 一条条追加，而应始终展示最新版本。
-
-## 5. FINAL 字幕格式
-
-FINAL 表示一句话已经由 ASR 确认。进入 `transcript` 模块后，由后端生成正式的 `segmentId` 和 `segmentSeq`，然后再推送给前端。
+FINAL（同一 `sentenceId`，说话人通常已解析为 `>= 0`）：
 
 ```json
 {
   "type": "transcript.final",
-  "meetingId": "M202609180001",
-  "segmentId": "8f8a7d1c-...",
-  "segmentSeq": 25,
-  "asrSessionId": "0139ec51-b32b-11f1-99ee-7008108bf18b",
+  "meetingId": "meeting_001",
+  "asrSessionId": "sess-001",
   "sentenceId": 2,
   "speakerId": 0,
   "startMs": 950,
   "endMs": 7900,
-  "text": "我们现在正在测试小水华实时语音识别功能。",
+  "text": "我们今天讨论会议助手的整体方案。",
   "provider": "tencent"
 }
 ```
 
-FINAL 的处理规则：
+### 字段表 ✅ FROZEN
+
+| 字段 | 类型 | 约束 | 说明 |
+| --- | --- | --- | --- |
+| `type` | str | `transcript.partial` \| `transcript.final` | 事件判别符 |
+| `meetingId` | str | 1..64，须等于 path | 会议标识 |
+| `asrSessionId` | str | **1..48** | ASR 会话标识，见 §6 |
+| `sentenceId` | int | `>= 0`，`<= 2147483647` | **会话内**句子编号，**不等于**排序 |
+| `speakerId` | int | `>= -1` | **-1 = 说话人暂未知**，合法 |
+| `startMs` / `endMs` | int | `>= 0` 且 `endMs >= startMs` | 会话内相对偏移，见 §5 |
+| `text` | str | `<= 4000` | 识别文本 |
+| `provider` | str | 1..64 | **不透明**，不得据此硬编码厂商逻辑 |
+
+**没有** `segmentSeq`，**没有** `utteranceId`，**没有** `eventId`——这三者归后端。
+
+### 校验 ✅ FROZEN
+
+- `extra="forbid"`：未知字段（如误传 `segmentSeq` 或 snake_case 写法）→ **422**。
+- `endMs < startMs` → **422**。
+- 契约漂移必须**大声失败**，不做静默兼容。
+
+---
+
+## 4. Identity 归属 ✅ FROZEN
+
+| 概念 | 归属 | 派生方式 | 用途 |
+| --- | --- | --- | --- |
+| `utterance_id` | 后端 | `f"{asrSessionId}:{sentenceId}"` | PARTIAL 原地覆盖；PARTIAL→FINAL 交接 |
+| FINAL `event_id` | 后端 | 确定性摘要（含 `meetingId`） | 幂等（全局 `UNIQUE(event_id)`） |
+| PARTIAL `event_id` | 后端 | 摘要**混入 revision 内容** | 不做该句固定 id（否则后续 revision 会撞幂等） |
+| `segment_seq` | 后端 | `max(segment_seq) + 1`（meeting lock 内） | **会议内唯一排序** |
+
+**禁止 `segment_seq = sentenceId`**：`sentenceId` 是会话内编号，ASR 重连后会重号，
+直接映射会撞 `UNIQUE(meeting_id, segment_seq)`。
+
+**FINAL 幂等重试复用已存 `segment_seq`**，不消耗新号。
+
+---
+
+## 5. 时间轴语义 ✅ FROZEN（MVP）
+
+- `startMs` / `endMs` 是**每个 ASR session 内的相对偏移**。
+- **跨 session 不可比较**（重连后上游可能把时间轴归零）。
+- 因此：**排序永远只认 `segment_seq`**；`start_ms` / `end_ms` **只用于存储、回显与展示**，
+  绝不参与排序或完整性判断。
+- **MVP 不做 rebase**（不把多 session 时间轴重建为会议全局时间轴）。
+
+> ⏳ **V0.2 known limitation / tech debt**：会议级全局时间轴重建需要先持久化 session
+> 元数据（`provider` / `asrSessionId` / `sentenceId` 当前只活在 ingress 生命周期内，
+> **不落库**）。届时需 DB schema 变更，属于 V0.2 范围。
+
+---
+
+## 6. `asrSessionId` 上限 48 —— 为什么是硬约束 ✅ FROZEN
+
+`utterance_id = f"{asrSessionId}:{sentenceId}"` 必须落在内部 64 字符界内：
 
 ```text
-FINAL
-→ Transcript Service
-→ 幂等检查
-→ 正式落库
-→ 清除对应 PARTIAL Cache
-→ 通过 SSE 推送前端
+最坏情况 = 48 + 1 + len("2147483647") = 48 + 1 + 10 = 59  <=  64
 ```
 
-前端收到 FINAL 后，用它替换当前对应的 PARTIAL，并追加为正式字幕段。
+超过 48 → **422**。这样派生 identity **精确且单射**；相比之下静默哈希或截断一个
+identity 是不可接受的。该约束已同步暴露在 OpenAPI schema（`maxLength: 48`）。
 
-## 6. 谁负责落库
+---
 
-> **由 FastAPI 后端 `transcript` 模块统一落库。前端绝不直接落库。**
+## 7. 状态码 ✅ FROZEN
 
-职责边界：
+| 码 | 含义 |
+| --- | --- |
+| `200` | 接收成功（FINAL 已持久化 / 幂等命中；PARTIAL 已入实时缓存） |
+| `400` | path `meeting_id` ≠ payload `meetingId` |
+| `404` | meeting 不存在 |
+| `409` | meeting 状态不允许；同句内容漂移（绝不静默覆盖）；**utterance 已 FINAL 关闭后收到 PARTIAL** |
+| `422` | payload 校验失败（含未知字段） |
 
-```text
-speech/
-负责：腾讯云结果 → 标准 ASR/Transcript Event
+---
 
-transcript/
-负责：PARTIAL 缓存、FINAL 幂等、FINAL 落库、segmentSeq、实时事件发布、Transcript 查询
-```
+## 8. 顺序与重复语义 ✅ FROZEN
 
-最终链路：
+| 场景 | 行为 |
+| --- | --- |
+| **乱序到达**（先 sentence 3 后 sentence 1） | 均 `200`；`segment_seq` 按**到达顺序**分配 |
+| **重复 FINAL**（内容相同） | `200` 幂等；不新增 segment |
+| **同句 FINAL 内容漂移** | `409`，保留原值，绝不覆盖 |
+| **迟到重试**（该句 FINAL 已落库后重发） | `200`，复用原 `segment_seq` |
+| **PARTIAL 原地更新**（同句多次 revision） | 每次 `200`，覆盖实时缓存（不写库） |
+| **PARTIAL 晚于同句 FINAL** | **`409`**：utterance 一旦 FINAL 即**关闭**，见 §9 |
+| **多 session 重连**（`sentenceId` 从 1 重启） | 均 `200`；`utterance_id` 含 session 前缀，身份不串 |
 
-```text
-Tencent ASR
-    ↓
-speech/tencent_client.py
-    ↓
-标准事件
-    ↓
-transcript/service.py
-    │
-    ├── PARTIAL → live_cache → realtime/SSE
-    │
-    └── FINAL   → repository → DB
-                         ↓
-                     realtime/SSE
-```
+---
 
-Transcript 数据库是会议文字的唯一事实源。
+## 9. Utterance 关闭语义 ✅ FROZEN
 
-## 7. 为什么 PARTIAL 不落库
+**同一 utterance 一旦收到 FINAL，即视为 closed。**
 
-腾讯实时识别过程中，同一句话可能连续产生很多版本：
+此后同 `utterance_id` 的 PARTIAL → **`409`**，不写入实时缓存。
 
-```text
-我们
-我们现在
-我们现在正在
-我们现在正在讨论
-我们现在正在讨论会议助手
-```
+理由：若接受，前端会渲染一条永远无法收敛的"识别中"行——它等待的 FINAL 早已到达，
+且不会再作为 live 帧重发。按既有"契约漂移必须大声失败"原则，此情形应让调用方获知。
 
-如果全部 INSERT，会产生大量无效记录、重复字幕，并可能让后续 Agent 读取错误中间结果。因此规则固定为：
+> 该不变式在**两个 ingress 上都生效**（领域不变式，非路由细节）。
 
-```text
-PARTIAL = 临时状态
-FINAL   = 正式事实
-```
+---
 
-只有 FINAL 进入正式 `transcript_segment`。
+## 10. 明确不做（本协议范围外）
 
-## 8. FINAL 建议落库字段
-
-`transcript_segment` 至少包含：
-
-```text
-id
-meeting_id
-segment_seq
-speaker_id
-start_ms
-end_ms
-text
-asr_provider
-asr_session_id
-asr_sentence_id
-created_at
-```
-
-建议幂等依据：
-
-```text
-meeting_id + asr_session_id + asr_sentence_id
-```
-
-同一个 FINAL 即使因网络重试到达两次，也不能插入两条。同时保留：
-
-```text
-UNIQUE(meeting_id, segment_seq)
-```
-
-保证会议字幕顺序唯一。
-
-## 9. 前端如何实时接收
-
-当前项目继续使用已有 SSE，例如：
-
-```text
-GET /meetings/{meeting_id}/events
-```
-
-FastAPI 持续推送：
-
-```text
-transcript.partial
-transcript.final
-meeting.status
-summary.status
-...
-```
-
-React 不直接连接腾讯云。正确架构：
-
-```text
-Tencent
-   ↓
-FastAPI
-   ↓
-SSE
-   ↓
-React
-```
-
-## 10. 前端实时字幕状态建议
-
-React 页面可以维护：
-
-```text
-finalSegments[]
-currentPartial
-```
-
-收到新的 PARTIAL：覆盖 `currentPartial`。
-
-收到 FINAL：清空/替换当前 `currentPartial`，并将正式 Segment 追加到 `finalSegments`。
-
-这样页面不会把几十条中间结果全部堆出来。
-
-## 11. Speaker 约定
-
-V1 暂时没有声纹身份识别，因此：
-
-```text
-speakerId = 0 → Speaker 0
-speakerId = 1 → Speaker 1
-speakerId = 2 → Speaker 2
-```
-
-PARTIAL 阶段腾讯可能返回 `speakerId = -1`，这是正常情况，不是错误。前端可显示“正在识别...”或暂不显示 Speaker，等 FINAL 到达后再显示正式 Speaker。
-
-## 12. 时间戳约定
-
-统一使用：
-
-```text
-startMs
-endMs
-```
-
-单位统一为毫秒。不要一部分代码使用秒、一部分使用毫秒。
-
-## 13. 协作者当前如何模拟我的输出
-
-在真实 ESP32 / 腾讯 ASR 完成之前，协作者不需要等我，可以使用 Mock Event。
-
-PARTIAL：
-
-```json
-{
-  "type": "transcript.partial",
-  "meetingId": "M001",
-  "sentenceId": 1,
-  "speakerId": -1,
-  "startMs": 1000,
-  "endMs": 2500,
-  "text": "我们今天先讨论..."
-}
-```
-
-随后模拟 FINAL：
-
-```json
-{
-  "type": "transcript.final",
-  "meetingId": "M001",
-  "segmentId": "mock-seg-001",
-  "segmentSeq": 1,
-  "sentenceId": 1,
-  "speakerId": 0,
-  "startMs": 1000,
-  "endMs": 3200,
-  "text": "我们今天先讨论会议助手的整体方案。"
-}
-```
-
-这样 React 字幕页面可以完全独立开发。等真实链路完成后，只需要把 Mock Producer 替换成 Tencent ASR，前端协议不变。
-
-## 14. 双方模块边界
-
-我主要修改：
-
-```text
-firmware/esp32-s3/
-backend/app/device/
-backend/app/audio/
-backend/app/speech/
-backend/app/transcript/   # ASR 输入、标准化、落库入口
-protocols/
-```
-
-协作者主要修改：
-
-```text
-backend/app/meeting/
-backend/app/agent/
-backend/app/auth/
-backend/app/weiguang/
-frontend/
-```
-
-共同修改前必须沟通：
-
-```text
-backend/app/transcript/
-backend/app/realtime/
-protocols/
-```
-
-尤其以下字段不能某一方自行修改：
-
-```text
-type
-meetingId
-segmentId
-segmentSeq
-sentenceId
-speakerId
-startMs
-endMs
-text
-```
-
-如果协议需要变化，先修改：
-
-```text
-protocols/transcript-format.md
-protocols/realtime-events.md
-```
-
-双方确认后再改代码。
-
-## 15. 一句话总结
-
-```text
-我负责：声音 → 标准字幕
-
-Transcript Service 负责：FINAL 落库 + 所有字幕实时事件发布
-
-协作者负责：消费字幕 → 实时页面 + Agent + 会后业务
-```
-
-其中：
-
-```text
-PARTIAL：只实时显示，不正式落库
-FINAL：正式落库，并实时显示
-```
-
-这就是 V1 字幕链路的协作边界。
+- 真实腾讯 ASR 对接、音频采集、ESP32 固件（V0.2）。
+- `provider` / `asrSessionId` / `sentenceId` 落库（见 §5 tech debt）。
+- 多 worker / 多实例下的排序分配：当前 `segment_seq` 分配依赖**进程内 per-meeting
+  `RLock`**，仅 MVP 单进程成立。多实例需升级为数据库级安全分配机制（V0.2）。

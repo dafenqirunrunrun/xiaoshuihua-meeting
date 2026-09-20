@@ -43,9 +43,11 @@ SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
 
 def create_all() -> None:
     """Create tables (imports models first)."""
-    from app.agent import summary_model  # noqa: F401
-    from app.meeting import meeting_model  # noqa: F401
-    from app.transcript import segment_model, stream_model  # noqa: F401
+    from app.agent.summary_model import MeetingSummary  # noqa: F401
+    from app.meeting.meeting_model import Meeting  # noqa: F401
+    from app.meeting_state.model import MeetingState  # noqa: F401
+    from app.transcript.segment_model import TranscriptSegment  # noqa: F401
+    from app.transcript.stream_model import TranscriptStream  # noqa: F401
 
     Base.metadata.create_all(bind=engine)
 

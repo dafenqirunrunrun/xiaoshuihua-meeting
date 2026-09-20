@@ -29,3 +29,18 @@ export interface Meeting {
   /** 由后端推导的业务展示态（= status；FE 依赖驱动页面，见 MeetingStatusTag） */
   displayStatus?: MeetingStatus
 }
+
+/** GET /api/meetings 查询参数（Step 8B-6：status 过滤 + limit/offset 分页） */
+export interface MeetingListQuery {
+  status?: MeetingStatus
+  limit?: number
+  offset?: number
+}
+
+/** GET /api/meetings 响应（MeetingListOut —— 复用 MeetingOut，不新增派生字段） */
+export interface MeetingList {
+  items: Meeting[]
+  total: number
+  limit: number
+  offset: number
+}
