@@ -106,6 +106,7 @@ def main() -> int:
     print(f"  final_summary_model = {settings.final_summary_model!r} (empty -> provider default)")
     print(f"  deepseek_base_url set = {bool(settings.deepseek_base_url)}")
     print(f"  deepseek_api_key  present = {bool(settings.deepseek_api_key)} (value never printed)")
+    print(f"  llm_timeout_seconds = {settings.llm_timeout_seconds}")
     print(f"  meeting_agent_enabled = {settings.meeting_agent_enabled}")
     print(f"  final_summary_v2_enabled = {settings.final_summary_v2_enabled}")
     print()
@@ -149,7 +150,6 @@ def main() -> int:
         db = SessionLocal()
         try:
             report = meeting_state_service.process_pending(db, mid)
-            state = meeting_state_service.get_state(db, mid)
         finally:
             db.close()
 
@@ -157,15 +157,27 @@ def main() -> int:
         print()
 
         # --- finish + force flush --------------------------------------------
+        # NOTE: this flush is an OBSERVATION, not the acceptance basis. The
+        # Finalizer runs its OWN synchronous force flush (AGENT-2 §2 Step 0), so
+        # a failure here (e.g. a provider timeout) can still be recovered by the
+        # Finalizer and the summary can legitimately be `meeting_state`. Reading
+        # the state HERE and asserting on it would therefore judge a stale
+        # intermediate — which is exactly the false-negative this script used to
+        # produce. The checks below read the state AFTER the Finalizer instead.
         client.post(f"/api/meetings/{mid}/finish")
         db = SessionLocal()
         try:
             flush = meeting_state_service.process_pending(db, mid, force_flush=True)
-            state = meeting_state_service.get_state(db, mid)
         finally:
             db.close()
 
-        print(f"finish + force flush: outcome={flush.get('outcome')} reason={flush.get('reason')}")
+        print(f"finish + explicit force flush: outcome={flush.get('outcome')} "
+              f"reason={flush.get('reason')}")
+        if flush.get("outcome") == meeting_state_service.OUTCOME_FAILED:
+            # Surface it: a provider timeout here is worth knowing about even
+            # though the Finalizer may recover it below.
+            print("   ^ NOTE: this flush FAILED — the Finalizer's own flush is the "
+                  "one under test; final state is read after it.")
         print()
         # --- STREAM_END -> Finalizer -> AGENT-2 --------------------------------
         r = client.post(
@@ -182,7 +194,15 @@ def main() -> int:
         summary = client.get(f"/api/meetings/{mid}/summary").json()
         meeting = client.get(f"/api/meetings/{mid}").json()
 
-    # --- the 10 acceptance checks ------------------------------------------
+        # Read the FINAL state AFTER the Finalizer — its flush is the one that
+        # counts (and is the one AGENT-2 §2 relies on). Same for the summary.
+        db = SessionLocal()
+        try:
+            state = meeting_state_service.get_state(db, mid)
+        finally:
+            db.close()
+
+    # --- the acceptance checks ----------------------------------------------
     print("Acceptance checks")
     print("-" * 72)
 

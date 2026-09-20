@@ -12,9 +12,9 @@ name: backend-tests
 
 on:
   push:
-    branches: [main, dafenqi]
+    branches: [main, develop, dafenqi]
   pull_request:
-    branches: [main]
+    branches: [main, develop]
 
 jobs:
   pytest:
@@ -31,8 +31,8 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements-collab.txt
-          pip install -r requirements-dev.txt
+          pip install -r requirements.txt
+          pip install -r ../requirements-dev.txt
       - name: Run pytest
         env:
           # The suite sets its own DATABASE_URL / LLM_PROVIDER per test via
@@ -56,7 +56,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements-collab.txt
+          pip install -r requirements.txt
       - name: Run step regression suites
         env:
           LLM_PROVIDER: fake
