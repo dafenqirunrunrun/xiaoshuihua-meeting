@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { useNavigate, useParams } from 'react-router-dom'
 import { Button, Card, Popconfirm, Skeleton, Tabs, Typography, message } from 'antd'
 import {
@@ -7,11 +7,13 @@ import {
   FileTextOutlined,
 } from '@ant-design/icons'
 import { EmptyPlaceholder } from '@/components/EmptyPlaceholder'
+import { EvidenceTraceButton } from '@/components/EvidenceTraceButton'
 import { MeetingStatusTag } from '@/components/MeetingStatusTag'
 import { regenerateSummary, normalizeApiError } from '@/api'
 import { useMeetingLoad } from '@/hooks/useMeetingLoad'
 import { useMeetingSummary } from '@/hooks/useMeetingSummary'
 import { useSummaryResultStream } from '@/hooks/useSummaryResultStream'
+import { useTranscriptEvidenceNavigation } from '@/hooks/useTranscriptEvidenceNavigation'
 import { useTranscriptSnapshotResult } from '@/hooks/useTranscriptSnapshotResult'
 import { useMeetingStore } from '@/stores/meetingStore'
 import { formatDateTime, formatDuration } from '@/utils/time'
@@ -32,11 +34,50 @@ function resultDurationText(meeting: Meeting): string {
 }
 
 /**
+ * 一个 action item 的展示文本。
+ *
+ * 必须与后端 `final_summary_prompts.to_legacy_schema` 的折叠格式**逐字一致**
+ * （`task（owner，deadline）`，缺项就省略该段）。不一致不会报错，只会让
+ * 「查看原文」入口消失 —— 这正是为什么「有 structured evidence 时走结构化渲染」
+ * （见下）而不是靠比对扁平字符串去对齐。
+ */
+function formatActionItem(
+  task: string,
+  owner: string | null,
+  deadline: string | null,
+): string {
+  const bits = [owner, deadline].filter((b): b is string => Boolean(b))
+  return bits.length > 0 ? `${task}（${bits.join('，')}）` : task
+}
+
+/**
  * Summary 分节渲染 —— 只展示后端真实字段（SummaryOut），无 fake。
  * overview / key_topics / conclusions / open_questions 均来自 actual schema。
  * 空数组不显示大空卡片（弱化）。
+ *
+ * UI-INTEL-2B：主要结论 / 未决问题两节带上「查看原文」入口。
+ *
+ * **为什么是这两节、而不是新开四节**：后端 `to_legacy_schema` 已经把这四类内容
+ * 压平进来了 —— `conclusions` = decision 文本 + action item（折叠成
+ *「task（owner，deadline）」），`open_questions` = open question 文本 + risk 文本。
+ * 也就是说内容本来就在页面上，缺的只是「点得进去」。新开四节会让同一段文字出现
+ * 两次，也会让两个契约的关系变得难以理解。
+ *
+ * **两条渲染路径，按 evidence 有无切换**：
+ *   - `summary_evidence` 非 null（可验证 V2）→ 直接读**结构化字段**渲染，
+ *     顺序与后端压平顺序一致。文本由字段算出，不做任何字符串匹配。
+ *   - `summary_evidence` 为 null（legacy / fallback / FAILED / 空会议）→
+ *     原样渲染扁平字符串，**不出现任何入口**（§3：不猜、不反推、关键词匹配）。
+ * 这样两边的展示在各自路径上都来自真实数据，且不需要一个「按位置猜对齐」的
+ * 脆弱映射 —— 那种映射一旦格式漂移就会静默地把按钮变没。
  */
-function SummarySections({ summary }: { summary: MeetingSummary }) {
+function SummarySections({
+  summary,
+  onTraceEvidence,
+}: {
+  summary: MeetingSummary
+  onTraceEvidence: (seqs: number[]) => void
+}) {
   const blocks: { label: string; body: React.ReactNode }[] = []
   if (summary.overview?.trim()) {
     blocks.push({
@@ -56,29 +97,69 @@ function SummarySections({ summary }: { summary: MeetingSummary }) {
       ),
     })
   }
-  if (summary.conclusions.length > 0) {
-    blocks.push({
-      label: '主要结论',
-      body: (
-        <ol className="summary-list">
-          {summary.conclusions.map((c, i) => (
-            <li key={i}>{c}</li>
-          ))}
-        </ol>
+
+  const ev = summary.summary_evidence
+
+  // 一行 = 文本 + 可选 evidence 入口。seqs 为空时 EvidenceTraceButton 自己
+  // 返回 null（§6 无 disabled 假按钮），这里不需要再判断一次。
+  const tracedRow = (text: string, seqs: number[] | null, key: number) => (
+    <li key={key} className="summary-list__item">
+      <span>{text}</span>
+      {seqs ? <EvidenceTraceButton sourceSegmentSeqs={seqs} onTrace={onTraceEvidence} /> : null}
+    </li>
+  )
+
+  if (ev) {
+    // --- 结构化渲染：内容与顺序都来自 V2 字段本身 ---
+    const conclusions = [
+      ...ev.decisions.map((d, i) => tracedRow(d.text, d.source_segment_seqs, i)),
+      ...ev.action_items.map((a, i) =>
+        tracedRow(
+          formatActionItem(a.task, a.owner, a.deadline),
+          a.source_segment_seqs,
+          ev.decisions.length + i,
+        ),
       ),
-    })
-  }
-  if (summary.open_questions.length > 0) {
-    blocks.push({
-      label: '未决问题',
-      body: (
-        <ol className="summary-list">
-          {summary.open_questions.map((q, i) => (
-            <li key={i}>{q}</li>
-          ))}
-        </ol>
+    ]
+    if (conclusions.length > 0) {
+      blocks.push({ label: '主要结论', body: <ol className="summary-list">{conclusions}</ol> })
+    }
+
+    const questions = [
+      ...ev.open_questions.map((q, i) => tracedRow(q.text, q.source_segment_seqs, i)),
+      ...ev.risks.map((r, i) =>
+        tracedRow(r.text, r.source_segment_seqs, ev.open_questions.length + i),
       ),
-    })
+    ]
+    if (questions.length > 0) {
+      blocks.push({ label: '未决问题', body: <ol className="summary-list">{questions}</ol> })
+    }
+  } else {
+    // --- 扁平渲染（legacy / fallback）：与 UI-INTEL-2B 之前完全一致，无入口 ---
+    if (summary.conclusions.length > 0) {
+      blocks.push({
+        label: '主要结论',
+        body: (
+          <ol className="summary-list">
+            {summary.conclusions.map((c, i) => (
+              <li key={i}>{c}</li>
+            ))}
+          </ol>
+        ),
+      })
+    }
+    if (summary.open_questions.length > 0) {
+      blocks.push({
+        label: '未决问题',
+        body: (
+          <ol className="summary-list">
+            {summary.open_questions.map((q, i) => (
+              <li key={i}>{q}</li>
+            ))}
+          </ol>
+        ),
+      })
+    }
   }
 
   if (blocks.length === 0) {
@@ -131,10 +212,23 @@ function SummarySections({ summary }: { summary: MeetingSummary }) {
  *   - 生成/失败期间保留并继续展示上一次可用纪要（Banner 提示），不清空页面。
  *
  * 本 Step 明确不做：版本切换 / 版本历史 / 版本对比（8C-3 只展示 latest）。
+ *
+ * UI-INTEL-2B：Final Summary → Transcript Evidence Trace（会后证据溯源）。
+ *   - 纪要条目（decision / action item / risk / open question）→「查看原文」→
+ *     **切到「会议内容」Tab** → 等 Transcript DOM ready → 定位 + 高亮。
+ *   - **不新增路由 query、不跳回 MeetingRoom**：Result 页本来就有这两个 Tab，
+ *     切 Tab 是页面内行为。
+ *   - 复用 UI-INTEL-2A 的 `useTranscriptEvidenceNavigation`（同一个 hook，
+ *     同一套 data-segment-seq / 高亮 / 降级规则），**没有第二套 DOM 查询**。
+ *   - **不引入 auto-follow**：会后 Transcript 是静态的，没有新内容来抢滚动，
+ *     所以这里不调用 `pauseAutoFollow` / `jumpToBottom`（§7）。协作是可选的，
+ *     hook 本身与 auto-follow 无耦合。
  */
 export function MeetingResultPage() {
   const { meetingId } = useParams<{ meetingId: string }>()
   const navigate = useNavigate()
+  const [activeTab, setActiveTab] = useState('summary')
+  const transcriptRef = useRef<HTMLDivElement | null>(null)
 
   // Meeting 域（复用 MeetingRoom 的 load 模式；404 / network 轻量态）
   const meeting = useMeetingStore((s) => s.meeting)
@@ -149,6 +243,70 @@ export function MeetingResultPage() {
   // Transcript 域（持久化 FINAL only，ASC）
   const { segments, loading: transcriptLoading, error: transcriptError, retry: retryTranscript } =
     useTranscriptSnapshotResult(meetingId)
+
+  // ---- UI-INTEL-2B：会后证据溯源 -------------------------------------------
+  // 复用 UI-INTEL-2A 的 hook：同一套 data-segment-seq 定位、同一套「滚动到
+  // 最小有效 seq + 全部有效项同时高亮 + 全部缺失才提示」规则、同一个
+  // `.transcript-segment--evidence` 样式。这里没有第二份 querySelector。
+  //
+  // 与 MeetingRoom 的唯一区别：**不接 auto-follow**（§7）。会后转写是静态
+  // 归档，不会有新 FINAL 来抢滚动，因此不需要 pauseAutoFollow / jumpToBottom。
+  // 该协作本来就是调用方的事，hook 与它无耦合。
+  const evidence = useTranscriptEvidenceNavigation(transcriptRef, !transcriptLoading)
+
+  /**
+   * 「查看原文」：切到会议内容 Tab，**等容器真的挂载**再定位。
+   *
+   * 为什么不能就地调 `traceEvidence`（这是本页最容易写错的一处）：
+   * `setActiveTab` 只是改我们自己的 state。AntD Tabs 用它**内部**的
+   * `activeKey` 决定渲染哪个面板，并在后续一次 commit 才同步 —— 也就是说
+   * `activeTab === 'transcript'` 已经被 React 提交时，「会议内容」面板**还没进
+   * DOM**（惰性渲染非激活面板）。而转写此时通常早就加载完了
+   * （`contentSettled === true`），于是 hook 会判定「内容已定稿但容器不存在」
+   * = **不可定位**，立刻弹出「原始记录暂不可定位」。
+   *
+   * 那是个假故障：不是记录找不到，只是面板还没挂载。它属于**调用方**才知道的
+   * 第三种情况（hook 只知道「还在加载」与「根本没有转写」），所以修正放在这里。
+   *
+   * 实测（本 Step 浏览器 E2E）：`useEffect` 依赖 `activeTab` 也**不够** ——
+   * AntD 的同步发生在更晚的一次 commit，effect 跑的时候 ref 仍是 null。可靠
+   * 的信号是**节点挂载本身**，所以用 callback ref：无论面板在哪一次 commit
+   * 落地，节点「出现」的那一刻都会回调，这才是「可以定位了」的真实时刻。
+   */
+  const pendingTraceRef = useRef<number[] | null>(null)
+  /** 容器挂载状态。把 ref 的存在性提升为 state，effect 才有可依赖的触发点。 */
+  const [transcriptNode, setTranscriptNode] = useState<HTMLDivElement | null>(null)
+
+  const attachTranscript = useCallback((node: HTMLDivElement | null) => {
+    transcriptRef.current = node
+    setTranscriptNode(node)
+  }, [])
+
+  const handleTraceEvidence = useCallback(
+    (seqs: number[]) => {
+      // 已经在「会议内容」Tab 且容器已挂载：此刻容器可见，滚动计算有效，
+      // 直接定位。（callback ref 只在挂载时触发，覆盖不到这种情况。）
+      if (activeTab === 'transcript' && transcriptRef.current) {
+        evidence.traceEvidence(seqs)
+        return
+      }
+      pendingTraceRef.current = seqs
+      setActiveTab('transcript')
+    },
+    [activeTab, evidence.traceEvidence],
+  )
+
+  useEffect(() => {
+    // 两个条件缺一不可：目标 Tab 已激活（文本已可见）＋容器已挂载（有 DOM 可查）。
+    // 容器挂载是个 state，所以面板晚到的那一次 commit 也会重新触发本 effect。
+    if (activeTab !== 'transcript' || !transcriptNode) return
+    const pending = pendingTraceRef.current
+    if (!pending) return
+    pendingTraceRef.current = null
+    evidence.traceEvidence(pending)
+    // 依赖 `traceEvidence` 本身（hook 内是稳定 useCallback），而不是整个
+    // `evidence` 对象 —— 后者每次 render 都是新引用，会让本 effect 空转。
+  }, [activeTab, transcriptNode, evidence.traceEvidence])
 
   // ---- 8C-2/8C-3 Summary 实时通知 ----
   // 连接条件（spec：仅 summary 非 terminal 时连 SSE）：
@@ -402,7 +560,7 @@ export function MeetingResultPage() {
         <div className="summary-wrap">
           {summaryHead(`v${display.version}`)}
           {summaryBanner}
-          <SummarySections summary={display} />
+          <SummarySections summary={display} onTraceEvidence={handleTraceEvidence} />
         </div>
       )
     }
@@ -477,15 +635,25 @@ export function MeetingResultPage() {
       )
     }
     return (
-      <div className="transcript-surface transcript-surface--top">
+      <div className="transcript-surface transcript-surface--top" ref={attachTranscript}>
         <ol className="transcript-segments">
           {segments.map((seg) => (
-            <li key={seg.segment_seq} className="transcript-segment">
+            <li
+              key={seg.segment_seq}
+              className="transcript-segment"
+              /* 与 MeetingRoom 用同一个稳定标识：UI-INTEL-2A 建立的定位依据。
+                 禁止用数组 index / 文本 / utterance_id —— 那些都会漂移。 */
+              data-segment-seq={seg.segment_seq}
+            >
               <span className="transcript-segment__speaker">{seg.speaker_id}</span>
               <span className="transcript-segment__text">{seg.text}</span>
             </li>
           ))}
         </ol>
+        {/* 不可定位轻提示（§8），与 MeetingRoom 同一套文案 / 同一个 class */}
+        {evidence.outcome === 'not_found' ? (
+          <div className="transcript-note" role="status">原始记录暂不可定位</div>
+        ) : null}
       </div>
     )
   })()
@@ -529,7 +697,8 @@ export function MeetingResultPage() {
         styles={{ body: { padding: '4px 24px 24px' } }}
       >
         <Tabs
-          defaultActiveKey="summary"
+          activeKey={activeTab}
+          onChange={setActiveTab}
           items={[
             {
               key: 'summary',
