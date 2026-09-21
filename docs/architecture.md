@@ -1505,3 +1505,133 @@ V2 由 `backend/tests/test_final_summary_v2.py` **单独证明**：其 `scripted
 （`app.agent.llm.factory.get_provider` 与 `app.agent.summary_service.get_provider`
 —— 后者是模块级 import 绑定，只 patch factory **够不到**），并直接断言
 `summary_source == meeting_state`。
+
+---
+
+## 21. Meeting Intelligence Panel（Step UI-INTEL-1 已实现）
+
+### 21.1 定位
+
+把「进行中的会议页」从「只有实时字幕」升级为「实时字幕 + AI 会议理解」：
+会议**进行中**就把 AI 已经理解出的结构化内容（当前议题 / 已确认决策 / 待办事项 /
+未决问题 / 风险）呈现给用户，而不是等到会议结束。
+
+**这不是新数据域。** `Meeting State` 是 AGENT-1（arch §19）已经产出的会中工作记忆，
+本 Step 只是**把已有的 durable 事实暴露给产品前端**，并让它在会议进行中**实时可见**。
+
+三条边界（硬约束）：
+
+1. **Meeting State ≠ Final Summary**。前者是会中工作记忆、随 FINAL 增量更新；
+   后者是会后一次性派生终稿。两者独立，禁止互相推导。
+2. **前端绝不重新推导**。禁止 `Transcript → 前端关键词规则 → 猜 decision /
+   action item`。展示的每一条都必须来自服务端持久化的 Meeting State。
+3. **零 Agent 改动**。本 Step 不修改 AGENT-1 的核心 schema、不修改游标 / 批次 /
+   失败策略，只新增一条**只读投影** + 一个**失效通知事件** + 前端展示。
+
+### 21.2 链路
+
+```text
+AGENT-1 成功 upsert meeting_state（durable）
+   ↓ （同一次请求内，commit 之后）
+publish_meeting_state_updated(meeting_id, version, status)
+   ↓ SSE 具名帧 `meeting.state.updated`（payload 仅 {version,status}）
+   ↓ 复用前端既有的 `GET /events` EventSource —— 不新增第二条连接
+useMeetingStream → onStateInvalidated
+   ↓
+useMeetingIntelligence.refreshState()
+   ↓
+GET /api/meetings/:id/state  ← 事实源（durable）
+   ↓
+MeetingIntelligencePanel 重新渲染
+```
+
+**SSE 只是通知通道**：事件 non-durable、不回放、不改变 `after_segment_seq` 恢复协议、
+无 Last-Event-ID。刷新 / 重连一律以 `GET /state` 为准。
+
+### 21.3 后端：public 投影 + 发布时机
+
+- **`MeetingStatePublic`**（`app/meeting_state/schemas.py`）是**只读产品投影**，
+  与 internal `MeetingState` 的唯一差别是**不带 `model_name`**（provider 身份是
+  工程事实，不是产品事实）。`last_error` 在两个模型上都**不是字段**，因此
+  **结构性**无法泄漏 —— 不是靠"记得别传"。
+- **投影层加载 / 解析失败时降级而非抛错**（`get_public_state`）：public 接口是产品 UI
+  消费的，未捕获异常会变成 500（读作"应用坏了"），而 `ACTIVE + 空内容` 的兜底更是
+  **主动撒谎**。因此损坏时返回 `status = FAILED` + 保留可安全读取的标量 + 内容置空，
+  **且不回写 DB**（读路径投影，脏行绝不被 GET 洗白）。
+- **发布判据是「durable 状态是否真的变了」，不是「version 是否 +1」**：
+  `ACTIVE vN → ACTIVE vN+1` / `EMPTY·ACTIVE → FAILED` / `FAILED → ACTIVE` /
+  `ACTIVE → FROZEN` 都必须发；`FAILED → FAILED` 与 `NO_WORK` 抑制（不刷屏）。
+  **这块必须覆盖 FAILED**：`mark_failed` 刻意不推进 version，所以
+  "version +1 才发" 会**静默丢掉**整个失败通知。
+- **稳定 SSE id 必须带 status**：`state:<meeting_id>:<version>:<status>`。
+  `ACTIVE@4` 与 `FAILED@4` 是两个不同的 durable 状态、同一个 version，
+  仅凭 version 无法区分，客户端去重会误判为重复而丢弃。**不引入新的持久化事件序号。**
+- 顺序硬约束：**先 DB commit，后 publish**；SSE 发布失败**绝不回滚** Meeting State。
+- 新增路由 `GET /api/meetings/{id}/state`（public 产品投影），
+  internal 调试接口 `/api/internal/meetings/{id}/state` **保留且不变**。
+
+### 21.4 前端：数据架构与两道守卫
+
+```text
+MeetingRoomPage
+├─ useMeetingIntelligence(meetingId, enabled)   ← 状态留在 hook 内，不进全局 store
+│  ├─ initial GET /state
+│  ├─ request sequence guard   （过期响应丢弃，乱序不覆盖）
+│  ├─ version guard            （incoming.version >= current.version 才落地）
+│  └─ refreshState()
+└─ useMeetingStream(..., onStateInvalidated)    ← 复用同一条 /events EventSource
+   └─ meeting.state.updated → refreshState()
+```
+
+- **不扩 Zustand 全局 store**：Meeting State 与 Transcript 是两个数据域，
+  放在 hook / 页面作用域内即可，避免全局 store 被第三个域污染。
+- **两道守卫缺一不可**：
+  - *request sequence* —— 解决乱序返回时旧响应覆盖新响应；
+  - *version* —— 解决过期快照覆盖新状态。判定必须是 `>=` 而**不是** `>`：
+    FAILED **不推进 version**，用 `>` 会把同 version 下的 `ACTIVE → FAILED` 丢掉。
+  - **初始基线为 `-1`**，保证首个 `version = 0 / status = EMPTY` 能正常进入 ——
+    那是最常见的早期状态，不是"过期"。
+- **复用既有 SSE 连接**：`meeting.state.updated` 走 `useMeetingStream` 里**已经有**的
+  `EventSource`，只把事件转成一次 invalidation 回调。**不新增第二条 EventSource
+  生命周期** —— 那会引入两条连接的竞态、双倍重连逻辑与 StrictMode 双连接风险。
+  回调经 `Ref` 读取，故意不进 effect 依赖（否则每次 render 换新引用都会重连 SSE）。
+- **SSE 白名单必须三处同步**（`backend/realtime/schemas.py` /
+  `frontend/types/sse.ts` / `frontend/utils/sse.ts`）。后端的具名帧**不触发
+  `onmessage`**，遗漏订阅是**完全静默**的失效。本 Step 加了**编译期穷尽性守卫**：
+  `Exclude<SseEventType, typeof SSE_EVENT_TYPES[number]> extends never` 不成立即
+  `npm run typecheck` 失败（已做 mutation 验证：删掉白名单里的
+  `meeting.state.updated` → typecheck 立即报错）。
+
+### 21.5 展示策略
+
+- 面板挂在既有 `room__rail`（轨首），**不重构 MeetingRoom**、不删既有信息。
+- 四态：Loading（Skeleton）/ Empty（诚实的空态）/ Error（轻量重试）/ Normal。
+- **失败不清空 last-good**：`FAILED` 时继续展示最近一次成功理解的内容 +
+  一行轻量提示。**会议 `COMPLETED` + Meeting State `FAILED` 是合法组合**。
+- `owner` / `deadline` 为 `null` → 「负责人：待确认」/「截止时间：待确认」，
+  **纯展示层 fallback，绝不写回后端**。
+- `source_segment_seqs` 在类型与 API 里保留，但点击溯源跳转属 **UI-INTEL-2**。
+- 视觉沿用既有体系（AntD 5 + global.css + designTokens + rail-section / InfoRow /
+  EmptyPlaceholder / Skeleton / Tag）：无新 UI 库、无动画库、无渐变、无 AI 发光效果、
+  无 emoji 堆叠。宽屏 `--rail-width: 340px`；`<900px` 单列时面板独占整行。
+
+### 21.6 明确不做
+
+真实 ASR / 点击证据跳转（UI-INTEL-2）/ 触发式任务编排 / 跨会议记忆 / RAG /
+向量库 / 多智能体 / 前端本地缓存 Meeting State / 新增持久化字段 / DB migration /
+Meeting 四态机改动 / Transcript 契约改动。
+
+### 21.7 验证
+
+- `backend/tests/test_meeting_state_api.py` —— **31/31 PASS**
+  （public 字段集与禁泄漏字段 / 状态矩阵 / 损坏降级 / 事件契约 / 发布矩阵 /
+  legacy SSE 不受影响）
+- `pytest` **171/171 PASS**（140 + 31）
+- 回归全绿：Step5 21 + Step6 21 + Step7A 28 + Step7B 36 + list 17 + ASR-A 22
+- `scripts/e2e_ui_intel_browser.py` 真实 Chrome CDP —— **17/17 PASS**
+  （含「**不刷新**面板即更新」这一只有浏览器能证明的断言；
+  ACTIVE→FAILED 同 version 转换；FAILED 保留 last-good；无内部细节泄漏）
+- 前端 `npm run typecheck` + `npm run build` PASS
+- **零改动**：Meeting 四态机 / Freeze 语义 / Transcript 契约 / ASR 契约 /
+  LLM Provider / **DB schema（无 migration，meeting_state 表结构不变）** /
+  AGENT-1 核心 schema / AGENT-2

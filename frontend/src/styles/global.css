@@ -513,7 +513,9 @@ body {
   }
 }
 
-/* 8B-4 「有新内容 · 回到底部」FAB：悬浮于转写面板右下，出现时轻升起 */
+/* 8B-4 「回到最新」FAB：悬浮于转写面板右下，出现时轻升起
+   （文案原为「有新内容 · 回到底部」，UI-INTEL-2A 收敛回 PRD §36 的「回到最新」：
+    该按钮现在也是 evidence 跳转后恢复 auto-follow 的唯一入口，不再只表示"有新内容"） */
 .transcript-jump {
   position: absolute;
   right: 16px;
@@ -637,6 +639,107 @@ body {
   font-size: 13px;
   color: var(--color-text-primary);
   text-align: right;
+}
+
+/* ============================================================
+   AI 会议理解（UI-INTEL-1）—— 展示 AI 在会中理解出的结构化内容。
+   视觉沿用既有卡片 / 圆角 / 边框体系：不发散、不加发光效果、
+   不用渐变强调；层级只靠字号 / 颜色 / 间距建立。
+   ============================================================ */
+.intel-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+/* FAILED / 刷新失败提示：极轻的底色块，不是 Alert，不抢主内容视觉 */
+.intel-notice {
+  margin-bottom: 10px;
+  padding: 8px 10px;
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--color-text-secondary);
+  background: var(--color-bg-page);
+  border: 1px solid var(--color-border-light);
+  border-radius: 8px;
+}
+.intel-notice--soft {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 4px;
+}
+.intel-block {
+  margin-bottom: 12px;
+}
+.intel-block:last-of-type {
+  margin-bottom: 0;
+}
+.intel-block__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+.intel-block__title {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--color-text-secondary);
+}
+/* 条数：弱化的小胶囊，提供「有几条」的快速感知，不喧宾夺主 */
+.intel-block__count {
+  min-width: 18px;
+  padding: 0 6px;
+  font-size: 11px;
+  line-height: 18px;
+  color: var(--color-text-tertiary);
+  text-align: center;
+  background: var(--color-bg-page);
+  border-radius: 9px;
+}
+.intel-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.intel-item {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 7px 0;
+  border-bottom: 1px solid var(--color-border-light);
+}
+.intel-item:last-child {
+  border-bottom: none;
+}
+.intel-item__text {
+  font-size: 13px;
+  line-height: 1.6;
+  color: var(--color-text-primary);
+  /* 长文本换行，不撑破窄轨 */
+  overflow-wrap: anywhere;
+}
+.intel-item__sub {
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--color-text-tertiary);
+  overflow-wrap: anywhere;
+}
+.intel-item__meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 10px;
+}
+.intel-meta {
+  font-size: 12px;
+  color: var(--color-text-tertiary);
+}
+.intel-foot {
+  margin-top: 10px;
+  font-size: 11px;
+  color: var(--color-text-tertiary);
 }
 
 /* FINALIZING 三态指示条：✓ 会议已结束 / ● 转写收尾中 / ○ AI 纪要等待生成 */
@@ -982,6 +1085,23 @@ body {
 .summary-list li {
   margin-bottom: 4px;
 }
+/* UI-INTEL-2B：条目 + 右侧「查看原文」入口同排；正文占满剩余宽度，
+   按钮不换行、不被正文挤断。仅在 Result 纪要区出现（MeetingRoom 的面板
+   用 .intel-item，与此无关）。 */
+.summary-list__item {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+}
+.summary-list__item > span {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.summary-list__item > .intel-trace.ant-btn {
+  flex: 0 0 auto;
+  white-space: nowrap;
+}
 .summary__version {
   margin-top: 16px;
   font-size: 12px;
@@ -989,8 +1109,50 @@ body {
 }
 
 /* ============================================================
+   UI-INTEL-2A：Transcript Evidence Trace（查看原文 → 定位 + 高亮）
+   ============================================================ */
+/* 「查看原文 / 查看依据」入口：link 型按钮，弱化但可点；
+   仅在有 source_segment_seqs 的条目上渲染（无证据则完全不出现，不是 disabled）。 */
+.intel-trace.ant-btn {
+  align-self: flex-start;
+  height: auto;
+  padding: 0;
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--color-primary);
+}
+.intel-trace.ant-btn:hover {
+  color: var(--color-primary-hover);
+}
+
+/* Evidence 高亮：轻量的左侧色条 + 淡底，不做动画库、不做发光。
+   **刻意不动 padding / 尺寸** —— 改内边距会让正文在每次高亮时跳一下，
+   比不高亮更烦人。色条用 inset shadow 画在最左缘，不占布局。 */
+.transcript-segment--evidence {
+  background: var(--color-primary-light);
+  box-shadow: inset 3px 0 0 0 var(--color-primary);
+  border-radius: 6px;
+  transition: background var(--motion-base) ease, box-shadow var(--motion-base) ease;
+}
+
+/* 定位提示（不可定位 / 正在加载原始记录）：轻，不拦截操作 */
+.transcript-note {
+  padding: 8px 20px 0;
+  font-size: 12px;
+  color: var(--color-text-tertiary);
+}
+
+/* ============================================================
    Responsive（≥1200 双列 / 900–1199 窄轨 / <900 单列）
    ============================================================ */
+/* UI-INTEL-1：宽屏下右轨放 340px，容下 AI 会议理解的条目与「负责人/截止时间」行。
+   仅在 ≥1200 生效；900–1199 仍是 260px 窄轨，<900 单列（面板随轨下移）。 */
+@media (min-width: 1200px) {
+  .room__body {
+    --rail-width: 340px;
+  }
+}
+
 @media (max-width: 1199px) {
   .room__body {
     --rail-width: 260px;
@@ -1010,6 +1172,13 @@ body {
   }
   .rail-section {
     flex: 1 1 220px;
+  }
+  /* AI 会议理解在单列下独占整行：它是内容型面板，与并列的元信息卡不同，
+     挤在半行里条目会被压得很窄。 */
+  .rail-section:has(.intel-head),
+  .rail-section:has(.intel-block),
+  .rail-section:has(.intel-foot) {
+    flex: 1 1 100%;
   }
   /* hero 插画在窄屏淡出，不占位不遮挡文字 */
   .home-hero {

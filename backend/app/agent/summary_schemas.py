@@ -4,6 +4,8 @@ from datetime import datetime
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from app.agent.final_summary_schemas import SummaryEvidence
+
 
 class MeetingSummaryOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
@@ -38,6 +40,18 @@ class SummaryOut(BaseModel):
     version's state. Includes version (append-only regeneration) and the safe
     raw_model_output evidence (LLM JSON or a short human FAILED reason) — never
     provider exception stacks / API keys / internal headers.
+
+    `summary_evidence` (Step UI-INTEL-2B) is the OPTIONAL structured evidence
+    projection over `raw_model_output`: the decisions / action items / risks /
+    open questions the summary was built from, each with the transcript seqs it
+    cites, so the Result page can offer 「查看原文」.
+
+    It is a PROJECTION, not a second source of truth — `raw_model_output` above
+    is unchanged and remains the raw record. `summary_evidence = null` means the
+    row is not a verifiable V2 summary (legacy, transcript-fallback, FAILED, an
+    empty meeting, or unparseable output); the UI must then render no evidence
+    entry rather than guessing. See
+    `final_summary_schemas.project_summary_evidence` for the exact rule.
     """
 
     model_config = ConfigDict(from_attributes=True)
@@ -52,6 +66,7 @@ class SummaryOut(BaseModel):
     open_questions: list[str] = []
     model_name: str | None = None
     raw_model_output: str | None = None
+    summary_evidence: SummaryEvidence | None = None
     created_at: datetime | None = None
 
 

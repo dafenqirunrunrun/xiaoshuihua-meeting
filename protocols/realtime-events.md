@@ -80,6 +80,7 @@ es.addEventListener('<event_type>', handler)
 | `transcript.final` | **durable** | 正式 segment | `final:<meeting_id>:<segment_seq>` |
 | `meeting.status` | durable | 会议状态 | — |
 | `heartbeat` | — | 空 | — |
+| `meeting.state.updated` | **非 durable** | `{version,status}` | `state:<mid>:<version>:<status>` |
 | `summary.started` | **非 durable** | `{version,status}` | `summary:<mid>:<version>:started` |
 | `summary.completed` | **非 durable** | `{version,status}` | `summary:<mid>:<version>:completed` |
 | `summary.failed` | **非 durable** | `{version,status}` | `summary:<mid>:<version>:failed` |
@@ -88,11 +89,43 @@ es.addEventListener('<event_type>', handler)
 
 - **PARTIAL 不回放**：只 live 推送，断线后不补（它从来不是事实源）。
 - **`summary.*` 不回放**：`after_segment_seq` 不重放它们；重连后用 `GET /summary` 恢复。
+- **`meeting.state.updated` 不回放**：`after_segment_seq` 不重放它；
+  重连后用 `GET /api/meetings/{id}/state` 恢复（**SSE 不是 Meeting State 事实源**）。
 - **payload 绝不含**：`raw_model_output`、堆栈、API key、prompt。
   仅 `{version, status}`。
 - **`TRANSCRIPT_STREAM_END` 不广播**（PRD §30 未列出；契约不可自行扩展）。
 - 心跳：`sse_heartbeat_interval`（默认 15s）空闲周期发 `heartbeat`。
 - 顺序：`summary.started → summary.completed|failed → meeting.status(COMPLETED)`。
+
+### `meeting.state.updated` 语义（Step UI-INTEL-1）✅ FROZEN
+
+**纯失效通知（invalidation），不承载内容。** 产品可见的 **durable Meeting State
+发生变化**时发布；前端收到后**重新 `GET /api/meetings/{id}/state`**，
+**绝不**把 payload 当内容渲染。
+
+必须覆盖的转换（判据是「durable 状态是否真的变了」，**不是**「version 是否 +1」）：
+
+| 转换 | version | 是否发布 |
+| --- | --- | --- |
+| `ACTIVE vN → ACTIVE vN+1` | +1 | ✅ |
+| `EMPTY/ACTIVE → FAILED` | **不变** | ✅ |
+| `FAILED → ACTIVE` | +1 | ✅ |
+| `ACTIVE → FROZEN` | 不变或 +1 | ✅ |
+| `FAILED → FAILED`（重复失败） | 不变 | ❌ 抑制（不刷屏） |
+| `NO_WORK`（无新 FINAL） | 不变 | ❌ 抑制 |
+
+**为什么 id 里必须带 status**：`mark_failed` **刻意不推进 version**
+（失败不移动游标、不移动版本），所以 `ACTIVE@4` 与 `FAILED@4` 是**两个不同的
+durable 状态、同一个 version**。仅用 `state:<mid>:<version>` 无法区分它们，
+会在客户端去重时把「转 FAILED」误判为重复事件而**静默丢弃**。
+`state:<mid>:<version>:<status.lower()>` 让每次不同的变更都可区分，
+**且不引入新的持久化事件序号**（该 id 只作客户端去重键，事件本身不回放）。
+
+- **顺序硬约束**：**先 DB commit，后 publish**。`publish → commit` 禁止。
+- **SSE 发布失败绝不回滚** Meeting State（commit-before-publish，与 FINAL 同规）。
+- 不改变 `after_segment_seq` 恢复协议；无 Last-Event-ID；无 durable replay。
+- **本步只新增此一个事件**（`meeting.state.updated`），不新增任何 HTTP 端点或
+  既有事件 payload 字段。
 
 ---
 

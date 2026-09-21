@@ -65,8 +65,9 @@ from app.meeting.meeting_model import Meeting
 from app.meeting_state import repository as state_repository
 from app.meeting_state import updater
 from app.meeting_state.prompts import build_repair_prompt, build_update_prompt
-from app.meeting_state.schemas import MeetingState, MeetingStateContent
+from app.meeting_state.schemas import MeetingState, MeetingStateContent, MeetingStatePublic
 from app.common.meeting_lock import meeting_lock
+from app.realtime import sse_service  # publish AFTER db.commit() only
 from app.transcript import repository as transcript_repository
 from app.transcript import stream_service
 from app.transcript.segment_model import TranscriptSegment
@@ -93,6 +94,77 @@ OUTCOME_NOT_FOUND = "MEETING_NOT_FOUND"
 
 def _utcnow_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+def _publish_state_changed(
+    meeting_id: str,
+    *,
+    version: int,
+    status: str,
+    previous_version: int,
+    previous_status: str | None,
+) -> None:
+    """Announce a PRODUCT-VISIBLE durable state change (Step UI-INTEL-1).
+
+    The trigger condition is deliberately "the durable state actually changed",
+    NOT "the version incremented": a failed update changes what the user must be
+    told (the AI is unavailable) while leaving `version` untouched, so a
+    version-gated publish would hide exactly the transition the panel needs.
+
+        ACTIVE vN -> ACTIVE vN+1   version moved      -> publish
+        ACTIVE|EMPTY -> FAILED     status moved       -> publish
+        FAILED -> ACTIVE           status + version   -> publish
+        ACTIVE -> FROZEN           status moved       -> publish
+        FAILED -> FAILED           neither moved      -> SUPPRESSED
+
+    That last row is why this is a predicate and not a bare call: a retry that
+    fails again re-writes the same FAILED status, and waking the panel for a
+    no-op would make an outage generate a re-fetch per retry. The comparison is
+    against the status/version read immediately BEFORE the write, so it reflects
+    the real prior durable state rather than the state at the start of the run.
+
+    Called only AFTER the row committed, and can never raise:
+
+    **Commit-before-publish.** The durable state is already on disk, so a failed
+    announce must never roll it back — SSE is a notification channel, not a fact
+    source. A client that misses the event still converges, because every connect
+    / refresh / reconnect re-reads GET /api/meetings/{id}/state.
+
+    **Never raises.** This runs inside `process_pending`, whose contract is that
+    an agent problem never propagates to the transcript path. A broken broker or
+    a slow-consumer eviction must stay contained here instead of surfacing as a
+    bogus agent failure — the state itself is perfectly fine.
+    """
+    if status == previous_status and version == previous_version:
+        return
+    try:
+        sse_service.publish_meeting_state_updated(meeting_id, version=version, status=status)
+    except Exception:  # pragma: no cover - defensive; SSE is not a fact source
+        logger.exception(
+            "meeting.state.updated publish failed for meeting %s "
+            "(state is already durable; client recovers via GET /state)", meeting_id,
+        )
+
+
+def _current_state_identity(db: Session, meeting_id: str) -> tuple[str | None, int]:
+    """(status, version) of the persisted row as it stands RIGHT NOW.
+
+    Read immediately before a write so the publish predicate compares against the
+    real prior durable state — within one run the persisted status can already
+    have moved (an earlier batch succeeded, then a later one failed), so a value
+    captured back in Phase A would be stale.
+
+    Returns a PLAIN TUPLE, never the ORM row, and that is load-bearing: SQLAlchemy
+    hands back the same identity-mapped instance every time, and `repository.upsert`
+    mutates that instance in place. Holding the row object across the write and
+    reading `row.status` afterwards would therefore report the NEW status as if it
+    were the old one — making every status-only change look like "no change" and
+    silently suppressing exactly the events this predicate exists to emit.
+    """
+    row = state_repository.get(db, meeting_id)
+    if row is None:
+        return None, 0
+    return row.status, row.version
 
 
 # =============================================================================
@@ -265,6 +337,12 @@ def process_pending(
         # an unearned claim, so we report NO_WORK and leave the failure visible.
         if frozen and row is not None and row.status == STATUS_ACTIVE:
             with meeting_lock(meeting_id):
+                # Capture the PRIOR status BEFORE the write: `upsert` mutates the
+                # identity-mapped row in place, so reading `row.status` afterwards
+                # would return the new FROZEN value and make this look like a
+                # no-op change (see `_current_state_identity`).
+                previous_status = row.status
+                previous_version = row.version
                 state_repository.upsert(
                     db, meeting_id,
                     content=previous,
@@ -273,6 +351,12 @@ def process_pending(
                     status=STATUS_FROZEN,
                     model_name=row.model_name,
                 )
+            # ACTIVE -> FROZEN is a product-visible change (the panel switches to
+            # its archived presentation). Version deliberately does NOT move: the
+            # cursor did not advance, so there is nothing new to count.
+            _publish_state_changed(meeting_id, version=version, status=STATUS_FROZEN,
+                                   previous_version=previous_version,
+                                   previous_status=previous_status)
             return {"outcome": OUTCOME_OK, "agent_run_id": run_id, "status": STATUS_FROZEN,
                     "from_segment_seq": cursor, "to_segment_seq": cursor,
                     "previous_state_version": version, "new_state_version": version,
@@ -331,8 +415,16 @@ def process_pending(
         if reason is not None:
             # No silent truncation: skip the batch, leave the state untouched,
             # and report. A later trigger retries (the segments stay pending).
-            state_repository.mark_failed(db, meeting_id, reason=reason,
-                                         model_name=getattr(provider, "name", None))
+            with meeting_lock(meeting_id):
+                before_status, before_version = _current_state_identity(db, meeting_id)
+                state_repository.mark_failed(db, meeting_id, reason=reason,
+                                             model_name=getattr(provider, "name", None))
+            # A failure is a product-visible change even though NOTHING else
+            # moved: content and cursor are preserved and `version` does not
+            # increment (it counts SUCCESSFUL updates). The panel must be able to
+            # say "AI 整理暂时不可用" while still showing the last good content.
+            _publish_state_changed(meeting_id, version=version, status=STATUS_FAILED,
+                                   previous_version=before_version, previous_status=before_status)
             _log_run(meeting_id, run_id, from_seq, batch_end, version, version, 0,
                      OUTCOME_TOO_LARGE, reason)
             return {"outcome": OUTCOME_TOO_LARGE, "agent_run_id": run_id, "reason": reason,
@@ -359,10 +451,15 @@ def process_pending(
             # Failure policy: record, do NOT advance the cursor, do NOT touch
             # state_json. The next trigger replays exactly these segments.
             with meeting_lock(meeting_id):
+                before_status, before_version = _current_state_identity(db, meeting_id)
                 state_repository.mark_failed(
                     db, meeting_id, reason=result.reason or "unknown error",
                     model_name=getattr(provider, "name", None),
                 )
+            # Same non-version-bumping failure notice as the size-guard path
+            # above, and for the same reason: the durable status changed.
+            _publish_state_changed(meeting_id, version=version, status=STATUS_FAILED,
+                                   previous_version=before_version, previous_status=before_status)
             _log_run(meeting_id, run_id, from_seq, batch_end, version, version,
                      latency_ms, OUTCOME_FAILED, result.reason)
             return {"outcome": OUTCOME_FAILED, "agent_run_id": run_id,
@@ -390,6 +487,10 @@ def process_pending(
 
             new_version = fresh_version + 1
             status = STATUS_FROZEN if (frozen and batch_end == pending[-1].segment_seq) else STATUS_ACTIVE
+            # Captured as plain values before the write: `upsert` mutates the
+            # identity-mapped row in place, so a later `fresh.status` read would
+            # already show the new status (see `_current_state_identity`).
+            previous_status = fresh.status if fresh is not None else None
             state_repository.upsert(
                 db, meeting_id,
                 content=merged,
@@ -399,6 +500,16 @@ def process_pending(
                 model_name=getattr(provider, "name", None),
                 last_error=None,
             )
+
+        # Announced AFTER the lock is released and the row is committed. This is
+        # the successful-update case (version bumped), and it also covers the
+        # recovery transition FAILED -> ACTIVE for free: `mark_failed` never
+        # bumped the version, so the next successful upsert both advances it and
+        # drops `last_error`, which is exactly what the panel needs to see.
+        # Publishing inside the critical section would only lengthen it.
+        _publish_state_changed(meeting_id, version=new_version, status=status,
+                               previous_version=fresh_version,
+                               previous_status=previous_status)
 
         _log_run(meeting_id, run_id, from_seq, batch_end, version, new_version,
                  latency_ms, OUTCOME_OK, None)
@@ -505,6 +616,63 @@ def get_state(db: Session, meeting_id: str) -> MeetingState:
     )
 
 
+def get_public_state(db: Session, meeting_id: str) -> MeetingStatePublic:
+    """Product-facing projection of the state (Step UI-INTEL-1).
+
+    Differs from `get_state` in exactly one behaviour: a CORRUPT `state_json`
+    degrades to `status = FAILED` with EMPTY content instead of propagating
+    `MeetingStateCorruptError` to the caller.
+
+    Why degrade rather than re-raise: `get_state` is the internal/debug view, and
+    loud is right there — a state we cannot decode is our own data-integrity
+    problem and a human should look at the row. But this projection is consumed
+    by the product UI, where an unhandled exception becomes a 500 that reads as
+    "the app is broken". Worse, the frontend would then have no idea whether the
+    AI is working, and an `ACTIVE + empty content` fallback would actively LIE:
+    it would tell the user the AI is running fine while showing nothing.
+
+    So the corruption is reported HONESTLY as a degraded status — the panel says
+    "AI 整理暂时不可用 / 会议字幕仍在正常记录" and the transcript is untouched.
+    The scalars we can still read (`version`, cursor, `updated_at`) are kept, and
+    NOTHING is written back to the DB: this is a read-path projection only, so a
+    bad row is never laundered away by a GET.
+    """
+    from app.common.exceptions import MeetingNotFoundError
+
+    if db.get(Meeting, meeting_id) is None:
+        raise MeetingNotFoundError(meeting_id)
+
+    row = state_repository.get(db, meeting_id)
+    if row is None:
+        return MeetingStatePublic(meeting_id=meeting_id, version=0,
+                                  last_processed_segment_seq=0, status=STATUS_EMPTY)
+
+    updated_at = row.updated_at.isoformat() if row.updated_at else None
+    try:
+        content = state_repository.get_content(db, meeting_id)
+    except state_repository.MeetingStateCorruptError:
+        logger.error(
+            "meeting state unreadable; public API degrading to FAILED",
+            extra={"meeting_id": meeting_id},
+        )
+        return MeetingStatePublic(
+            meeting_id=meeting_id,
+            version=row.version,
+            last_processed_segment_seq=row.last_processed_segment_seq,
+            status=STATUS_FAILED,
+            updated_at=updated_at,
+        )
+
+    return MeetingStatePublic(
+        meeting_id=meeting_id,
+        version=row.version,
+        last_processed_segment_seq=row.last_processed_segment_seq,
+        status=row.status,
+        updated_at=updated_at,
+        **content.model_dump(),
+    )
+
+
 def run_agent_background(
     meeting_id: str,
     *,
@@ -541,5 +709,6 @@ __all__ = [
     "process_pending",
     "select_batches",
     "get_state",
+    "get_public_state",
     "run_agent_background",
 ]

@@ -616,3 +616,181 @@ npm run build      # tsc --noEmit && vite build
   - **零改动**：Meeting 四态机 / Transcript 契约 / ASR 契约 / Freeze 语义 /
     **DB schema（无 migration）** / **前端业务代码** / `DeepSeekProvider` 传输层。
   - **本 Step 未 push**（按用户要求：等待确认后再 push）。
+- **Step UI-INTEL-1 已完成**：Meeting Intelligence Panel（会中 AI 会议理解面板）。
+  - **定位**：把进行中的会议页从「只有实时字幕」升级为「实时字幕 + AI 会议理解」——
+    会议**进行中**就展示 AI 已理解出的结构化内容。**不是新数据域**：复用 AGENT-1
+    已产出的 Meeting State，本步只是**暴露**它并让它**实时可见**。
+  - **三条边界**：① `Meeting State ≠ Final Summary`（会中工作记忆 vs 会后派生终稿，
+    禁止互相推导）；② **前端绝不重新推导**（禁止 `Transcript → 关键词规则 → 猜
+    decision`，展示的每一条都必须来自服务端持久化状态）；③ **零 Agent 改动**
+    （不改 AGENT-1 核心 schema / 游标 / 批次 / 失败策略）。
+  - **公开读取 API**：`GET /api/meetings/{id}/state` → `MeetingStatePublic`
+    （**产品侧唯一入口**；internal 调试接口保留不变，前端不使用）。
+    只有 11 个字段；**结构性**不含 `model_name`（`last_error` 在两个模型上都不是
+    字段，不靠"记得别传"）。会议不存在 → 404；未处理任何 FINAL → **200 +
+    version=0 + EMPTY**（不是错误）。
+  - **损坏降级（§6）**：`state_json` 不可解析时**不 500、不回写 DB**，在**投影层**
+    降级为 `status=FAILED` + 保留可安全读取的标量 + 内容置空。
+    **绝不返回 `ACTIVE + 空内容`**（那等于谎称 AI 正常）；**绝不**把解析异常当产品 500。
+  - **SSE 失效通知 `meeting.state.updated`**（复用既有 `/events` 连接，
+    **不新增第二条 EventSource**）：
+    - 语义是「**product-visible durable 状态变了**」，**不是**「version +1」。
+      必须覆盖：`ACTIVE vN → ACTIVE vN+1`、`ACTIVE|EMPTY → FAILED`、
+      `FAILED → ACTIVE`、`ACTIVE → FROZEN`；`FAILED → FAILED` 与 `NO_WORK` 抑制。
+      **必须覆盖 FAILED** —— `mark_failed` 刻意不推进 version，"version+1 才发"
+      会**静默丢掉整个失败通知**。
+    - payload 仅 `{version,status}`；**先 commit 后 publish**；发布失败**绝不回滚**。
+      **非 durable、不回放**，不改变 `after_segment_seq` 协议，无 Last-Event-ID。
+    - **稳定 id 必须带 status**：`state:<mid>:<version>:<status>` ——
+      `ACTIVE@4` 与 `FAILED@4` 是两个不同的 durable 状态、同一个 version，
+      仅凭 version 无法区分，客户端去重会误判为重复而丢弃。
+      **不引入新的持久化事件序号**。
+  - **✅ 修复真实缺陷（SQLAlchemy identity-map aliasing）**：`db.get()` 每次返回
+    **同一个** identity-mapped 实例，而 `repository.upsert` **原地修改**该实例 ——
+    于是「写后读 `row.status`」拿到的是**新值**，发布判据恒为"没变"，
+    **每一次状态变更都会被静默抑制**（`ACTIVE → FROZEN` 已实测复现）。
+    修复：在写**之前**把 `previous_status` / `previous_version` 读进**普通局部变量**；
+    `_current_state_identity()` 返回**普通元组而非 ORM 行**（docstring 记录此陷阱）。
+    **已做 mutation 验证**：改回别名读 → `test_freeze_is_announced` 立即失败。
+  - **SSE 白名单三处同步 + 编译期守卫（§4 硬要求）**：后端具名帧**不触发
+    `onmessage`**，遗漏订阅是**完全静默**的失效。三处 = 后端 `SSE_EVENT_TYPES` /
+    `types/sse.ts` 的 `SseEventType` / `utils/sse.ts` 的白名单。新增
+    `Exclude<SseEventType, typeof SSE_EVENT_TYPES[number]> extends never` 穷尽性守卫
+    （`satisfies` 只能查多余，查不出**遗漏**——而遗漏恰是静默方向）。
+    **已做 mutation 验证**：删白名单成员 → `npm run typecheck` 立即报错。
+  - **前端数据架构（§7/§8）**：`useMeetingIntelligence(meetingId, enabled)` ——
+    初始 GET / 两道守卫 / `refreshState()`；**状态留在 hook 内，不扩 Zustand 全局
+    store**。`useMeetingStream(..., onStateInvalidated)` 收到失效通知 → `refreshState()`
+    （回调经 `Ref` 读取，故意不进 effect 依赖，否则每次 render 换引用都会重连 SSE）。
+    - **两道守卫缺一不可**：*request sequence*（乱序旧响应不覆盖新响应）+
+      *version*（`incoming.version >= current.version` 才落地）。必须 `>=` 而非 `>`：
+      FAILED 不推进 version，`>` 会丢掉同 version 下的 `ACTIVE → FAILED`。
+      **初始基线 `-1`**，保证首个 `version=0 / EMPTY` 正常进入。
+  - **展示（§9~§12）**：面板挂既有 `room__rail`（轨首），**不重构 MeetingRoom**。
+    四态 Loading / Empty / Error / Normal；**FAILED 保留 last-good 内容** + 轻量提示
+    （**会议 `COMPLETED` + State `FAILED` 是合法组合**）。
+    `owner` / `deadline` = null → 「待确认」，**纯展示层 fallback，绝不写回后端**。
+    `source_segment_seqs` 保留在类型与 API，**点击溯源属 UI-INTEL-2**。
+    视觉沿用既有体系（无新 UI 库 / 动画库 / 渐变 / 发光 / emoji）：
+    `.intel-*` CSS + 宽屏 `--rail-width: 340px` + `<900px` 单列面板独占整行。
+  - 测试：`backend/tests/test_meeting_state_api.py` **31/31 PASS**；
+    `pytest` **171/171 PASS**；回归全绿（Step5 21 + Step6 21 + Step7A 28 +
+    Step7B 36 + list 17 + ASR-A 22）；前端 typecheck + build PASS。
+  - **E2E**：`scripts/e2e_ui_intel_browser.py` 真实 Chrome CDP **17/17 PASS** ——
+    含**只有浏览器能证明**的断言：`meeting.state.updated` **不刷新**页面即更新面板
+    （具名帧真实到达）、`ACTIVE→FAILED` **同 version** 转换、FAILED 保留 last-good、
+    无内部细节泄漏、Agent FAILED ≠ Transcript FAILED。
+    **已做 mutation 验证**：删掉前端失效分派 → UI-I06/UI-I14 失败而 UI-I11（刷新恢复）
+    仍通过，证明测的是**实时失效**而非恢复。
+  - **零改动**：Meeting 四态机 / Freeze 语义 / Transcript 契约 / ASR 契约 /
+    LLM Provider / **DB schema（无 migration，`meeting_state` 表结构不变）** /
+    AGENT-1 核心 schema / AGENT-2。
+  - **本 Step 未 push**（按用户要求：可 commit 到 `dafenqi`，等待确认后再 push）。
+- **Step UI-INTEL-2A 已完成**：Transcript Evidence Trace（会中证据溯源）。
+  - 会议进行中的 `AI 会议理解`面板条目 →「查看原文」→ 定位持久化 FINAL 行 +
+    高亮；复用既有 `/events` 连接，无新路由、无新数据域。
+  - `utils/evidence.ts`（唯一规范化实现：正整数 / 去重 / 升序 / 上限 50）+
+    `useTranscriptEvidenceNavigation`（唯一 DOM 定位实现：`data-segment-seq`）+
+    `EvidenceTraceButton`（无 evidence 则**不渲染**，不给 disabled 假按钮）。
+  - **定位依据只有 `data-segment-seq`**（`UNIQUE(meeting_id, segment_seq)`）；
+    禁止数组 index / 文本内容 / utterance_id。
+  - **§10 核心**：跳转后新 FINAL **不得把用户拽回底部**。与 `useAutoScroll`
+    的协作是**可选的**：`pauseAutoFollow()` 只覆盖「跳转不产生 scroll 事件」
+    这一种情况（其余情况 `onScroll` 会按几何重新推导跟随态）。
+    **mutation 证明**：删掉 `pauseAutoFollow()` 调用，2A-15 仍然通过 —— 因此
+    新增严格用例 2A-24/2A-25（跳转不滚动 + 随后到 FINAL 不被追），只有显式
+    暂停才能覆盖。冗余关系已在 hook 与测试双向注释。
+  - 降级：部分 seq 缺失 → 忽略缺失项、有则高亮；**全部**缺失 → 轻提示
+    「原始记录暂不可定位」，不弹窗、不抛错。
+  - 测试：`scripts/e2e_ui_intel_2a_browser.py` 真实 Chrome CDP **31/31 PASS**；
+    后端回归全绿；前端 typecheck + build PASS。**Backend 零改动**。
+- **Step UI-INTEL-2B 已完成 ✅**：Final Summary → Transcript Evidence Trace（会后证据溯源）。
+  - **定位**：把 AGENT-2 已经产生的 Final Summary evidence **暴露**出来并可点击
+    溯源。**不重新生成 evidence，不修模型引用质量，不新增数据域**（§12）。
+  - **后端 B1（唯一实质变更）**：`get_summary` 在既有 summary row 上做**公开读投影**
+    → `SummaryOut.summary_evidence`（可选）。
+    `final_summary_schemas.project_summary_evidence(raw_model_output)` 解析
+    `raw_model_output` → 识别合法 `FinalMeetingSummary` → 输出
+    `SummaryEvidence{decisions, action_items, risks, open_questions}`，
+    每条保留 `source_segment_seqs` 与业务字段（decision: text；action:
+    task/owner/deadline；risk/open_question: text）。
+    **无新 DB 列、无 migration、不改 Summary 持久化结构。**
+  - **V2 判定方式（唯一依据）**：`FinalMeetingSummary` 的 **`extra="forbid"`**。
+    legacy payload 必带 `conclusions`（V2 未声明该字段）→ **校验失败**，而不是
+    "成功解析出空列表"。没有这条 config 两种形状无法区分（共享
+    `overview`/`key_topics`/`open_questions`），每个 legacy 摘要都会静默宣称
+    "结构化 evidence 为空"。**已做 mutation 验证**。
+  - **legacy / fallback 降级（§3）**：非可验证 V2 → `summary_evidence = null`。
+    **不猜、不从 legacy 字符串反推、不关键词匹配、不调 LLM 补、不抛 500**。
+    投影失败**只能降级这一个可选字段**，绝不能把可读摘要变成 500。
+  - **修复读路径严于写路径（真实缺陷）**：`parse_v2` 走 `_prune_code_fence`
+    而投影直接 `json.loads` → 带 ``` 围栏的真实 DeepSeek 响应**写得进、读不出**，
+    evidence 永久为 null（测试全绿、线上失效）。修复：`prune_code_fence` 上移到
+    `final_summary_schemas.py`，读写共用同一实现（`final_summary_service` 以
+    别名引用，避免漂移）。
+  - **§13 doc drift 修复**：`final_summary_schemas.py` docstring 曾描述一个
+    **并不存在**的 sanitize 流程。已改为与实现一致（引用不存在的 seq
+    **不修复、不丢弃**，是否可解析由读侧决定）。**未新增未经设计的 sanitize**。
+  - **前端（§5/§6/§7）**：
+    - 复用 UI-INTEL-2A 的 `utils/evidence.ts` / `useTranscriptEvidenceNavigation` /
+      `EvidenceTraceButton` / `.transcript-segment--evidence` / `data-segment-seq`
+      —— **没有第二套 querySelector / scrollIntoView / highlight timer**。
+    - **不跳回 MeetingRoom、不新增 route query**：Result 页本就有「会议纪要 /
+      会议内容」两个 Tab，点击 → 切到「会议内容」→ 定位 + 高亮。
+    - **不接 auto-follow**：会后转写是静态归档，无新 FINAL 抢滚动；
+      `pauseAutoFollow` / `jumpToBottom` **没有被带进 Result 页**（§7）。
+    - 两条渲染路径：`summary_evidence` 非 null → 读**结构化字段**渲染（文本由
+      字段算出，不做字符串匹配）；null → 原样扁平渲染，**无任何入口**。
+  - **★ 修复真实缺陷：异步 Tab 假「不可定位」**。`setActiveTab` 只改我们自己的
+    state；AntD 用它**内部** activeKey 决定渲染哪个面板，并在**更晚的一次 commit**
+    才同步。实测（本 Step E2E）：仅依赖 `activeTab` 的 `useEffect` **不够** ——
+    effect 跑时 ref 仍是 null，而 `contentSettled` 早已 true → hook 判定
+    「已定稿但容器不存在」→ **每次点击都弹假的「原始记录暂不可定位」**。
+    修复：把容器挂载提升为 state（callback ref），effect 依赖
+    `[activeTab, transcriptNode, traceEvidence]`，节点出现的那一刻才定位；
+    已在 `handleTraceEvidence` 中保留「已在该 Tab 且容器已挂载 → 直接定位」分支
+    （callback ref 只在挂载时触发，覆盖不到这种可见性变化）。
+  - **§8 边界**：`[4,5,999]` 中 4、5 存在 → 定位成功并同时高亮，999 **静默忽略**
+    （**不得**报「暂不可定位」）；**全部**不存在 → 轻提示，页面不崩。
+    后端**原样透传** seqs（不去重/不排序/不过滤非法值）—— 规范化只有前端一份。
+  - **§9 展示**：仅「查看原文」轻量入口，**不显示 `source_segment_seqs` /
+    Evidence ID**，**不宣称「AI 已验证」**。
+  - 测试：`backend/tests/test_summary_evidence_api.py` **20/20 PASS**
+    （T01~T11 投影单测：四种类型 / null owner·deadline 保持 null / seqs 原样透传
+    `[5,2,5,999,2]` 不变 / legacy 拒绝 / 围栏 V2 接受 / malformed·非对象·None·
+    空·FAILED reason 全 None / 空会议 precomputed vs 合法空 V2 / `extra="forbid"`
+    守卫；T12~T18 HTTP 面：12 键集合、404、无内部泄漏；T19~T20 走**真实链路**
+    断言 seqs 来自 AGENT-1 而非手写 fixture）。
+    `pytest` **191/191 PASS**（三次连跑一致）。
+  - **Browser E2E**：`scripts/e2e_ui_intel_2b_browser.py` 真实 Chrome CDP
+    **37/37 PASS**，覆盖用户指定的 6 个 Case：
+    - Case 1 Decision →「查看原文」→ 自动切「会议内容」Tab → 对应行高亮
+      （并断言**不是**假的「暂不可定位」）；
+    - Case 2 Action Item `[4,5]` → 4、5 同时高亮；
+    - Case 3 部分 dangling `[4,5,999]` → 4、5 正常工作、note 为空；
+    - Case 4 全部 evidence 不存在 →「原始记录暂不可定位」、无高亮、页面不崩、
+      无内部细节泄漏、提示会自行消失、之后仍可正常溯源；
+    - Case 5 legacy / fallback → `summary_evidence=null` → **0 个假按钮**，
+      且旧扁平字段内容照常展示（走真实 §9 降级：empty state → 全量 transcript 路径）；
+    - Case 6 前端源码**不读取 / 不 JSON.parse `raw_model_output`**（源码级断言）。
+    另含：Tab 面即导航面（无新 route/query）、重复点击可重触发、高亮自动过期、
+    F5 后从 durable API 恢复、Result 页**无** auto-follow 控件、Transcript 未被改动。
+  - **Dev-only 启动器**：`scripts/e2e_ui_intel_stack.sh`（`up|down` + `intel1|intel2a|intel2b`），
+    三套 E2E 只差端口与 harness 模块；端口占用是唯一可靠的清理信号
+    （Windows 下残留 Chrome 会占住端口 + profile 锁，导致下次 `up` 以
+    "Lock file can not be created" 失败）。intel1 额外需要
+    `MEETING_AGENT_MAX_BATCH_CHARS=2000`（否则 UI-I13/14 会以 state 仍 ACTIVE 失败）。
+  - 回归：pytest 191/191；legacy suites 全绿（Step5 21 + Step6 21 + Step7A 28 +
+    Step7B 36 + list 17 + ASR-A 22）；**UI-INTEL-1 browser E2E 17/17**；
+    **UI-INTEL-2A browser E2E 31/31**；**UI-INTEL-2B 37/37**；
+    前端 typecheck + build PASS。
+  - **Known limitations**：① 4 个 evidence 入口共用「主要结论 / 未决问题」两节
+    （后端 `to_legacy_schema` 本就压平到此），不新开四节；② 空会议 precomputed
+    摘要是 legacy payload → evidence 为 `null`（诚实回答：无可溯源内容），而
+    "真的什么都没决定的 V2 会议" 是可到达的**非 null 空** `SummaryEvidence`；
+    ③ 后端不改写 seqs，悬空引用仍原样出现（读侧解释）；④ multi-worker 不安全
+    （沿用进程内锁，与 Step 5/6/AGENT-1 同一限制）。
+  - **零改动**：Meeting 四态机 / Freeze 语义 / Transcript 契约 / ASR 契约 /
+    LLM Provider / DeepSeek / **DB schema（无 migration）** / AGENT-1 /
+    AGENT-2 生成行为 / evidence 语义正确性。
+  - **本 Step 未 push**（按用户要求：可 commit 到 `dafenqi`，等待确认后再 push）。

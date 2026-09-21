@@ -14,12 +14,15 @@ import {
 } from '@ant-design/icons'
 import { EmptyPlaceholder } from '@/components/EmptyPlaceholder'
 import { InfoRow } from '@/components/InfoRow'
+import { MeetingIntelligencePanel } from '@/components/MeetingIntelligencePanel'
 import { MeetingStatusTag } from '@/components/MeetingStatusTag'
 import { useMeetingStore } from '@/stores/meetingStore'
 import { useMeetingLoad } from '@/hooks/useMeetingLoad'
+import { useMeetingIntelligence } from '@/hooks/useMeetingIntelligence'
 import { useTranscriptSnapshot } from '@/hooks/useTranscriptSnapshot'
 import { useMeetingStream } from '@/hooks/useMeetingStream'
 import { useAutoScroll } from '@/hooks/useAutoScroll'
+import { useTranscriptEvidenceNavigation } from '@/hooks/useTranscriptEvidenceNavigation'
 import { formatDateTime, formatDuration, elapsedMs } from '@/utils/time'
 import { startMeeting, finishMeeting, normalizeApiError } from '@/api'
 import type { Meeting } from '@/types/meeting'
@@ -210,7 +213,13 @@ function TranscriptBody({
     <div className="transcript-surface transcript-surface--top">
       <ol className="transcript-segments" ref={listRef}>
         {segments.map((seg) => (
-          <li key={seg.segment_seq} className="transcript-segment">
+          <li
+            key={seg.segment_seq}
+            className="transcript-segment"
+            /* UI-INTEL-2A：evidence 定位的**唯一**稳定标识（segment_seq 是
+               DB UNIQUE 业务键）。禁止用 index / 文本 / utterance_id 定位。 */
+            data-segment-seq={seg.segment_seq}
+          >
             <span className="transcript-segment__speaker">{seg.speaker_id}</span>
             <span className="transcript-segment__text">{seg.text}</span>
             {timingText(seg.start_ms, seg.end_ms) ? (
@@ -299,12 +308,23 @@ export function MeetingRoomPage() {
     ? finalSegments[finalSegments.length - 1].segment_seq
     : 0
 
+  // UI-INTEL-1：Meeting State（AI 工作记忆）。独立数据域、独立错误域 ——
+  // 数据留在 hook 内（不进全局 store），失败只降级本面板，绝不影响转写 / 生命周期。
+  // 不连流时（CREATED / COMPLETED）不拉取：CREATED 还没有内容，COMPLETED 属归档态。
+  const intelligence = useMeetingIntelligence(
+    meetingId,
+    !!meeting && meeting.status !== 'CREATED',
+  )
+
   // 8B-4：SSE 流（含 Snapshot-first 连接、断线恢复、meeting.status→GET Meeting）
+  // UI-INTEL-1：**复用同一条 /events 连接**承接 meeting.state.updated 失效通知，
+  // 收到后 refreshState() 重新 GET /state —— 不新增第二条 EventSource。
   useMeetingStream({
     meetingId,
     status: meeting?.status,
     snapshotReady,
     maxSegmentSeq,
+    onStateInvalidated: intelligence.refreshState,
   })
 
   // 8B-4：自动滚动（跟随底部 / 向上查历史暂停 / 回到底部 FAB）
@@ -314,7 +334,31 @@ export function MeetingRoomPage() {
   const contentKey = `${finalSegments.length}:${partialList
     .map((p) => `${p.utterance_id}=${p.text}`)
     .join('|')}`
-  const { showJumpButton, jumpToBottom } = useAutoScroll(segmentsRef, contentKey)
+  const { showJumpButton, jumpToBottom, pauseAutoFollow } = useAutoScroll(
+    segmentsRef,
+    contentKey,
+  )
+
+  // UI-INTEL-2A：evidence 定位（「查看原文」→ 滚动 + 短暂高亮）。
+  // contentSettled = Snapshot 加载已结束（成功或失败）—— 用于区分「还没等到」
+  // 与「压根没有转写」，避免空会议时提示永久停在「正在加载原始记录…」。
+  const evidence = useTranscriptEvidenceNavigation(
+    segmentsRef,
+    !transcriptLoading,
+  )
+
+  /**
+   * 点击「查看原文」：**先暂停跟随，再定位**（§10 冻结顺序）。
+   *
+   * 顺序不能倒：先滚再 pause 的话，smooth 滚动途中若恰好有新 FINAL 到达，
+   * auto-scroll 仍处于跟随态，会把用户直接拽回底部 —— 表现就是「点了没反应」。
+   * 先 pause 则新内容进列表但不抢滚动，用户停在证据处；只有显式点「回到最新」
+   * 才恢复跟随。
+   */
+  const handleTraceEvidence = (sourceSegmentSeqs: number[]) => {
+    pauseAutoFollow()
+    evidence.traceEvidence(sourceSegmentSeqs)
+  }
 
   // ---- 生命周期动作（Step 8B-2）：start / finish，仅经 API layer ----
   const [startLoading, setStartLoading] = useState(false)
@@ -549,6 +593,17 @@ export function MeetingRoomPage() {
             </div>
           ) : null}
 
+          {/* UI-INTEL-2A：evidence 定位提示（只读、轻量，不阻塞转写）。
+              加载中 → 「正在加载原始记录…」（Snapshot 到位后自动补做定位，不再发请求）；
+              找不到 → 「原始记录暂不可定位」（不弹窗、不影响其它功能）。 */}
+          {evidence.outcome !== 'idle' ? (
+            <div className="transcript-note" role="status" aria-live="polite">
+              {evidence.outcome === 'loading'
+                ? '正在加载原始记录…'
+                : '原始记录暂不可定位'}
+            </div>
+          ) : null}
+
           <TranscriptBody
             status={meeting.status}
             segments={finalSegments}
@@ -560,7 +615,9 @@ export function MeetingRoomPage() {
             listRef={segmentsRef}
           />
 
-          {/* 8B-4 FAB：悬浮于转写面板右下，出现时轻升起；hover 轻抬、点击微压 */}
+          {/* 8B-4 FAB：悬浮于转写面板右下，出现时轻升起；hover 轻抬、点击微压。
+              UI-INTEL-2A：evidence 跳转后此按钮即「回到最新」的唯一恢复入口 ——
+              文案不依赖「有新内容」，因为跳转本身也会让用户离开底部。 */}
           {showJumpButton ? (
             <Button
               className="transcript-jump"
@@ -568,12 +625,22 @@ export function MeetingRoomPage() {
               icon={<ArrowDownOutlined />}
               onClick={jumpToBottom}
             >
-              有新内容 · 回到底部
+              回到最新
             </Button>
           ) : null}
         </section>
 
         <aside className="room__rail">
+          {/* UI-INTEL-1：AI 会议理解（会议进行中的结构化工作记忆）。
+              放在轨首 —— 这是本 Step 新增的核心信息，会议状态等元信息仍是次要。 */}
+          <MeetingIntelligencePanel
+            state={intelligence.state}
+            loading={intelligence.loading}
+            error={intelligence.error}
+            onRefresh={intelligence.refreshState}
+            onTraceEvidence={handleTraceEvidence}
+          />
+
           <div className="rail-section">
             <div className="rail-title">会议状态</div>
             <InfoRow label="会议状态" value={<MeetingStatusTag status={meeting.status} />} />
