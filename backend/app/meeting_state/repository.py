@@ -13,6 +13,7 @@ from sqlalchemy.orm import Session
 
 from app.meeting_state.model import MeetingState
 from app.meeting_state.schemas import MeetingStateContent
+from app.meeting_state import snapshot_repository
 
 
 class MeetingStateCorruptError(Exception):
@@ -65,6 +66,7 @@ def upsert(
     status: str,
     model_name: str | None = None,
     last_error: str | None = None,
+    record_health_success: bool = True,
 ) -> MeetingState:
     """Replace the meeting's current state with `content` at `version`.
 
@@ -83,6 +85,8 @@ def upsert(
     row.status = status
     row.model_name = model_name
     row.last_error = last_error
+    if record_health_success:
+        snapshot_repository.record_success(db, meeting_id)
     db.commit()
     db.refresh(row)
     return row
@@ -98,18 +102,23 @@ def mark_failed(
     """Record a failed update WITHOUT touching the state payload or the cursor.
 
     This is the "do not pollute the existing state" rule made structural: only
-    `status` and `last_error` move, so a failed LLM call can never damage what
-    we already know. `version` is intentionally NOT incremented — it counts
-    successful updates.
+    `status` and diagnostics move, so a failed LLM call can never damage what
+    we already know. Last-good content becomes STALE; a first-pass failure is
+    FAILED. `version` is not incremented because it counts successful updates.
     """
     row = get(db, meeting_id)
     if row is None:
         row = MeetingState(meeting_id=meeting_id)
         db.add(row)
-    row.status = "FAILED"
+    # A transient realtime failure must not invalidate a previously successful
+    # summary. STALE means "last-good remains visible while pending transcript
+    # waits for a later pass". FAILED is reserved for meetings with no usable
+    # state yet (or read-path corruption handled elsewhere).
+    row.status = "STALE" if (row.version or 0) > 0 and row.state_json else "FAILED"
     row.last_error = reason[:1000]
     if model_name is not None:
         row.model_name = model_name
+    snapshot_repository.record_failure(db, meeting_id, reason)
     db.commit()
     db.refresh(row)
     return row

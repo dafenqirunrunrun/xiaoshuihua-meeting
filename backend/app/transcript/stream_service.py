@@ -247,6 +247,11 @@ def handle_stream_end(
         # This is TEMPORARY-STATE cleanup only, NOT the source of truth for
         # finalization readiness (that is the committed transcript_stream row).
         live_utterance_cache.clear_meeting(meeting_id)
+        # Archive the last-good live view without asking the realtime LLM to
+        # catch up. Final Summary consumes the frozen transcript independently.
+        from app.meeting_state.service import freeze_state
+
+        freeze_state(db, meeting_id)
         return meeting, stream_row, True, True
 
 

@@ -16,10 +16,9 @@ logger = logging.getLogger(__name__)
 class MeetingStateScheduler:
     """Run at most one worker per meeting and merge repeated FINAL signals.
 
-    Signals are collected until a short quiet window, capped by a maximum wait.
-    The resulting run force-flushes the pending tail, so a short meeting becomes
-    visible while recording instead of waiting for the normal batch threshold or
-    Finish. Signals received while the model is running form one follow-up window.
+    Signals are collected until the segment, silence or interval policy is met.
+    The resulting run consumes one captured high-watermark in one bounded call.
+    Signals received while the model is running form one follow-up window.
     """
 
     def __init__(
@@ -27,11 +26,24 @@ class MeetingStateScheduler:
         *,
         runner: Callable[[str], None] | None = None,
         max_workers: int = 2,
-        debounce_seconds: float = 0.0,
+        debounce_seconds: float | None = None,
         max_wait_seconds: float = 0.0,
+        min_signals: int | None = None,
+        target_interval_seconds: float = 0.0,
+        silence_seconds: float | None = None,
     ) -> None:
         self._runner = runner
-        self._debounce_seconds = max(0.0, debounce_seconds)
+        # `debounce_seconds` remains as a compatibility alias for focused unit
+        # tests and internal callers. Product configuration uses silence_seconds.
+        quiet = silence_seconds if silence_seconds is not None else debounce_seconds
+        self._silence_seconds = max(0.0, quiet or 0.0)
+        self._min_signals = max(
+            1,
+            min_signals
+            if min_signals is not None
+            else (2**31 - 1 if debounce_seconds is not None else 1),
+        )
+        self._target_interval_seconds = max(0.0, target_interval_seconds)
         self._max_wait_seconds = max(0.0, max_wait_seconds)
         self._executor = ThreadPoolExecutor(
             max_workers=max_workers,
@@ -41,6 +53,7 @@ class MeetingStateScheduler:
         self._pending: set[str] = set()
         self._window_started_at: dict[str, float] = {}
         self._last_signal_at: dict[str, float] = {}
+        self._signal_count: dict[str, int] = {}
         self._lock = RLock()
         self._idle = Condition(self._lock)
 
@@ -52,6 +65,7 @@ class MeetingStateScheduler:
                 self._window_started_at[meeting_id] = now
             self._pending.add(meeting_id)
             self._last_signal_at[meeting_id] = now
+            self._signal_count[meeting_id] = self._signal_count.get(meeting_id, 0) + 1
             self._idle.notify_all()
             if meeting_id in self._running:
                 return False
@@ -65,8 +79,8 @@ class MeetingStateScheduler:
             return
         from app.meeting_state.service import run_agent_background
 
-        # The debounce window is the batching boundary for live updates. Force
-        # the below-threshold tail so state is refreshed during the recording.
+        # The scheduler has already decided this high-watermark is ready. The
+        # service folds the captured pending range in one bounded LLM call.
         run_agent_background(meeting_id, force_flush=True)
 
     def _wait_for_window(self, meeting_id: str) -> bool:
@@ -74,19 +88,28 @@ class MeetingStateScheduler:
         with self._idle:
             while meeting_id in self._pending:
                 now = time.monotonic()
-                quiet_deadline = (
-                    self._last_signal_at[meeting_id] + self._debounce_seconds
-                )
-                max_deadline = (
-                    self._window_started_at[meeting_id] + self._max_wait_seconds
-                    if self._max_wait_seconds > 0
-                    else quiet_deadline
-                )
-                remaining = min(quiet_deadline, max_deadline) - now
+                if self._signal_count.get(meeting_id, 0) >= self._min_signals:
+                    remaining = 0.0
+                else:
+                    quiet_deadline = (
+                        self._last_signal_at[meeting_id] + self._silence_seconds
+                    )
+                    deadlines = [quiet_deadline]
+                    if self._target_interval_seconds > 0:
+                        deadlines.append(
+                            self._window_started_at[meeting_id]
+                            + self._target_interval_seconds
+                        )
+                    if self._max_wait_seconds > 0:
+                        deadlines.append(
+                            self._window_started_at[meeting_id] + self._max_wait_seconds
+                        )
+                    remaining = min(deadlines) - now
                 if remaining <= 0:
                     self._pending.discard(meeting_id)
                     self._window_started_at.pop(meeting_id, None)
                     self._last_signal_at.pop(meeting_id, None)
+                    self._signal_count.pop(meeting_id, None)
                     return True
                 self._idle.wait(timeout=remaining)
             return False
@@ -129,6 +152,28 @@ class MeetingStateScheduler:
                 self._idle.wait(timeout=remaining)
         return True
 
+    def cancel_pending(self, meeting_id: str) -> None:
+        """Drop a not-yet-started realtime pass when a meeting is ending.
+
+        An already-running provider call is not forcibly interrupted; it may
+        persist its last-good snapshot, but no follow-up realtime run is kept.
+        """
+        with self._idle:
+            self._pending.discard(meeting_id)
+            self._window_started_at.pop(meeting_id, None)
+            self._last_signal_at.pop(meeting_id, None)
+            self._signal_count.pop(meeting_id, None)
+            self._idle.notify_all()
+
+    def cancel_all_pending(self) -> None:
+        """Cancel every waiting window during process shutdown/test cleanup."""
+        with self._idle:
+            self._pending.clear()
+            self._window_started_at.clear()
+            self._last_signal_at.clear()
+            self._signal_count.clear()
+            self._idle.notify_all()
+
     def _is_busy(self, meeting_id: str | None) -> bool:
         if meeting_id is None:
             return bool(self._running)
@@ -136,7 +181,9 @@ class MeetingStateScheduler:
 
 
 meeting_state_scheduler = MeetingStateScheduler(
-    debounce_seconds=settings.meeting_agent_realtime_debounce_seconds,
+    min_signals=settings.meeting_agent_realtime_min_segments,
+    target_interval_seconds=settings.meeting_agent_realtime_target_interval_seconds,
+    silence_seconds=settings.meeting_agent_realtime_silence_seconds,
     max_wait_seconds=settings.meeting_agent_realtime_max_wait_seconds,
 )
 

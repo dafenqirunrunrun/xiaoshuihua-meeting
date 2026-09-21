@@ -108,14 +108,14 @@ es.addEventListener('<event_type>', handler)
 | 转换 | version | 是否发布 |
 | --- | --- | --- |
 | `ACTIVE vN → ACTIVE vN+1` | +1 | ✅ |
-| `EMPTY/ACTIVE → FAILED` | **不变** | ✅ |
+| `EMPTY → FAILED` / `ACTIVE → STALE` | **不变** | ✅ |
 | `FAILED → ACTIVE` | +1 | ✅ |
 | `ACTIVE → FROZEN` | 不变或 +1 | ✅ |
 | `FAILED → FAILED`（重复失败） | 不变 | ❌ 抑制（不刷屏） |
 | `NO_WORK`（无新 FINAL） | 不变 | ❌ 抑制 |
 
 **为什么 id 里必须带 status**：`mark_failed` **刻意不推进 version**
-（失败不移动游标、不移动版本），所以 `ACTIVE@4` 与 `FAILED@4` 是**两个不同的
+（失败不移动游标、不移动版本），所以 `ACTIVE@4` 与 `STALE@4` 是**两个不同的
 durable 状态、同一个 version**。仅用 `state:<mid>:<version>` 无法区分它们，
 会在客户端去重时把「转 FAILED」误判为重复事件而**静默丢弃**。
 `state:<mid>:<version>:<status.lower()>` 让每次不同的变更都可区分，

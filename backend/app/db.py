@@ -46,6 +46,10 @@ def create_all() -> None:
     from app.agent.summary_model import MeetingSummary  # noqa: F401
     from app.meeting.meeting_model import Meeting  # noqa: F401
     from app.meeting_state.model import MeetingState  # noqa: F401
+    from app.meeting_state.snapshot_model import (  # noqa: F401
+        MeetingMemorySnapshot,
+        MeetingStateHealth,
+    )
     from app.transcript.segment_model import TranscriptSegment  # noqa: F401
     from app.transcript.stream_model import TranscriptStream  # noqa: F401
 

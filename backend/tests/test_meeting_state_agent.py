@@ -76,6 +76,7 @@ class ScriptedProvider:
 
         return json.dumps(
             {
+                "live_summary": f"已处理到片段 {seqs[-1]}，会议讨论正在持续推进。" if seqs else None,
                 "current_topic": f"topic-{seqs[-1]}" if seqs else None,
                 "topics": [{"title": f"议题{seqs[0]}", "summary": "s",
                             "source_segment_seqs": list(seqs)}] if seqs else [],
@@ -105,7 +106,7 @@ def _start_meeting(client, title: str = "上线安排") -> str:
 
 def _final(client, meeting_id: str, seq: int, text: str, speaker: str = "speaker_0"):
     """Ingest one FINAL through the INTERNAL ingress (seq is producer-owned here)."""
-    return client.post(
+    response = client.post(
         f"/api/internal/meetings/{meeting_id}/transcript-events",
         json={
             "event_id": f"evt_{meeting_id}_{seq}",
@@ -120,6 +121,10 @@ def _final(client, meeting_id: str, seq: int, text: str, speaker: str = "speaker
             "emitted_at": 1_789_000_000_000 + seq,
         },
     )
+    from app.meeting_state.scheduler import meeting_state_scheduler
+
+    assert meeting_state_scheduler.wait_for_idle(meeting_id, timeout_seconds=2.0)
+    return response
 
 
 def _state(client, meeting_id: str) -> dict:
@@ -149,7 +154,7 @@ def agent(monkeypatch) -> ScriptedProvider:
     `agent.raw` / `agent.error` mid-test to script a failure on the next call.
     """
     provider = ScriptedProvider()
-    monkeypatch.setattr("app.agent.llm.factory.get_provider", lambda: provider)
+    monkeypatch.setattr("app.agent.llm.factory.get_provider", lambda **_policy: provider)
     return provider
 
 
@@ -280,6 +285,7 @@ class TestIncremental:
         from app.meeting_state import service as svc
 
         previous = MeetingStateContent(
+            live_summary="old live summary",
             current_topic="old topic",
             decisions=[{"text": "old", "source_segment_seqs": [1]}],
             open_questions=[{"text": "resolved", "source_segment_seqs": [1]}],
@@ -288,9 +294,11 @@ class TestIncremental:
         preserved = svc.merge_content(previous, omitted)
         assert [d.text for d in preserved.decisions] == ["old"]
         assert [q.text for q in preserved.open_questions] == ["resolved"]
+        assert preserved.live_summary == "old live summary"
         assert preserved.current_topic == "old topic"
 
         explicit_empty = MeetingStateUpdate(
+            live_summary=None,
             current_topic=None,
             decisions=[],
             open_questions=[],
@@ -298,6 +306,7 @@ class TestIncremental:
         cleared = svc.merge_content(previous, explicit_empty)
         assert cleared.decisions == []
         assert cleared.open_questions == []
+        assert cleared.live_summary is None
         assert cleared.current_topic is None
 
         replacing = MeetingStateContent(
@@ -371,8 +380,8 @@ class TestIdempotency:
 
 
 class TestForcedFlush:
-    def test_finish_flushes_a_sub_threshold_buffer(self, client, agent, monkeypatch):
-        """§11: the user ends the meeting with segments still buffered."""
+    def test_finish_does_not_flush_a_sub_threshold_buffer(self, client, agent, monkeypatch):
+        """Finalization must not run or wait for realtime understanding."""
         monkeypatch.setattr("app.config.settings.meeting_agent_batch_max_segments", 50)
         provider = agent
         mid = _start_meeting(client)
@@ -383,19 +392,16 @@ class TestForcedFlush:
 
         assert client.post(f"/api/meetings/{mid}/finish").status_code == 200
 
-        assert len(provider.calls) == 1, "finish must flush the remaining buffer"
-        assert provider.seqs_seen[0] == [1, 2]
+        assert provider.calls == []
         body = _state(client, mid)
-        assert body["last_processed_segment_seq"] == 2
-        assert body["version"] == 1
+        assert body["last_processed_segment_seq"] == 0
+        assert body["version"] == 0
 
     def test_forced_flush_drains_a_tail_larger_than_one_batch(self, client, agent, monkeypatch):
-        """A forced flush lifts the batch-COUNT cap, it does not merge everything
-        into one oversized prompt (which the size guard would then reject)."""
+        """A ready high-watermark is coalesced into one bounded provider call."""
         from app.db import SessionLocal
 
         monkeypatch.setattr("app.config.settings.meeting_agent_batch_max_segments", 2)
-        monkeypatch.setattr("app.config.settings.meeting_agent_max_batches_per_run", 2)
         provider = agent
 
         # Buffer the whole meeting with the agent disabled: otherwise each FINAL
@@ -408,19 +414,19 @@ class TestForcedFlush:
         assert provider.calls == []
         monkeypatch.setattr("app.config.settings.meeting_agent_enabled", True)
 
-        # A normal run stops at the batch cap, leaving the tail pending.
+        # One run consumes the captured range in one call.
         db = SessionLocal()
         try:
             report = state_service.process_pending(db, mid, provider=provider)
         finally:
             db.close()
-        assert report["outcome"] == state_service.OUTCOME_LIMIT_REACHED
-        assert report["remaining_segment_seqs"] == [5, 6, 7, 8]
-        assert provider.seqs_seen == [[1, 2], [3, 4]]
+        assert report["outcome"] == state_service.OUTCOME_OK
+        assert report["remaining_segment_seqs"] == []
+        assert provider.seqs_seen == [[1, 2, 3, 4, 5, 6, 7, 8]]
 
-        # finish -> forced flush drains the remainder in normal-sized batches.
+        # Finish does not create any additional realtime calls.
         assert client.post(f"/api/meetings/{mid}/finish").status_code == 200
-        assert provider.seqs_seen == [[1, 2], [3, 4], [5, 6], [7, 8]]
+        assert provider.seqs_seen == [[1, 2, 3, 4, 5, 6, 7, 8]]
         assert _state(client, mid)["last_processed_segment_seq"] == 8
 
     def test_finish_survives_the_agent_being_disabled(self, client, monkeypatch):
@@ -431,6 +437,37 @@ class TestForcedFlush:
 
 
 class TestFailurePolicy:
+    def test_success_snapshot_and_failure_health_are_durable(
+        self, client, agent, monkeypatch
+    ):
+        from app.db import SessionLocal
+        from app.meeting_state import snapshot_repository
+        from app.meeting_state.snapshot_model import MeetingStateHealth
+
+        monkeypatch.setattr("app.config.settings.meeting_agent_batch_max_segments", 2)
+        mid = _start_meeting(client)
+        for seq in (1, 2):
+            _final(client, mid, seq, f"line {seq}")
+
+        with SessionLocal() as db:
+            snapshots = snapshot_repository.list_for_meeting(db, mid)
+            assert [(s.from_segment_seq, s.to_segment_seq) for s in snapshots] == [(1, 2)]
+            health = db.get(MeetingStateHealth, mid)
+            assert health is not None
+            assert health.last_success_at is not None
+            assert health.consecutive_failures == 0
+
+        agent.error = "temporary outage"
+        for seq in (3, 4):
+            _final(client, mid, seq, f"line {seq}")
+
+        with SessionLocal() as db:
+            snapshots = snapshot_repository.list_for_meeting(db, mid)
+            assert len(snapshots) == 1, "a failed window must not create a checkpoint"
+            health = db.get(MeetingStateHealth, mid)
+            assert health.consecutive_failures == 1
+            assert health.last_error
+
     def test_invalid_llm_output_does_not_pollute_the_previous_state(
         self, client, agent, monkeypatch
     ):
@@ -447,7 +484,7 @@ class TestFailurePolicy:
         _final(client, mid, 2, "second")
 
         after = _state(client, mid)
-        assert after["status"] == "FAILED"
+        assert after["status"] == "STALE"
         assert after["version"] == 1, "a failed update is not a version"
         assert after["last_processed_segment_seq"] == 1, "the cursor must not advance"
         assert after["decisions"] == good["decisions"], "content must be untouched"
@@ -465,7 +502,7 @@ class TestFailurePolicy:
 
         provider.raw = "not json"
         _final(client, mid, 2, "second")
-        assert _state(client, mid)["status"] == "FAILED"
+        assert _state(client, mid)["status"] == "STALE"
 
         provider.raw = None  # the model behaves again
         _final(client, mid, 3, "third")
@@ -474,7 +511,7 @@ class TestFailurePolicy:
         # Both the failed seq 2 and the new seq 3 are drained in this one run:
         # the cursor only advanced to 1 on the failure, so 2 is pending again.
         assert body["last_processed_segment_seq"] == 3
-        assert provider.seqs_seen[-2:] == [[2], [3]], (
+        assert provider.seqs_seen[-2:] == [[2], [2, 3]], (
             "the previously failed segment is replayed before the new one"
         )
 
@@ -527,7 +564,7 @@ class TestFailurePolicy:
 
         _final(client, mid, 2, "second")
         body = _state(client, mid)
-        assert body["status"] == "FAILED"
+        assert body["status"] == "STALE"
         assert body["last_processed_segment_seq"] == 1
         assert len(provider.calls) == calls_after_first, (
             "the oversized batch is never sent to the LLM"
@@ -633,13 +670,13 @@ class TestIntegrationChain:
         assert _state(client, mid)["version"] == 3
         assert _state(client, mid)["last_processed_segment_seq"] == 6
 
-        # 3. one un-flushed segment, then finish -> forced flush
+        # 3. one unprocessed segment; finish must not run realtime AI
         _final(client, mid, 7, "line 7")
         assert client.post(f"/api/meetings/{mid}/finish").status_code == 200
 
         body = _state(client, mid)
-        assert body["last_processed_segment_seq"] == 7
-        assert body["version"] == 4
+        assert body["last_processed_segment_seq"] == 6
+        assert body["version"] == 3
 
         # 4. the meeting still completes through the normal Summary chain
         stream_end = client.post(
@@ -761,6 +798,7 @@ class TestScriptedMeetingReplay:
                 return self.raw
 
             payload: dict = {
+                "live_summary": None,
                 "current_topic": None,
                 "topics": [],
                 "decisions": [],
@@ -768,6 +806,8 @@ class TestScriptedMeetingReplay:
                 "open_questions": [],
                 "risks": [],
             }
+            if known:
+                payload["live_summary"] = "会议正在讨论上线安排、风险、决策与后续联调事项。"
             if 1 in known:
                 payload["current_topic"] = "上线安排"
                 payload["topics"] = [{
@@ -804,7 +844,7 @@ class TestScriptedMeetingReplay:
     @pytest.fixture
     def scripted(self, monkeypatch):
         provider = self.ScriptedMeetingProvider()
-        monkeypatch.setattr("app.agent.llm.factory.get_provider", lambda: provider)
+        monkeypatch.setattr("app.agent.llm.factory.get_provider", lambda **_policy: provider)
         # Two segments per batch: the meeting then spans exactly three batches,
         # so batching, incrementality and the trailing remainder are all real.
         monkeypatch.setattr("app.config.settings.meeting_agent_batch_max_segments", 2)
@@ -824,8 +864,9 @@ class TestScriptedMeetingReplay:
         body = _state(client, mid)
         # schema validity: the endpoint returned a shape the schema accepts
         MeetingStateContent.model_validate(
-            {k: v for k, v in body.items() if k in PAYLOAD_FIELDS + ("current_topic",)}
+            {k: v for k, v in body.items() if k in PAYLOAD_FIELDS + ("live_summary", "current_topic",)}
         )
+        assert body["live_summary"] == "会议正在讨论上线安排、风险、决策与后续联调事项。"
         assert body["current_topic"] == "上线安排"
         assert any("上线" in t["title"] for t in body["topics"])
         assert any("下周三" in d["text"] for d in body["decisions"])
@@ -875,8 +916,8 @@ class TestScriptedMeetingReplay:
         assert after["decisions"] == before["decisions"]
         assert after["action_items"] == before["action_items"]
 
-    def test_sub_threshold_tail_needs_the_finish_flush(self, client, scripted, monkeypatch):
-        """§11: buffered below the threshold, then 结束会议 must fold it in."""
+    def test_sub_threshold_tail_remains_transcript_only_at_finish(self, client, scripted, monkeypatch):
+        """Buffered realtime input remains durable in Transcript at finish."""
         monkeypatch.setattr("app.config.settings.meeting_agent_batch_max_segments", 4)
         provider = scripted
         mid = _start_meeting(client)
@@ -888,10 +929,9 @@ class TestScriptedMeetingReplay:
 
         assert client.post(f"/api/meetings/{mid}/finish").status_code == 200
         body = _state(client, mid)
-        assert body["last_processed_segment_seq"] == 6, "the tail must not be lost"
-        assert any("支付" in q["text"] for q in body["open_questions"])
-        item = next(a for a in body["action_items"] if "联调" in a["task"])
-        assert item["deadline"] == "周二之前"
+        assert body["last_processed_segment_seq"] == 4
+        snapshot = client.get(f"/api/meetings/{mid}/transcript").json()
+        assert [s["segment_seq"] for s in snapshot["segments"]] == [1, 2, 3, 4, 5, 6]
 
     def test_invalid_model_output_does_not_pollute_the_state(self, client, scripted):
         mid = _start_meeting(client)
@@ -905,7 +945,7 @@ class TestScriptedMeetingReplay:
         self._run_script(client, mid, seqs=(5, 6))
 
         after = _state(client, mid)
-        assert after["status"] == "FAILED"
+        assert after["status"] == "STALE"
         assert after["version"] == good["version"], "a failed update is not a version"
         assert after["last_processed_segment_seq"] == good["last_processed_segment_seq"]
         assert after["decisions"] == good["decisions"], "content must be untouched"
@@ -919,7 +959,7 @@ class TestScriptedMeetingReplay:
 
         snapshot = client.get(f"/api/meetings/{mid}/transcript").json()
         assert [s["segment_seq"] for s in snapshot["segments"]] == [1, 2, 3, 4]
-        assert _state(client, mid)["status"] == "FAILED"
+        assert _state(client, mid)["status"] == "STALE"
 
 
 # ==========================================================================

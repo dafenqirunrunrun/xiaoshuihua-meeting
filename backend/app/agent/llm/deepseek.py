@@ -36,6 +36,7 @@ class DeepSeekProvider:
         model: str | None = None,
         timeout_seconds: float | None = None,
         max_retries: int | None = None,
+        retry_timeouts: bool = True,
         temperature: float | None = None,
         max_output_tokens: int | None = None,
     ) -> None:
@@ -49,6 +50,7 @@ class DeepSeekProvider:
             if max_retries is not None
             else max(0, settings.llm_max_retries)
         )
+        self._retry_timeouts = retry_timeouts
         self._temperature = (
             temperature if temperature is not None else settings.llm_temperature
         )
@@ -86,7 +88,7 @@ class DeepSeekProvider:
                     resp.raise_for_status()
                     return extract_content(resp.json())
             except httpx.TimeoutException as exc:
-                if attempt < self._max_retries:
+                if self._retry_timeouts and attempt < self._max_retries:
                     self._retry_pause(attempt)
                     continue
                 raise SummaryGenerationError(
@@ -104,14 +106,18 @@ class DeepSeekProvider:
                     f"deepseek HTTP {exc.response.status_code}: "
                     f"{exc.response.text[:200]}"
                 ) from exc
-            except (httpx.TransportError, ValueError, SummaryGenerationError) as exc:
+            except httpx.TransportError as exc:
                 if attempt < self._max_retries:
                     self._retry_pause(attempt)
                     continue
+                raise SummaryGenerationError(
+                    f"deepseek transport/response error: {exc}"
+                ) from exc
+            except (ValueError, SummaryGenerationError) as exc:
                 if isinstance(exc, SummaryGenerationError):
                     raise
                 raise SummaryGenerationError(
-                    f"deepseek transport/response error: {exc}"
+                    f"deepseek response error: {exc}"
                 ) from exc
 
         raise SummaryGenerationError("deepseek request exhausted retries")

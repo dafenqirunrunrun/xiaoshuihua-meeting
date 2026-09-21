@@ -29,7 +29,12 @@ from .fake import FakeProvider
 _VALID = frozenset({"fake", "deepseek"})
 
 
-def get_provider(model: str | None = None) -> LLMProvider:
+def get_provider(
+    model: str | None = None,
+    *,
+    max_retries: int | None = None,
+    retry_timeouts: bool = True,
+) -> LLMProvider:
     """Resolve the provider. `model` optionally overrides the provider's model.
 
     The override exists for the Final Summary, which may legitimately want a
@@ -40,7 +45,11 @@ def get_provider(model: str | None = None) -> LLMProvider:
     """
     kind = (settings.llm_provider or "").strip().lower()
     if kind == "deepseek":
-        return DeepSeekProvider(model=model)
+        return DeepSeekProvider(
+            model=model,
+            max_retries=max_retries,
+            retry_timeouts=retry_timeouts,
+        )
     if kind == "fake":
         return FakeProvider()
     raise LLMConfigurationError(

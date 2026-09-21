@@ -83,19 +83,20 @@ class Settings(BaseSettings):
     # Char count is the real cost driver for the prompt, so it is checked too.
     meeting_agent_batch_max_segments: int = 8
     meeting_agent_batch_max_chars: int = 1200
-    # Real-time FINAL signals are merged for a short quiet window, but a steady
-    # stream is flushed no later than max_wait. This makes Meeting State visible
-    # during recording without turning every sentence into one LLM request.
-    meeting_agent_realtime_debounce_seconds: float = 2.0
-    meeting_agent_realtime_max_wait_seconds: float = 6.0
-    # Live understanding favours freshness. This per-attempt bound replaces the
-    # generic 120s timeout; any configured provider retry remains finite, and a
-    # later FINAL also naturally retries a failed state pass.
-    meeting_agent_llm_timeout_seconds: float = 12.0
+    # Realtime understanding is near-real-time, not subtitle-real-time. FINAL
+    # signals only move one pending high-watermark; these thresholds decide when
+    # the sole per-meeting worker consumes that range in one LLM call.
+    meeting_agent_realtime_min_segments: int = 8
+    meeting_agent_realtime_target_interval_seconds: float = 25.0
+    meeting_agent_realtime_silence_seconds: float = 10.0
+    meeting_agent_realtime_max_wait_seconds: float = 45.0
+    # Realtime favours freshness: a timed-out pass remains pending and may be
+    # coalesced with later FINALs, but it is never retried inside the request.
+    meeting_agent_llm_timeout_seconds: float = 25.0
     # Structured-output (Pydantic) validation attempts per state update, with
     # the same bounded repair-prompt semantics as the Summary pipeline.
-    meeting_agent_max_attempts: int = 2
-    meeting_agent_parse_repair: bool = True
+    meeting_agent_max_attempts: int = 1
+    meeting_agent_parse_repair: bool = False
     # Hard bound on the batch body fed to the LLM. No silent truncation: a batch
     # larger than this is SKIPPED with a logged reason (the state simply does not
     # advance — the transcript is untouched and a later batch can still progress).
@@ -104,11 +105,6 @@ class Settings(BaseSettings):
     # only part of the prompt that can grow unboundedly across the meeting).
     # Exceeding it fails the update loudly rather than silently clipping context.
     meeting_agent_max_state_chars: int = 24_000
-    # Safety valve on ONE drain pass: how many batches a single trigger may
-    # process. Bounds the work (and LLM cost) of a single call; whatever remains
-    # is flushed by the next FINAL or by the finish-time forced flush.
-    meeting_agent_max_batches_per_run: int = 4
-
     # --- Final Summary V2 (Step AGENT-2) ------------------------------------
     # Master switch for "Meeting State -> Final Summary". When false the summary
     # pipeline behaves EXACTLY as it did before AGENT-2 (full-transcript prompt),
@@ -127,9 +123,9 @@ class Settings(BaseSettings):
     # Hard bound on the assembled V2 prompt (state + evidence). Same stance as
     # the rest of the pipeline: refuse loudly rather than silently truncate.
     final_summary_max_input_chars: int = 100_000
-    # Final generation gets a larger window than live state, but still fails in
-    # bounded time so the UI can offer explicit regeneration instead of hanging.
-    final_summary_llm_timeout_seconds: float = 30.0
+    # Final generation may be substantially heavier than one incremental state
+    # update, so use the same proven upper bound as the provider-level default.
+    final_summary_llm_timeout_seconds: float = 120.0
 
     # Model name for the Final Summary Agent. Empty means "use the provider's
     # own configured model" (DeepSeekProvider already owns deepseek_model).

@@ -223,9 +223,13 @@ def scripted(monkeypatch):
     double would break the real call signature.
     """
     provider = ScriptedProvider()
-    monkeypatch.setattr("app.agent.llm.factory.get_provider", lambda model=None: provider)
     monkeypatch.setattr(
-        "app.agent.summary_service.get_provider", lambda model=None: provider
+        "app.agent.llm.factory.get_provider",
+        lambda model=None, **_policy: provider,
+    )
+    monkeypatch.setattr(
+        "app.agent.summary_service.get_provider",
+        lambda model=None, **_policy: provider,
     )
     monkeypatch.setattr("app.config.settings.meeting_agent_enabled", True)
     monkeypatch.setattr("app.config.settings.final_summary_v2_enabled", True)
@@ -253,6 +257,9 @@ def _final(client, mid, sentence_id, text, session="s1"):
             "provider": "tencent",
         },
     )
+    from app.meeting_state.scheduler import meeting_state_scheduler
+
+    assert meeting_state_scheduler.wait_for_idle(mid, timeout_seconds=2.0)
     assert r.status_code == 200, r.text
     return r
 
@@ -261,6 +268,13 @@ def _seed_meeting(client, script=SCRIPT) -> str:
     mid = _create_and_start(client)
     for sid, text in script:
         _final(client, mid, sid, text)
+    # Model the scheduler's silence/interval trigger deterministically. The
+    # finalizer itself must never perform this realtime catch-up.
+    from app.db import SessionLocal
+    from app.meeting_state.service import process_pending
+
+    with SessionLocal() as session:
+        process_pending(session, mid, force_flush=True)
     return mid
 
 
@@ -425,7 +439,7 @@ class TestUsabilityGate:
         state_repository.mark_failed(db, mid, reason="boom")
         db.commit()
         a = assess_usability(db, mid)
-        assert a.usable is False and a.reason == REASON_STATE_FAILED
+        assert a.usable is False and a.reason == REASON_STATE_STALE
 
     def test_t06_empty_state_is_refused(self, client, db):
         mid = _create_and_start(client)
@@ -759,8 +773,13 @@ class TestMergeAndBoundaries:
 # ===========================================================================
 
 class TestOrderingInvariant:
-    def test_t25_finish_flushes_the_tail_into_the_state(self, client, db, scripted):
-        """§2: the last sentences must be IN the state before the summary runs."""
+    def test_finalizer_has_no_realtime_flush_dependency(self):
+        from app.agent import finalizer as finalizer_service
+
+        assert not hasattr(finalizer_service, "_flush_meeting_state")
+
+    def test_t25_finish_does_not_flush_the_realtime_tail(self, client, db, scripted):
+        """Finish cancels pending realtime work instead of blocking on it."""
         # batch threshold 99 so nothing flushes proactively; only force_flush can
         mid = _create_and_start(client)
         for sid, text in SCRIPT:
@@ -770,12 +789,10 @@ class TestOrderingInvariant:
         # NOTE: no STREAM_END here — this asserts the /finish-time flush alone,
         # before the Finalizer's own flush can mask a broken one.
         state = _state(client, mid)
-        assert state is not None
-        assert state["last_processed_segment_seq"] == 6
-        assert state["version"] >= 1
+        assert state is None or state["last_processed_segment_seq"] == 0
 
-    def test_t26_finalizer_flushes_before_summarizing(self, client, db, scripted):
-        """The Finalizer itself closes the gap, not just /finish.
+    def test_t26_finalizer_uses_transcript_without_flushing_state(self, client, db, scripted):
+        """A stale state is optional context and never gates final generation.
 
         Simulates the real failure the invariant exists for: the transcript is
         frozen and the meeting FINALIZING, but the state is behind (the agent's
@@ -804,12 +821,13 @@ class TestOrderingInvariant:
         from app.agent import finalizer as finalizer_service
 
         finalizer_service.finalize_for_meeting(db, mid, provider=scripted)
-        # the Finalizer's own flush absorbed seqs 1..6 -> not stale any more
-        assert assess_usability(db, mid).usable is True
+        # Realtime state remains stale, but the full frozen transcript still
+        # produces the canonical V2 summary.
+        assert assess_usability(db, mid).reason == REASON_STATE_STALE
         assert _summary(client, mid)["status"] == "COMPLETED"
 
-    def test_t27_trailing_final_after_finish_still_reaches_the_state(self, client, db, scripted):
-        """A FINAL that lands after /finish must not be summarized around."""
+    def test_t27_trailing_final_is_read_directly_by_finalizer(self, client, db, scripted):
+        """A trailing FINAL need not enter realtime state to be summarized."""
         mid = _create_and_start(client)
         for sid, text in SCRIPT[:4]:
             _final(client, mid, sid, text)
@@ -817,13 +835,12 @@ class TestOrderingInvariant:
         # trailing FINAL arrives after finish, before the transcript freezes.
         _final(client, mid, 5, "周二之前完成")
         _freeze_only(mid, 5)
-        # The Finalizer forces another flush, so the state catches up to seq 5
-        # rather than summarizing a state that stopped at seq 4.
         from app.agent import finalizer as finalizer_service
 
         finalizer_service.finalize_for_meeting(db, mid, provider=scripted)
         state = _state(client, mid)
-        assert state["last_processed_segment_seq"] == 5
+        assert state["last_processed_segment_seq"] < 5
+        assert _summary(client, mid)["status"] == "COMPLETED"
 
 
 # ===========================================================================

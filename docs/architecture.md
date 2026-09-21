@@ -1164,26 +1164,21 @@ Meeting State Repository  meeting_state 表（upsert，version +1）
 - `transcript_service.handle_final()` 在**真实插入**时返回
   `FinalApplied(segment_seq, event_id)`；Case A / Case C 幂等重试返回 `None`
   → **绝不重跑 LLM（不重付模型成本）**。
-- `handle_event(..., background_tasks=None)` 把 `FinalApplied` 交给路由层（应用层），
-  由路由层用**既有 FastAPI BackgroundTasks** 机制调度消费。
+- HTTP 内部入口与正式 Tencent 回调都只把已提交 FINAL 通知给同一个 process-local
+  high-watermark scheduler，不再为每条 FINAL 创建独立 BackgroundTask。
 - `background_tasks=None`（legacy 脚本直接调用）等于“不调度”，保持既有调用方语义不变。
 - Agent 包**只在调度函数内 lazy import**，transcript 包对 agent 包**无 import 期依赖**。
 
-**不引入** MQ / Kafka / Redis Stream / Celery / 定时线程 / 调度器。
+当前不引入 MQ / Kafka / Redis Stream / Celery；scheduler 是进程内近实时协调器，
+Transcript 与 cursor 仍是可恢复的持久化事实。
 
 ### 19.4 Batch / Flush 规则
 
-- `select_batches()` 返回 `(ready, remainder)`：
-  - `ready` —— 达到阈值（`AGENT_BATCH_MAX_SEGMENTS` 或 `AGENT_BATCH_MAX_CHARS`）的批次，
-    值得一次 LLM 调用。
-  - `remainder` —— 未达阈值的尾部，**继续缓冲**，不提前 flush。
-    （提前 flush 等于每句一次 LLM 调用，正是 Batch 要避免的。）
-- 一次 run 最多处理 `AGENT_MAX_BATCHES_PER_RUN` 个批次；超出部分留给下次触发
-  （outcome `BATCH_LIMIT_REACHED`）。
-- **强制 flush（§11）**：会议结束（`POST /finish`）时调度 `force_flush=True`，
-  用 `_chunk()` 把**包括尾部 remainder** 的全部 pending 按**同样的阈值切分**后处理。
-  强制 flush 只解除“批次数量上限”，**不**把所有内容并成一条超大 prompt
-  （那会被尺寸守卫拒绝，反而丢掉最需要抢救的尾部句子）。
+- 同一 meeting 最多一个 RUNNING realtime request；新 FINAL 只更新 pending 信号窗口。
+- 满足 8 个新 FINAL、约 25s、约 10s 停顿任一条件即执行，45s 为最大等待。
+- 每次 run 对当时 `cursor+1..pending_until` 形成一个连续窗口，最多调用一次 LLM；
+  输入受 12k 字符硬上限保护，剩余范围等待下一次触发，不在一次 worker 内串行清空。
+- `POST /finish` 取消尚未开始的 realtime window，不做强制 flush；Final Summary 不等待它。
 - 单个超长 segment 自成一批（**绝不切分** —— 切分会破坏 `segment_seq` 证据链），
   交由尺寸守卫显式拒绝而非静默截断。
 
@@ -1208,18 +1203,20 @@ meeting_id (PK, FK -> meeting.id ON DELETE CASCADE)   一场会议一份当前�
 version                   成功更新计数（append-only 语义）
 last_processed_segment_seq 幂等游标
 state_json                结构化状态（MeetingStateContent）
-status                    EMPTY / ACTIVE / FAILED / FROZEN
+status                    EMPTY / ACTIVE / STALE / FAILED / FROZEN
 model_name / last_error    可观测性
 created_at / updated_at
 ```
+
+另有 `meeting_memory_snapshot` 保存每个成功窗口的 segment range 与 validated state，
+`meeting_state_health` 保存 last_attempt / last_success / consecutive_failures。
 
 **为什么必须新表（不可复用既有三张表）**：`meeting` 是四态生命周期（无 content 语义）；
 `transcript_segment` 是 append-only 事实（不可变）；`meeting_summary` 是 append-only
 版本化终稿（会后语义）。三者语义均不兼容“**单行、原地更新、会中可用**”的工作记忆。
 
-**恢复**：状态在 DB，进程重启后 `GET /summary` 式的读取即可恢复；崩溃遗留的 `ACTIVE`
-行由下一次触发从游标继续，**不重放已处理 segment**。`FROZEN` 在 transcript freeze 后
-由一次 drain 收口（`FAILED` 行**不**被提升为 `FROZEN`，失败保持可见）。
+**恢复**：状态、快照和 cursor 在 DB；下一次 FINAL 从 cursor 后继续。Transcript freeze
+只归档 last-good state，不调用 LLM，也不要求 realtime cursor 追平最终 Transcript。
 
 ### 19.7 Failure Policy
 
@@ -1245,11 +1242,15 @@ created_at / updated_at
 MEETING_AGENT_ENABLED            默认 true   总开关（false = 完全惰性，零 Agent 行为）
 MEETING_AGENT_BATCH_MAX_SEGMENTS 默认 8      批大小（按 segment 数）
 MEETING_AGENT_BATCH_MAX_CHARS    默认 1200   批大小（按字符数）
-MEETING_AGENT_MAX_ATTEMPTS       默认 2      形状失败的有界 repair 次数
-MEETING_AGENT_PARSE_REPAIR       默认 true   是否启用 repair prompt
+MEETING_AGENT_REALTIME_MIN_SEGMENTS 默认 8   片段数触发
+MEETING_AGENT_REALTIME_TARGET_INTERVAL_SECONDS 默认 25  目标刷新间隔
+MEETING_AGENT_REALTIME_SILENCE_SECONDS 默认 10  停顿触发
+MEETING_AGENT_REALTIME_MAX_WAIT_SECONDS 默认 45 最大等待
+MEETING_AGENT_LLM_TIMEOUT_SECONDS 默认 25     单次 realtime SLA
+MEETING_AGENT_MAX_ATTEMPTS       默认 1      realtime 不做模型 repair
+MEETING_AGENT_PARSE_REPAIR       默认 false  避免形状修复放大实时延迟
 MEETING_AGENT_MAX_BATCH_CHARS    默认 12000  单批硬上界（超限拒绝，不截断）
 MEETING_AGENT_MAX_STATE_CHARS    默认 24000  状态硬上界（超限拒绝，不截断）
-MEETING_AGENT_MAX_BATCHES_PER_RUN 默认 4     单次 run 批次上限
 ```
 
 **未提供 `MEETING_AGENT_MODEL`**：模型名由 Provider 层拥有，独立开关会与实际调用的
@@ -1259,7 +1260,7 @@ MEETING_AGENT_MAX_BATCHES_PER_RUN 默认 4     单次 run 批次上限
 
 ```text
 GET  /api/internal/meetings/{meeting_id}/state                 → 当前状态（空状态 200，会议缺失 404）
-POST /api/internal/meetings/{meeting_id}/state/process-pending → 后台强制 drain（幂等）
+POST /api/internal/meetings/{meeting_id}/state/process-pending → 后台触发一次阈值检查（幂等）
 ```
 
 前端**不使用**这两个端点。**本 Step 零前端改动。**
@@ -1327,23 +1328,12 @@ Step AGENT-2:   Meeting State（结构索引）┐
 ### 20.2 §2 排序不变式（本步最重要的一条）
 
 ```text
-finish ──► flush 剩余 FINAL ──► Meeting State 达到最新 ──► 才生成 Final Summary
+finish ──► freeze 完整 FINAL Transcript ──► 立即生成 Final Summary
 ```
 
-**绝对不允许**：最后两句 Transcript 还没进入 Meeting State，Summary 已经生成。
-
-为什么这条不变式**必须由 Finalizer 自己守**：`POST /finish` 确实会安排一次强制
-flush，但它跑在**另一个 BackgroundTask** 里 —— 可能失败、可能与 trailing FINAL
-竞争、或者（crash-gap 恢复场景）根本没跑过。所以：
-
-- `finalize_for_meeting` 在生成纪要**之前**，**同步**调用
-  `meeting_state_service.process_pending(force_flush=True)`（代码中的 Step 0）。
-- `force_flush=True` 把不足阈值的尾巴当成**一个最终批次**送出，会议中途结束也能收口。
-- **best-effort by construction**：`process_pending` 对业务原因**从不抛异常**
-  （失败记录在 state 行上并上报），所以 flush 失败**绝不阻断会议完成**（§18）。
-- `final_summary_service.assess_usability` 守住**最后一跳**：若状态游标仍然落后于
-  transcript（`state_stale`），**拒绝把该状态当作完整状态使用**，改走 legacy 全量
-  transcript —— **降级，但绝不静默漏报**。
+Final Summary 与 Realtime State 是 Transcript 的两个平级消费者。Finalizer 不获取
+realtime agent lock、不补跑 pending、不要求 state cursor 追平。完整冻结 Transcript
+始终是最终纪要事实输入；latest-good State / Snapshot 即使 stale 也只是辅助上下文。
 
 ### 20.3 Usability Gate（来源选择的唯一裁决点）
 
@@ -1563,12 +1553,12 @@ MeetingIntelligencePanel 重新渲染
   **主动撒谎**。因此损坏时返回 `status = FAILED` + 保留可安全读取的标量 + 内容置空，
   **且不回写 DB**（读路径投影，脏行绝不被 GET 洗白）。
 - **发布判据是「durable 状态是否真的变了」，不是「version 是否 +1」**：
-  `ACTIVE vN → ACTIVE vN+1` / `EMPTY·ACTIVE → FAILED` / `FAILED → ACTIVE` /
-  `ACTIVE → FROZEN` 都必须发；`FAILED → FAILED` 与 `NO_WORK` 抑制（不刷屏）。
-  **这块必须覆盖 FAILED**：`mark_failed` 刻意不推进 version，所以
+  `ACTIVE vN → ACTIVE vN+1` / `ACTIVE → STALE` / `EMPTY → FAILED` /
+  `STALE·FAILED → ACTIVE` / `ACTIVE·STALE → FROZEN` 都必须发；重复降级状态与
+  `NO_WORK` 抑制（不刷屏）。`mark_failed` 刻意不推进 version，所以
   "version +1 才发" 会**静默丢掉**整个失败通知。
 - **稳定 SSE id 必须带 status**：`state:<meeting_id>:<version>:<status>`。
-  `ACTIVE@4` 与 `FAILED@4` 是两个不同的 durable 状态、同一个 version，
+  `ACTIVE@4` 与 `STALE@4` 是两个不同的 durable 状态、同一个 version，
   仅凭 version 无法区分，客户端去重会误判为重复而丢弃。**不引入新的持久化事件序号。**
 - 顺序硬约束：**先 DB commit，后 publish**；SSE 发布失败**绝不回滚** Meeting State。
 - 新增路由 `GET /api/meetings/{id}/state`（public 产品投影），

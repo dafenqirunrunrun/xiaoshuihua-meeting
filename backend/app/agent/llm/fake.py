@@ -62,7 +62,7 @@ DEFAULT_JSON = (
 # update is legal and always parses — the deterministic default cannot fail
 # validation.
 DEFAULT_STATE_JSON = (
-    '{"current_topic": null, "topics": [], "decisions": [], '
+    '{"live_summary": null, "current_topic": null, "topics": [], "decisions": [], '
     '"action_items": [], "open_questions": [], "risks": []}'
 )
 

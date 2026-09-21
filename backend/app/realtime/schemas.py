@@ -55,11 +55,11 @@ FINAL_ID_PREFIX = "final:"
 SUMMARY_ID_PREFIX = "summary:"
 
 # Stable SSE `id:` prefix for a Meeting State change (Step UI-INTEL-1):
-#   state:<meeting_id>:<version>:active|failed|frozen|empty
+#   state:<meeting_id>:<version>:active|stale|failed|frozen|empty
 #
 # NOTE the trailing status. Unlike a FINAL, a state change is NOT uniquely
-# identified by (meeting, version): a FAILED update deliberately does NOT bump
-# `version` (see meeting_state.repository.mark_failed), so ACTIVE@4 and FAILED@4
+# identified by (meeting, version): a failed attempt deliberately does NOT bump
+# `version`, so ACTIVE@4 and STALE@4
 # are two DIFFERENT durable states with the same version. Including the status
 # keeps every distinct change distinguishable without inventing a new persisted
 # event sequence — and this id is only ever a client-side dedup key, since the

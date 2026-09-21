@@ -1,5 +1,11 @@
 import { Button, Skeleton, Tag } from 'antd'
-import { BulbOutlined, ReloadOutlined } from '@ant-design/icons'
+import {
+  AudioOutlined,
+  BulbOutlined,
+  CheckCircleOutlined,
+  ReloadOutlined,
+  SyncOutlined,
+} from '@ant-design/icons'
 import { EmptyPlaceholder } from '@/components/EmptyPlaceholder'
 import { EvidenceTraceButton } from '@/components/EvidenceTraceButton'
 import type { MeetingState, MeetingStateStatus } from '@/types/meetingState'
@@ -7,8 +13,9 @@ import type { MeetingState, MeetingStateStatus } from '@/types/meetingState'
 /**
  * Meeting Intelligence Panel（Step UI-INTEL-1）。
  *
- * 展示 AI 在会议进行中**理解出的结构化内容**（当前议题 / 已确认决策 / 待办 /
- * 未决问题 / 风险）。数据全部来自 `GET /api/meetings/:id/state` —— 服务端
+ * 展示 AI 在会议进行中**理解出的内容**：顶部是面向参会人的实时会议摘要，
+ * 下方仍保留当前议题 / 已确认决策 / 待办 / 未决问题 / 风险等结构化工作记忆。
+ * 数据全部来自 `GET /api/meetings/:id/state` —— 服务端
  * 持久化的 Meeting State。
  *
  * 三条展示层铁律：
@@ -30,6 +37,7 @@ import type { MeetingState, MeetingStateStatus } from '@/types/meetingState'
 const STATUS_LABEL: Record<MeetingStateStatus, string> = {
   EMPTY: '等待内容',
   ACTIVE: '实时更新中',
+  STALE: '更新稍有延迟',
   FAILED: '暂时不可用',
   FROZEN: '已冻结',
 }
@@ -40,6 +48,8 @@ function statusTag(status: MeetingStateStatus) {
   switch (status) {
     case 'ACTIVE':
       return <Tag color="success">实时更新中</Tag>
+    case 'STALE':
+      return <Tag color="warning">更新稍有延迟</Tag>
     case 'FAILED':
       return <Tag color="warning">暂时不可用</Tag>
     case 'FROZEN':
@@ -145,6 +155,8 @@ interface MeetingIntelligencePanelProps {
   state: MeetingState | null
   loading: boolean
   error: string
+  isMeetingLive: boolean
+  pendingSegmentCount: number
   onRefresh: () => void
   /**
    * 「查看原文」回调（Step UI-INTEL-2A）。只把 `source_segment_seqs` 交给调用方，
@@ -154,66 +166,158 @@ interface MeetingIntelligencePanelProps {
   onTraceEvidence: (sourceSegmentSeqs: number[]) => void
 }
 
+function IntelligenceHeader({ status }: { status?: MeetingStateStatus }) {
+  return (
+    <div className="intel-head">
+      <div>
+        <div className="intel-eyebrow">MEETING INTELLIGENCE</div>
+        <div className="intel-title">
+          <BulbOutlined aria-hidden />
+          AI 会议理解
+        </div>
+      </div>
+      {status ? statusTag(status) : null}
+    </div>
+  )
+}
+
+function IntelligenceActivity({
+  loading,
+  isMeetingLive,
+  pendingSegmentCount,
+  status,
+}: {
+  loading: boolean
+  isMeetingLive: boolean
+  pendingSegmentCount: number
+  status?: MeetingStateStatus
+}) {
+  const unavailable = status === 'FAILED' || status === 'STALE'
+  const working =
+    isMeetingLive && !unavailable && (loading || pendingSegmentCount > 0 || status === 'EMPTY')
+  let icon = <CheckCircleOutlined aria-hidden />
+  let title = isMeetingLive ? '已跟进到最新内容' : '本次理解已归档'
+  let detail = isMeetingLive ? 'AI 将继续监听后续讨论' : '可通过下方条目查看对应原文'
+
+  if (loading) {
+    icon = <SyncOutlined spin aria-hidden />
+    title = '正在同步最新理解'
+    detail = '已有内容保持可见，完成后会自动更新'
+  } else if (status === 'FAILED') {
+    icon = <ReloadOutlined aria-hidden />
+    title = '理解更新暂时中断'
+    detail = '当前继续展示最近一次成功整理的内容'
+  } else if (status === 'STALE') {
+    icon = <SyncOutlined aria-hidden />
+    title = '理解更新稍有延迟'
+    detail = '系统仍在保留并展示最近一次可靠结果'
+  } else if (isMeetingLive && pendingSegmentCount > 0) {
+    icon = <AudioOutlined aria-hidden />
+    title = `已收到 ${pendingSegmentCount} 条新内容`
+    detail = '正在倾听并等待合适的整理时机'
+  } else if (isMeetingLive && status === 'EMPTY') {
+    icon = <AudioOutlined aria-hidden />
+    title = '正在倾听会议'
+    detail = '出现有效讨论后会自动形成摘要与要点'
+  }
+
+  return (
+    <div className={`intel-activity${working ? ' intel-activity--working' : ''}`} role="status">
+      <span className="intel-activity__icon">{icon}</span>
+      <span className="intel-activity__copy">
+        <strong>{title}</strong>
+        <span>{detail}</span>
+      </span>
+      {working ? (
+        <span className="intel-activity__signal" aria-hidden>
+          <i />
+          <i />
+          <i />
+        </span>
+      ) : null}
+    </div>
+  )
+}
+
 export function MeetingIntelligencePanel({
   state,
   loading,
   error,
+  isMeetingLive,
+  pendingSegmentCount,
   onRefresh,
   onTraceEvidence,
 }: MeetingIntelligencePanelProps) {
   // ---- 首次加载（还没有任何可用内容）----
   if (!state && loading) {
     return (
-      <div className="rail-section">
-        <div className="rail-title">AI 会议理解</div>
-        <Skeleton active paragraph={{ rows: 3 }} title={false} />
-      </div>
+      <section className="intelligence-panel">
+        <IntelligenceHeader />
+        <IntelligenceActivity
+          loading
+          isMeetingLive={isMeetingLive}
+          pendingSegmentCount={pendingSegmentCount}
+        />
+        <div className="intel-scroll">
+          <Skeleton active paragraph={{ rows: 5 }} title={false} />
+        </div>
+      </section>
     )
   }
 
   // ---- 首次加载失败（无 last-good 可展示）----
   if (!state && error) {
     return (
-      <div className="rail-section">
-        <div className="rail-title">AI 会议理解</div>
-        <EmptyPlaceholder
-          icon={<ReloadOutlined />}
-          title={error === 'not_found' ? '会议不存在' : '暂时无法加载'}
-          description={
-            error === 'not_found'
-              ? '请确认会议链接是否正确。'
-              : 'AI 会议理解暂时不可用，不影响实时转写。'
-          }
-          action={
-            error === 'not_found' ? undefined : (
-              <Button size="small" icon={<ReloadOutlined />} onClick={onRefresh}>
-                重试
-              </Button>
-            )
-          }
-          compact
-        />
-      </div>
+      <section className="intelligence-panel">
+        <IntelligenceHeader />
+        <div className="intel-scroll">
+          <EmptyPlaceholder
+            icon={<ReloadOutlined />}
+            title={error === 'not_found' ? '会议不存在' : '暂时无法加载'}
+            description={
+              error === 'not_found'
+                ? '请确认会议链接是否正确。'
+                : 'AI 会议理解暂时不可用，不影响实时转写。'
+            }
+            action={
+              error === 'not_found' ? undefined : (
+                <Button size="small" icon={<ReloadOutlined />} onClick={onRefresh}>
+                  重试
+                </Button>
+              )
+            }
+            compact
+          />
+        </div>
+      </section>
     )
   }
 
   if (!state) {
     return (
-      <div className="rail-section">
-        <div className="rail-title">AI 会议理解</div>
-        <EmptyPlaceholder
-          icon={<BulbOutlined />}
-          title="等待会议内容"
-          description="开始会议后，AI 会在这里实时整理议题、决策与待办。"
-          compact
+      <section className="intelligence-panel">
+        <IntelligenceHeader />
+        <IntelligenceActivity
+          loading={false}
+          isMeetingLive={isMeetingLive}
+          pendingSegmentCount={pendingSegmentCount}
         />
-      </div>
+        <div className="intel-scroll">
+          <EmptyPlaceholder
+            icon={<BulbOutlined />}
+            title="等待会议内容"
+            description="开始会议后，AI 会持续概括讨论内容，并整理议题、决策与待办。"
+            compact
+          />
+        </div>
+      </section>
     )
   }
 
   const {
     version,
     status,
+    live_summary,
     current_topic,
     topics,
     decisions,
@@ -224,12 +328,15 @@ export function MeetingIntelligencePanel({
 
   // EMPTY：会议已开始但尚未处理任何 FINAL —— 不是错误，是正常的早期状态。
   const isEmpty = status === 'EMPTY'
-  const hasAnyContent =
+  const hasLiveSummary = Boolean(live_summary?.trim())
+  const hasStructuredContent =
+    Boolean(current_topic) ||
     topics.length > 0 ||
     decisions.length > 0 ||
     action_items.length > 0 ||
     open_questions.length > 0 ||
     risks.length > 0
+  const hasAnyContent = hasLiveSummary || hasStructuredContent
 
   // 冲突的「当前议题」：后端给的是标题，这里只从 topics 里取同名项的 summary。
   // current_topic 命中 topics 时用 TopicItem（带 summary），否则退化为纯文本条目。
@@ -241,19 +348,28 @@ export function MeetingIntelligencePanel({
     : topics
 
   return (
-    <div className="rail-section">
-      <div className="intel-head">
-        <div className="rail-title" style={{ marginBottom: 0 }}>
-          AI 会议理解
-        </div>
-        {statusTag(status)}
-      </div>
+    <section className="intelligence-panel">
+      <IntelligenceHeader status={status} />
+      <IntelligenceActivity
+        loading={loading}
+        isMeetingLive={isMeetingLive}
+        pendingSegmentCount={pendingSegmentCount}
+        status={status}
+      />
+
+      <div className="intel-scroll">
 
       {/* FAILED：保留已展示内容 + 轻量不可用提示（Meeting 仍可能是 COMPLETED，
           两者是独立维度）。绝不因为 FAILED 就清空用户已经看到的内容。 */}
       {status === 'FAILED' ? (
         <div className="intel-notice">
           状态更新暂时中断，以下为最近一次成功理解的内容。
+        </div>
+      ) : null}
+
+      {status === 'STALE' ? (
+        <div className="intel-notice intel-notice--soft">
+          AI 摘要更新稍有延迟，以下内容仍为最近一次成功理解的结果。
         </div>
       ) : null}
 
@@ -273,13 +389,20 @@ export function MeetingIntelligencePanel({
           title={isEmpty ? '等待会议内容' : '暂时没有明确的结论'}
           description={
             isEmpty
-              ? 'AI 会在会议进行中逐步整理议题、决策与待办。'
-              : 'AI 已收到内容，但尚未形成明确的议题或结论。'
+              ? 'AI 会在会议进行中实时概括讨论内容，并逐步整理议题、决策与待办。'
+              : 'AI 已收到内容，正在形成可读的会议摘要。'
           }
           compact
         />
       ) : (
         <>
+          {hasLiveSummary ? (
+            <div className="intel-summary" aria-live="polite">
+              <div className="intel-summary__label">实时摘要</div>
+              <div className="intel-summary__text">{live_summary}</div>
+            </div>
+          ) : null}
+
           {current_topic ? (
             <div className="intel-block">
               <div className="intel-block__head">
@@ -364,10 +487,13 @@ export function MeetingIntelligencePanel({
         </>
       )}
 
-      {/* 弱位置版本标记：只展示 latest，无版本切换（后端 append-only 语义在前端不暴露） */}
-      {version > 0 ? (
-        <div className="intel-foot">已理解 {version} 个版本</div>
-      ) : null}
-    </div>
+      {/* version 仍用于请求乱序守卫，但产品层不暴露工程版本号。 */}
+        {version > 0 ? (
+          <div className="intel-foot">
+            已理解至第 {state.last_processed_segment_seq} 条确认内容
+          </div>
+        ) : null}
+      </div>
+    </section>
   )
 }

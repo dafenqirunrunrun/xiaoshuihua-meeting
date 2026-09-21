@@ -9,11 +9,12 @@ import {
   StopOutlined,
   ArrowDownOutlined,
   CheckOutlined,
-  CheckCircleFilled,
+  ClockCircleOutlined,
   FileTextOutlined,
+  BulbOutlined,
+  WifiOutlined,
 } from '@ant-design/icons'
 import { EmptyPlaceholder } from '@/components/EmptyPlaceholder'
-import { InfoRow } from '@/components/InfoRow'
 import { MeetingIntelligencePanel } from '@/components/MeetingIntelligencePanel'
 import { MeetingStatusTag } from '@/components/MeetingStatusTag'
 import { useMeetingStore } from '@/stores/meetingStore'
@@ -23,7 +24,7 @@ import { useTranscriptSnapshot } from '@/hooks/useTranscriptSnapshot'
 import { useMeetingStream } from '@/hooks/useMeetingStream'
 import { useAutoScroll } from '@/hooks/useAutoScroll'
 import { useTranscriptEvidenceNavigation } from '@/hooks/useTranscriptEvidenceNavigation'
-import { formatDateTime, formatDuration, elapsedMs } from '@/utils/time'
+import { formatDuration, elapsedMs } from '@/utils/time'
 import { startMeeting, finishMeeting, normalizeApiError } from '@/api'
 import type { Meeting } from '@/types/meeting'
 import type { PartialUtterance, TranscriptSegment } from '@/types/transcript'
@@ -41,8 +42,7 @@ function useNowTick(active: boolean, startIso: string | null | undefined) {
 }
 
 /**
- * Header strip：title + #id + 状态 Tag + timer（仅进行中），action 在右侧。
- * 详细字段（开始时间 / 持续时长 / 转写连接态）留给右 Rail —— 不在此重复状态。
+ * Workspace header：会议身份、核心运行状态和主要操作形成一个整体。
  * 左上角提供纯导航「返回会议列表」：离开页面 ≠ 结束/暂停会议（Step 8B-6 §16）。
  */
 function Header({
@@ -50,39 +50,65 @@ function Header({
   action,
   timer,
   onBack,
+  details,
 }: {
   meeting: Meeting
   action?: React.ReactNode
   timer?: string
   onBack?: () => void
+  details?: React.ReactNode
 }) {
   const title = meeting.title?.trim() || '未命名会议'
   return (
     <header className="room__header">
-      <div style={{ minWidth: 0 }}>
-        {onBack ? (
-          <button type="button" className="room__back" onClick={onBack}>
-            <ArrowLeftOutlined aria-hidden />
-            返回会议列表
-          </button>
-        ) : null}
-        <h1 className="room__title h-m0" title={meeting.title || undefined}>
-          {title}
-        </h1>
-        <div className="room__meta" style={{ marginTop: 6 }}>
-          {meeting.id ? <span className="room__id">#{meeting.id}</span> : null}
-          {meeting.id ? <span className="meta-sep" /> : null}
-          <MeetingStatusTag status={meeting.status} />
-          {timer ? (
-            <>
-              <span className="meta-sep" />
-              <span className="u-tabular">{timer}</span>
-            </>
+      <div className="room__header-main">
+        <div className="room__header-identity">
+          {onBack ? (
+            <button type="button" className="room__back" onClick={onBack}>
+              <ArrowLeftOutlined aria-hidden />
+              返回会议列表
+            </button>
           ) : null}
+          <div className="room__title-row">
+            <h1 className="room__title h-m0" title={meeting.title || undefined}>
+              {title}
+            </h1>
+            <MeetingStatusTag status={meeting.status} />
+          </div>
+          <div className="room__meta">
+            {meeting.id ? <span className="room__id">#{meeting.id}</span> : null}
+            {timer ? (
+              <>
+                <span className="meta-sep" />
+                <span className="u-tabular">{timer}</span>
+              </>
+            ) : null}
+          </div>
         </div>
+        {action ? <div className="room__header-action">{action}</div> : null}
       </div>
-      {action ? <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>{action}</div> : null}
+      {details ? <div className="room__status-strip">{details}</div> : null}
     </header>
+  )
+}
+
+function HeaderMetric({
+  icon,
+  label,
+  value,
+}: {
+  icon: React.ReactNode
+  label: string
+  value: React.ReactNode
+}) {
+  return (
+    <div className="room-metric">
+      <span className="room-metric__icon" aria-hidden>{icon}</span>
+      <span className="room-metric__copy">
+        <span>{label}</span>
+        <strong>{value}</strong>
+      </span>
+    </div>
   )
 }
 
@@ -113,6 +139,44 @@ function transcriptPlaceholder(status: Meeting['status']) {
 function timingText(startMs: number | null, endMs: number | null): string {
   if (startMs === null || endMs === null) return ''
   return `${(startMs / 1000).toFixed(1)}s`
+}
+
+interface TranscriptGroup {
+  speakerId: string
+  segments: TranscriptSegment[]
+}
+
+/** Consecutive FINALs from one speaker are one visual message, while every
+ * segment remains in the DOM as an evidence-addressable record. */
+function groupTranscriptSegments(segments: TranscriptSegment[]): TranscriptGroup[] {
+  return segments.reduce<TranscriptGroup[]>((groups, segment) => {
+    const current = groups[groups.length - 1]
+    if (current?.speakerId === segment.speaker_id) {
+      current.segments.push(segment)
+      return groups
+    }
+    groups.push({ speakerId: segment.speaker_id, segments: [segment] })
+    return groups
+  }, [])
+}
+
+function speakerLabel(speakerId: string): string {
+  const normalized = speakerId.trim()
+  const generic = normalized.match(/^speaker[_\s-]?(\d+)$/i)
+  if (generic) return `发言人 ${generic[1]}`
+  return normalized || '未知发言人'
+}
+
+function speakerInitial(speakerId: string): string {
+  const label = speakerLabel(speakerId)
+  const generic = label.match(/^发言人\s*(\d+)$/)
+  return generic ? generic[1].slice(-2) : label.slice(0, 1).toUpperCase()
+}
+
+function speakerTone(speakerId: string): number {
+  let hash = 0
+  for (const character of speakerId) hash = (hash * 31 + character.charCodeAt(0)) >>> 0
+  return hash % 6
 }
 
 /** 实时转写状态标签：meeting.status 与 streamStatus 是两个不同维度。 */
@@ -164,6 +228,7 @@ function TranscriptBody({
   const placeholder = transcriptPlaceholder(status)
   const hasContent = segments.length > 0 || partials.length > 0
   const reconnecting = streamStatus === 'reconnecting' || streamStatus === 'connecting'
+  const groups = groupTranscriptSegments(segments)
 
   if (loading && segments.length === 0 && partials.length === 0) {
     return (
@@ -211,46 +276,81 @@ function TranscriptBody({
 
   return (
     <div className="transcript-surface transcript-surface--top">
-      <ol className="transcript-segments" ref={listRef}>
-        {segments.map((seg) => (
-          <li
-            key={seg.segment_seq}
-            className="transcript-segment"
-            /* UI-INTEL-2A：evidence 定位的**唯一**稳定标识（segment_seq 是
-               DB UNIQUE 业务键）。禁止用 index / 文本 / utterance_id 定位。 */
-            data-segment-seq={seg.segment_seq}
-          >
-            <span className="transcript-segment__speaker">{seg.speaker_id}</span>
-            <span className="transcript-segment__text">{seg.text}</span>
-            {timingText(seg.start_ms, seg.end_ms) ? (
-              <span className="transcript-segment__time">
-                {timingText(seg.start_ms, seg.end_ms)}
+      <ol className="transcript-segments transcript-chat" ref={listRef}>
+        {groups.map((group) => {
+          const first = group.segments[0]
+          return (
+            <li key={first.segment_seq} className="transcript-message-group">
+              <span
+                className="transcript-avatar"
+                data-avatar-tone={speakerTone(group.speakerId)}
+                aria-hidden
+              >
+                {speakerInitial(group.speakerId)}
               </span>
-            ) : null}
-          </li>
-        ))}
+              <div className="transcript-message">
+                <div className="transcript-message__meta">
+                  <span className="transcript-message__speaker">
+                    {speakerLabel(group.speakerId)}
+                  </span>
+                  {timingText(first.start_ms, first.end_ms) ? (
+                    <span className="transcript-message__time">
+                      {timingText(first.start_ms, first.end_ms)}
+                    </span>
+                  ) : null}
+                </div>
+                <div className="transcript-message__bubble">
+                  {group.segments.map((seg) => (
+                    <div
+                      key={seg.segment_seq}
+                      className="transcript-segment"
+                      /* segment_seq remains the sole evidence navigation key. */
+                      data-segment-seq={seg.segment_seq}
+                    >
+                      <span className="transcript-segment__text">{seg.text}</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            </li>
+          )
+        })}
         {partials.map((p) => (
-          <li key={p.utterance_id} className="transcript-segment transcript-segment--partial">
-            <span className="transcript-segment__live" aria-hidden />
-            <span className="transcript-segment__speaker">{p.speaker_id}</span>
-            <span className="transcript-segment__text">{p.text}</span>
-            <span className="transcript-segment__time">识别中</span>
+          <li
+            key={p.utterance_id}
+            className="transcript-message-group transcript-message-group--partial"
+          >
+            <span
+              className="transcript-avatar transcript-avatar--live"
+              data-avatar-tone={speakerTone(p.speaker_id)}
+              aria-hidden
+            >
+              {speakerInitial(p.speaker_id)}
+            </span>
+            <div className="transcript-message">
+              <div className="transcript-message__meta">
+                <span className="transcript-message__speaker">{speakerLabel(p.speaker_id)}</span>
+                <span className="transcript-message__live">
+                  <AudioOutlined aria-hidden />
+                  正在说
+                </span>
+              </div>
+              <div className="transcript-message__bubble transcript-message__bubble--partial">
+                <div className="transcript-segment transcript-segment--partial">
+                  <span className="transcript-segment__text">{p.text}</span>
+                  <span className="transcript-typing" aria-hidden>
+                    <i />
+                    <i />
+                    <i />
+                  </span>
+                </div>
+              </div>
+            </div>
           </li>
         ))}
       </ol>
     </div>
   )
-}
-
-/** AI 纪要标签（仅展示，不请求 summary 接口） */
-function summaryTag(status: Meeting['status']) {
-  if (status === 'COMPLETED') {
-    return <Tag color="green">已完成</Tag>
-  }
-  if (status === 'FINALIZING') {
-    return <Tag color="processing">正在生成</Tag>
-  }
-  return <Tag>等待会议结束</Tag>
 }
 
 /**
@@ -297,10 +397,14 @@ export function MeetingRoomPage() {
     meeting?.status === 'IN_PROGRESS',
     meeting?.started_at ?? null,
   )
-  const durationText =
-    meeting?.status === 'IN_PROGRESS' && meeting.started_at
-      ? formatDuration(elapsedMs(meeting.started_at, new Date(now)))
-      : '--'
+  const durationText = meeting?.started_at
+    ? formatDuration(
+        elapsedMs(
+          meeting.started_at,
+          meeting.ended_at ? new Date(meeting.ended_at) : new Date(now),
+        ),
+      )
+    : '--'
 
   // 8B-4：Snapshot 成功后计算 maxSegmentSeq 作为 SSE 游标（无 FINAL → 0，backend 允许）
   const snapshotReady = !transcriptLoading && !transcriptError
@@ -457,13 +561,66 @@ export function MeetingRoomPage() {
 
   if (!meeting) return null
 
+  const processedSegmentSeq = intelligence.state?.last_processed_segment_seq ?? 0
+  const pendingSegmentCount = finalSegments.filter(
+    (segment) => segment.segment_seq > processedSegmentSeq,
+  ).length
+  const intelligenceMetric = intelligence.loading
+    ? '正在同步'
+    : pendingSegmentCount > 0 && meeting.status === 'IN_PROGRESS'
+      ? `待整理 ${pendingSegmentCount} 条`
+      : intelligence.state?.status === 'FROZEN'
+        ? '已归档'
+        : intelligence.state?.status === 'FAILED'
+          ? '更新中断'
+          : intelligence.state?.status === 'STALE'
+            ? '更新稍有延迟'
+            : intelligence.state?.status === 'ACTIVE'
+              ? '已跟进最新内容'
+              : '正在倾听'
+
+  const headerDetails = (
+    <>
+      <HeaderMetric
+        icon={<WifiOutlined />}
+        label="实时转写"
+        value={streamStatusTag(meeting.status, streamStatus)}
+      />
+      <HeaderMetric
+        icon={<BulbOutlined />}
+        label="AI 理解"
+        value={intelligenceMetric}
+      />
+      <HeaderMetric
+        icon={<ClockCircleOutlined />}
+        label="会议时长"
+        value={<span className="u-tabular">{durationText}</span>}
+      />
+      <HeaderMetric
+        icon={<FileTextOutlined />}
+        label="会议纪要"
+        value={
+          meeting.status === 'COMPLETED'
+            ? '已生成'
+            : meeting.status === 'FINALIZING'
+              ? '正在生成'
+              : '会后自动生成'
+        }
+      />
+    </>
+  )
+
   // ---- CREATED：会前准备（主工作区 + 右轨），真实「开始会议」（Step 8B-2 启用） ----
   if (meeting.status === 'CREATED') {
     return (
       <div className="page page--wide" style={{ minHeight: 0 }}>
-        <Header meeting={meeting} onBack={() => navigate('/meetings')} />
+        <Header
+          meeting={meeting}
+          onBack={() => navigate('/meetings')}
+          details={headerDetails}
+        />
 
-        <div className="room__body">
+        <div className="room__body room__body--prep">
           <section className="room__transcript">
             <div className="room__prep">
               <div className="prep-orb">
@@ -486,23 +643,6 @@ export function MeetingRoomPage() {
               </div>
             </div>
           </section>
-
-          <aside className="room__rail">
-            <div className="rail-section">
-              <div className="rail-title">会议状态</div>
-              <InfoRow label="会议状态" value={<MeetingStatusTag status="CREATED" />} />
-              <InfoRow label="开始时间" value="--" />
-              <InfoRow label="持续时长" value="--" />
-            </div>
-            <div className="rail-section">
-              <div className="rail-title">AI 纪要</div>
-              <InfoRow label="纪要状态" value={<Tag>等待会议结束</Tag>} />
-            </div>
-            <div className="rail-section">
-              <div className="rail-title">会议信息</div>
-              <InfoRow label="Meeting ID" value={<span className="room__id">{meeting.id}</span>} />
-            </div>
-          </aside>
         </div>
       </div>
     )
@@ -510,8 +650,7 @@ export function MeetingRoomPage() {
 
   // ---- 其它状态：IN_PROGRESS / FINALIZING / COMPLETED ----
   // 四态动作严格：只有 IN_PROGRESS 显示「结束会议」；FINALIZING / COMPLETED 无 start/finish
-  const headerAction =
-    meeting.status === 'IN_PROGRESS' ? (
+  const headerAction = meeting.status === 'IN_PROGRESS' ? (
       <Popconfirm
         title="结束会议后将进入收尾阶段，是否继续？"
         okText="结束会议"
@@ -523,6 +662,14 @@ export function MeetingRoomPage() {
           结束会议
         </Button>
       </Popconfirm>
+    ) : meeting.status === 'COMPLETED' ? (
+      <Button
+        type="primary"
+        icon={<FileTextOutlined />}
+        onClick={() => navigate(`/meetings/${meetingId}/result`)}
+      >
+        查看会议结果
+      </Button>
     ) : undefined
 
   // section head 文案随状态变化（8B-5）。数据语义不变，仅展示文案。
@@ -547,9 +694,10 @@ export function MeetingRoomPage() {
         action={headerAction}
         timer={meeting.status === 'IN_PROGRESS' ? durationText : undefined}
         onBack={() => navigate('/meetings')}
+        details={headerDetails}
       />
 
-      <div className="room__body">
+      <div className="room__body room__body--active">
         <section className="room__transcript">
           <div className="room__section-head">
             {isLive ? <span className="live-dot" aria-hidden /> : null}
@@ -574,22 +722,6 @@ export function MeetingRoomPage() {
                 <span className="finish-step__dot finish-step__dot--ring" aria-hidden />
                 <span>AI 纪要等待生成</span>
               </div>
-            </div>
-          ) : null}
-
-          {/* COMPLETED：完成横幅 + 查看结果 CTA（进入既有 Result 页，8C 前为骨架） */}
-          {meeting.status === 'COMPLETED' ? (
-            <div className="complete-banner">
-              <CheckCircleFilled className="complete-banner__icon" aria-hidden />
-              <span className="complete-banner__text">会议已完成</span>
-              <Button
-                type="primary"
-                size="small"
-                icon={<FileTextOutlined />}
-                onClick={() => navigate(`/meetings/${meetingId}/result`)}
-              >
-                查看会议结果
-              </Button>
             </div>
           ) : null}
 
@@ -630,45 +762,16 @@ export function MeetingRoomPage() {
           ) : null}
         </section>
 
-        <aside className="room__rail">
-          {/* UI-INTEL-1：AI 会议理解（会议进行中的结构化工作记忆）。
-              放在轨首 —— 这是本 Step 新增的核心信息，会议状态等元信息仍是次要。 */}
+        <aside className="room__intelligence">
           <MeetingIntelligencePanel
             state={intelligence.state}
             loading={intelligence.loading}
             error={intelligence.error}
+            isMeetingLive={meeting.status === 'IN_PROGRESS'}
+            pendingSegmentCount={pendingSegmentCount}
             onRefresh={intelligence.refreshState}
             onTraceEvidence={handleTraceEvidence}
           />
-
-          <div className="rail-section">
-            <div className="rail-title">会议状态</div>
-            <InfoRow label="会议状态" value={<MeetingStatusTag status={meeting.status} />} />
-            <InfoRow
-              label="开始时间"
-              value={meeting.started_at ? formatDateTime(meeting.started_at, true) : '--'}
-            />
-            <InfoRow label="持续时长" value={durationText} />
-          </div>
-
-          <div className="rail-section">
-            <div className="rail-title">AI 纪要</div>
-            <InfoRow label="纪要状态" value={summaryTag(meeting.status)} />
-            <InfoRow
-              label="纪要说明"
-              value={
-                <span style={{ fontSize: 12, color: '#8A97AA' }}>
-                  结束会议后自动生成
-                </span>
-              }
-            />
-          </div>
-
-          <div className="rail-section">
-            <div className="rail-title">会议信息</div>
-            <InfoRow label="Meeting ID" value={<span className="room__id">{meeting.id}</span>} />
-            <InfoRow label="转写" value={streamStatusTag(meeting.status, streamStatus)} />
-          </div>
         </aside>
       </div>
     </div>

@@ -35,10 +35,10 @@ Final Summary
 | SSE | 具名帧增量流 + Snapshot 恢复（`after_segment_seq` 游标） |
 | Meeting lifecycle | 四态机 `CREATED → IN_PROGRESS → FINALIZING → COMPLETED` |
 | Mock / Replay | Mock Producer（外部 HTTP 客户端）+ 真实 provider replay 脚本 |
-| Meeting State Agent | 增量工作记忆（AGENT-1），游标幂等 + 批次 + finish 强制 flush |
-| Final Summary V2 | Meeting State + 完整 FINAL 转写；超限时退化为优先证据（AGENT-2） |
+| Meeting State Agent | 近实时工作记忆（AGENT-1），单请求 + pending high-watermark + Memory Snapshot |
+| Final Summary V2 | 冻结后的完整 FINAL 转写为事实源，latest-good State 为可选上下文（AGENT-2） |
 | Evidence trace | `source_segment_seqs` 优先级选择 + ±1 邻域扩展 |
-| legacy fallback | V2 不可用时回落到全量 transcript 路径（设计内降级，非失败） |
+| legacy fallback | 仅由 `FINAL_SUMMARY_V2_ENABLED=false` 显式回退旧输出契约 |
 | FakeProvider | 离线确定性，支持 Meeting State 与 Final Summary 两种 shape |
 | DeepSeek real-provider | 已在真实 DeepSeek 上端到端验证（见 §8） |
 | pytest / regression / frontend build / browser E2E | 全部可离线运行 |
@@ -326,12 +326,10 @@ Transcript FINAL × 6
 * **没有** transcript_fallback
 * source trace 存在（`source_segment_seqs`）
 
-> ⚠️ **已知传输层不稳定（非形状问题）**：实测中偶发过 **provider 120s 超时**
-> （`llm_timeout_seconds` 默认 120）。此时该次 AGENT-1 状态更新失败
-> （`status=FAILED`，游标不推进），但**因为 AGENT-1 是幂等 + 可重放**，
-> 后续触发会重放该批并成功，最终仍收敛到 `summary_source=meeting_state`。
-> 也就是说：**失败被安全吸收，不需要人工介入**；但若遇到超时，属预期内的
-> 可恢复路径。超时阈值可在 `.env` 用 `LLM_TIMEOUT_SECONDS` 调整。
+> Realtime 与 Final Summary 使用不同 SLA：Realtime 默认 25s、provider retry=0；
+> Final Summary 默认 120s，完整 timeout 不自动重试。Realtime 临时失败时游标不推进，
+> 有 last-good 内容则进入 `STALE` 并继续展示，后续 high-watermark 触发会合并重放。
+> Final Summary 始终直接读取冻结 Transcript，不会等待 Realtime 恢复。
 
 复现脚本（**会发真实付费请求，故意不放在 `tests/`，CI 绝不跑**）：
 
@@ -402,9 +400,8 @@ CI
 8. Meeting State merge 区分**字段缺省**与**显式空值**：缺省保留旧值，空数组或
    `null` 清除旧值；提示词要求模型在纠正、撤回或问题解决后输出完整的新状态。
 9. `source_segment_seqs` 只保证**字段存在**，不保证引用正确。
-10. **真实 provider 偶发 120s 超时**（传输层，非模型输出形状问题）。超时会使该次
-    AGENT-1 状态更新 `FAILED`，但因幂等可重放，后续触发会重放该批并收敛；不需要人工
-    介入。超时阈值见 `LLM_TIMEOUT_SECONDS`（默认 120）。
+10. **真实 provider 仍可能超时**。Realtime 以 25s 无重试快速释放 worker，并保留
+    pending watermark；Final Summary 以 120s 独立运行。两条链路互不等待。
 
 ---
 

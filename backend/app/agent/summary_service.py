@@ -402,7 +402,11 @@ def _run_generation(
     # state updates. Empty -> the provider's own default, i.e. exactly the
     # pre-AGENT-2 behaviour. Tests that inject a provider are unaffected.
     model_override = (settings.final_summary_model or "").strip() or None
-    comp = provider if provider is not None else get_provider(model_override)
+    comp = provider if provider is not None else get_provider(
+        model_override,
+        max_retries=1,
+        retry_timeouts=False,
+    )
 
     # --- Phase A: gate + idempotency ---------------------------------------
     with meeting_lock(path_meeting_id):
@@ -464,8 +468,8 @@ def _run_generation(
     # --- Phase B: LLM call — NO lock, NO transaction ------------------------
     # Material selection (Step AGENT-2) happens here, outside the lock: the
     # Final Summary uses Meeting State + complete transcript grounding when the
-    # input fits, priority evidence for oversized meetings, and the legacy full-
-    # transcript shape when state is unusable. The choice is observable.
+    # input fits and priority evidence/snapshots for oversized meetings. The
+    # legacy shape is only an explicit feature-flag rollback.
     raw = None
     parsed: MeetingSummarySchema | None = None
     reason: str | None = None

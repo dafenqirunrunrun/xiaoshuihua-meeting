@@ -11,8 +11,9 @@ Two distinct shapes live here, and the distinction matters:
                         (`version`, `last_processed_segment_seq`). These two
                         fields are owned by US, never by the model.
 
-  `MeetingStateContent` the LLM-WRITABLE part: topics / decisions / action
-                        items / open questions / risks / current topic.
+  `MeetingStateContent` the LLM-WRITABLE part: a user-facing live summary +
+                        topics / decisions / action items / open questions /
+                        risks / current topic.
 
 The LLM only ever produces `MeetingStateContent` (see `MeetingStateUpdate`).
 Letting the model emit `version` or `last_processed_segment_seq` would let it
@@ -87,6 +88,12 @@ class MeetingStateContent(BaseModel):
     schema. This is the object the updater asks the LLM for.
     """
 
+    # Product-facing, cumulative real-time summary. Unlike decisions / actions,
+    # this does NOT require the meeting to have reached a conclusion: once
+    # there is meaningful discussion, the model should keep a concise
+    # 'what is being discussed so far' paragraph here. It is persisted inside
+    # the same state_json, so the finalizer can also use it as working memory.
+    live_summary: str | None = Field(default=None, max_length=3000)
     current_topic: str | None = Field(default=None, max_length=200)
     topics: list[TopicState] = Field(default_factory=list)
     decisions: list[DecisionItem] = Field(default_factory=list)
@@ -108,6 +115,7 @@ class MeetingStateUpdate(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
+    live_summary: str | None = Field(default=None, max_length=3000)
     current_topic: str | None = None
     topics: list[TopicState] = Field(default_factory=list)
     decisions: list[DecisionItem] = Field(default_factory=list)

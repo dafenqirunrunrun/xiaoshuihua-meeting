@@ -173,6 +173,10 @@ export function useMeetingStream({
         useMeetingStore.getState().setFinalSegments(segs)
         const newMax = segs.length ? segs[segs.length - 1].segment_seq : 0
         maxSeqRef.current = newMax
+        // meeting.state.updated is non-durable and may have been missed while
+        // disconnected. Transcript snapshot recovery and AI-state recovery are
+        // paired: GET /state remains authoritative, SSE only invalidates it.
+        onStateInvalidatedRef.current?.()
         openStream(mid, newMax)
       } catch {
         if (genRef.current !== gen) return

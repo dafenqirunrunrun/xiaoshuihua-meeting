@@ -54,9 +54,8 @@ class FinalApplied(NamedTuple):
 def _schedule_agent(background_tasks, meeting_id: str, applied: FinalApplied) -> None:
     """Hand a newly committed FINAL to the meeting-state consumer.
 
-    Deliberately scheduled from the HTTP application layer, on the SAME
-    BackgroundTasks mechanism the Finalizer already uses (Step 7B), and NOT via
-    a callback inside the ASR adapter:
+    Deliberately signalled from the HTTP application layer through the shared
+    coalescing scheduler, and NOT via a callback inside the ASR adapter:
 
         ASR adapter  ->  Transcript Domain  ->  [application layer]  ->  agent
 
@@ -65,16 +64,15 @@ def _schedule_agent(background_tasks, meeting_id: str, applied: FinalApplied) ->
     the function so the transcript package keeps NO import-time dependency on
     the agent package (and cannot grow an import cycle with it).
 
-    A missing `background_tasks` (direct service callers: the legacy scripts)
-    simply means no scheduling — the same "downstream, never blocking" stance.
+    A missing `background_tasks` still identifies direct legacy service callers
+    that opted out of downstream scheduling. When present, no task is added to
+    it; the shared scheduler owns coalescing and worker lifecycle.
     """
     if background_tasks is None:
         return
-    from app.meeting_state import service as meeting_state_service
+    from app.meeting_state.scheduler import meeting_state_scheduler
 
-    background_tasks.add_task(
-        meeting_state_service.run_agent_background, meeting_id
-    )
+    meeting_state_scheduler.schedule(meeting_id)
 
 
 def _canonical(seg: TranscriptSegment) -> tuple[str, str, int | None, int | None]:

@@ -37,7 +37,7 @@ from app.meeting_state import service as state_service
 
 PAYLOAD_FIELDS = ("topics", "decisions", "action_items", "open_questions", "risks")
 PUBLIC_FIELDS = ("meeting_id", "version", "last_processed_segment_seq", "status",
-                 "updated_at", "current_topic", *PAYLOAD_FIELDS)
+                 "updated_at", "live_summary", "current_topic", *PAYLOAD_FIELDS)
 
 PUBLIC_URL = "/api/meetings/{}/state"
 INTERNAL_URL = "/api/internal/meetings/{}/state"
@@ -65,6 +65,7 @@ class ScriptedProvider:
         seqs = _seqs_in_batch(prompt)
         return json.dumps(
             {
+                "live_summary": "当前正在讨论上线安排，并逐步确认时间与后续事项。" if seqs else None,
                 "current_topic": "上线安排" if seqs else None,
                 "topics": [{"title": "上线安排", "summary": "s",
                             "source_segment_seqs": list(seqs)}] if seqs else [],
@@ -91,7 +92,7 @@ def _start_meeting(client, title: str = "上线安排") -> str:
 
 
 def _final(client, meeting_id: str, seq: int, text: str, speaker: str = "speaker_0"):
-    return client.post(
+    response = client.post(
         f"/api/internal/meetings/{meeting_id}/transcript-events",
         json={
             "event_id": f"evt_{meeting_id}_{seq}",
@@ -106,6 +107,10 @@ def _final(client, meeting_id: str, seq: int, text: str, speaker: str = "speaker
             "emitted_at": 1_789_000_000_000 + seq,
         },
     )
+    from app.meeting_state.scheduler import meeting_state_scheduler
+
+    assert meeting_state_scheduler.wait_for_idle(meeting_id, timeout_seconds=2.0)
+    return response
 
 
 def _stream_end(client, meeting_id: str, **over):
@@ -187,7 +192,7 @@ class StateEventRecorder:
 @pytest.fixture
 def agent(monkeypatch) -> ScriptedProvider:
     provider = ScriptedProvider()
-    monkeypatch.setattr("app.agent.llm.factory.get_provider", lambda: provider)
+    monkeypatch.setattr("app.agent.llm.factory.get_provider", lambda **_policy: provider)
     return provider
 
 
@@ -269,6 +274,7 @@ class TestStatusMatrix:
         assert body["status"] == "EMPTY"
         assert body["version"] == 0
         assert body["last_processed_segment_seq"] == 0
+        assert body["live_summary"] is None
         assert body["current_topic"] is None
         for field in PAYLOAD_FIELDS:
             assert body[field] == []
@@ -279,6 +285,7 @@ class TestStatusMatrix:
         assert body["status"] == "ACTIVE"
         assert body["version"] >= 1
         assert body["last_processed_segment_seq"] == 3
+        assert body["live_summary"] == "当前正在讨论上线安排，并逐步确认时间与后续事项。"
         assert body["current_topic"] == "上线安排"
         assert body["decisions"][0]["text"] == "下周三上线"
         assert body["decisions"][0]["source_segment_seqs"] == [3]
@@ -303,9 +310,10 @@ class TestStatusMatrix:
             assert _final(client, mid, seq, f"line {seq}").status_code == 200
 
         body = _public(client, mid)
-        assert body["status"] == "FAILED"
+        assert body["status"] == "STALE"
         assert body["version"] == version_before, "a failure must not bump the version"
         assert body["decisions"], "last good content must be preserved"
+        assert body["live_summary"] == "当前正在讨论上线安排，并逐步确认时间与后续事项。"
         assert body["current_topic"] == "上线安排"
 
     def test_failed_then_recovers_to_active(self, client, agent, monkeypatch):
@@ -387,6 +395,7 @@ class TestCorruptState:
         # would falsely tell the user the AI is working normally).
         for field in PAYLOAD_FIELDS:
             assert body[field] == []
+        assert body["live_summary"] is None
         assert body["current_topic"] is None
 
     def test_corrupt_json_is_not_laundered_into_the_database(self, client, agent, monkeypatch):
@@ -434,6 +443,7 @@ class TestStateEventContract:
         assert set(payload) == {"version", "status"}
         for field in PAYLOAD_FIELDS:
             assert field not in payload
+        assert "live_summary" not in payload
         assert "model_name" not in payload
 
     def test_payload_never_leaks_internal_detail(self, client, agent, monkeypatch, state_events):
@@ -452,7 +462,7 @@ class TestStateEventContract:
     ):
         """The id must not collide for two different states at the same version.
 
-        ACTIVE@1 and FAILED@1 are genuinely different durable states (a failure
+        ACTIVE@1 and STALE@1 are genuinely different durable states (a failure
         does not bump the version), so a version-only id would make them
         indistinguishable to a dedup-ing client.
         """
@@ -465,10 +475,10 @@ class TestStateEventContract:
             assert _final(client, mid, seq, f"line {seq}").status_code == 200
 
         statuses = state_events.statuses
-        assert statuses == ["ACTIVE", "FAILED"]
+        assert statuses == ["ACTIVE", "STALE"]
         ids = [e.sse_id for e in state_events.events]
         assert ids[0] == f"state:{mid}:1:active"
-        assert ids[1] == f"state:{mid}:1:failed"
+        assert ids[1] == f"state:{mid}:1:stale"
         assert ids[0] != ids[1], "equal version must not mean equal id"
 
     def test_event_envelope_renders_as_a_named_sse_frame(self, client, agent, monkeypatch, state_events):
@@ -515,15 +525,15 @@ class TestPublishMatrix:
 
         # Once the provider recovers, the SAME segments (still pending, because a
         # failure never advances the cursor) are replayed and now succeed — and
-        # each success is announced in turn.
+        # the coalesced recovery success is announced once.
         agent.error = None
         for seq in (3, 4):
             assert _final(client, mid, seq, f"line {seq}").status_code == 200
 
-        assert state_events.statuses == ["FAILED", "ACTIVE", "ACTIVE"]
-        assert state_events.versions == [0, 1, 2]
+        assert state_events.statuses == ["FAILED", "ACTIVE"]
+        assert state_events.versions == [0, 1]
         assert state_events.events[0].sse_id == f"state:{mid}:0:failed"
-        assert state_events.events[-1].sse_id == f"state:{mid}:2:active"
+        assert state_events.events[-1].sse_id == f"state:{mid}:1:active"
 
     def test_freeze_is_announced(self, client, agent, monkeypatch, state_events):
         mid = _drive_to_active(client, monkeypatch, agent)

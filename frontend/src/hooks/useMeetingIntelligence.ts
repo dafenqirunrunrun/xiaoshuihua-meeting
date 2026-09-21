@@ -44,8 +44,8 @@ export interface MeetingIntelligenceResult {
  *   - **version**：`incoming.version >= current.version` 才允许落 state。
  *     首个 `version = 0 / status = EMPTY` 必须允许正常进入（初始基线为 -1），
  *     否则「尚未处理任何 FINAL」这一最常见早期状态会被误判为过期。
- *     注意 FAILED **不推进 version**（见后端 mark_failed），所以判定必须是
- *     `>=` 而非 `>` —— 否则同一 version 下的 ACTIVE → FAILED 会被静默丢掉。
+   *     注意 STALE / FAILED **不推进 version**，所以判定必须是 `>=` 而非
+   *     `>` —— 否则同一 version 下的 ACTIVE → STALE 会被静默丢掉。
  *
  * 触发时机：meetingId 变化 / 显式 refreshState（手动或 SSE 失效）。
  * 无轮询、无定时器。
@@ -76,7 +76,7 @@ export function useMeetingIntelligence(
         .then((data) => {
           // 守卫 1：只有最后一次请求可以落 state（乱序返回的旧响应丢弃）
           if (seq !== seqRef.current || mid !== meetingRef.current) return
-          // 守卫 2：version 只能前进（含持平 —— FAILED 不推进 version）
+          // 守卫 2：version 只能前进（含持平 —— STALE/FAILED 不推进 version）
           if (data.version < versionRef.current) return
           versionRef.current = data.version
           setState(data)

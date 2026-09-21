@@ -130,7 +130,7 @@ PARTIAL 永远不会出现在此接口。Meeting 不存在 → **404**。
 ```
 
 - **`status`** 是 Meeting State 自身的处理状态
-  （`EMPTY` / `ACTIVE` / `FAILED` / `FROZEN`），**不是** Meeting 四态机。
+  （`EMPTY` / `ACTIVE` / `STALE` / `FAILED` / `FROZEN`），**不是** Meeting 四态机。
   两个维度独立：会议 `COMPLETED` + 状态 `FAILED` 是**合法组合**。
 - **`version`** 单调递增，**只由后端在成功更新时推进**（失败不推进）。
 - Meeting 不存在 → **404**。会议存在但**尚未处理任何 FINAL** → **200** +
@@ -325,7 +325,7 @@ Receive → Validate(status/meeting/seq) → Idempotency Check → Persist → C
 - **稳定 SSE id（Part 13）**：FINAL = `final:<meeting_id>:<segment_seq>`。
   Meeting State 变更 = `state:<meeting_id>:<version>:<status>`（**必须带 status** ——
   FAILED 刻意不推进 version，仅凭 version 无法区分同 version 下的
-  `ACTIVE@N` 与 `FAILED@N`；见 `protocols/realtime-events.md §4`）。
+  `ACTIVE@N` 与 `STALE@N`；见 `protocols/realtime-events.md §4`）。
 - **PARTIAL 不重放**（Part 12）：只 live 推送，断线后不补。
 - `TRANSCRIPT_STREAM_END` **不广播**（PRD §30 未列出，契约不可扩展）。
 - `Last-Event-ID` header **未实现**（Part 14）：`after_segment_seq` 是唯一恢复游标。
@@ -471,10 +471,11 @@ FINAL after Stream End（Part 8）：
 }
 ```
 
-- `status` ∈ `EMPTY` / `ACTIVE` / `FAILED` / `FROZEN`（Agent 内部状态，
+- `status` ∈ `EMPTY` / `ACTIVE` / `STALE` / `FAILED` / `FROZEN`（Agent 内部状态，
   **不是** Meeting 状态机的一部分 —— Meeting 仍然只有四态）。
 - `version` 与 `last_processed_segment_seq` 由**系统维护**，模型不可写。
-- `FAILED` 时 `last_error` 有值，且内容/游标**保持失败前**的值。
+- `STALE` 表示有 last-good 内容但最近一次更新失败；`FAILED` 表示尚无可用内容。
+  两者都不推进游标，已成功内容保持不变。
 
 ### POST /api/internal/meetings/{meeting_id}/state/process-pending
 

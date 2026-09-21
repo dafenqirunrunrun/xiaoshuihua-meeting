@@ -56,6 +56,10 @@ def fresh_schema(app_module) -> Iterator[None]:
     from app.agent.summary_model import MeetingSummary  # noqa: F401
     from app.meeting.meeting_model import Meeting  # noqa: F401
     from app.meeting_state.model import MeetingState  # noqa: F401
+    from app.meeting_state.snapshot_model import (  # noqa: F401
+        MeetingMemorySnapshot,
+        MeetingStateHealth,
+    )
     from app.transcript.segment_model import TranscriptSegment  # noqa: F401
     from app.transcript.stream_model import TranscriptStream  # noqa: F401
 
@@ -90,11 +94,25 @@ def reset_inprocess_state() -> Iterator[None]:
     from app.transcript.live_cache import live_utterance_cache
     from app.meeting_state.scheduler import meeting_state_scheduler
 
+    meeting_state_scheduler.cancel_all_pending()
     assert meeting_state_scheduler.wait_for_idle(timeout_seconds=10.0)
+    # Production uses 8 segments / 25s / 10s silence. Unit tests exercise the
+    # service thresholds directly, so make scheduler delivery immediate while
+    # retaining the exact same one-worker/coalescing implementation.
+    meeting_state_scheduler._min_signals = 2**31 - 1
+    meeting_state_scheduler._silence_seconds = 0.0
+    meeting_state_scheduler._target_interval_seconds = 0.0
+    meeting_state_scheduler._max_wait_seconds = 0.0
+    from app.meeting_state.service import run_agent_background
+
+    meeting_state_scheduler._runner = lambda meeting_id: run_agent_background(
+        meeting_id, force_flush=False
+    )
     device_meeting_bindings.clear()
     audio_session_manager.clear()
     yield
 
+    meeting_state_scheduler.cancel_all_pending()
     assert meeting_state_scheduler.wait_for_idle(timeout_seconds=10.0)
     device_meeting_bindings.clear()
     audio_session_manager.clear()

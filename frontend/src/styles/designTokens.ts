@@ -1,6 +1,6 @@
 /**
  * Design Tokens —— 视觉「轻量、克制、现代 AI Meeting Workspace」的唯一数据源。
- * （fronted_designer §47 色值 + Step 8B-5 Visual Polish：冰蓝工作台 + 薄荷呼吸点）
+ * （fronted_designer §47 色值 + Step 8B-5 Visual Polish：中性内容工作台 + 薄荷呼吸点）
  *
  * 规则：
  *  - 组件 / 页面禁止散落 magic color / radius / spacing；
@@ -9,10 +9,10 @@
  */
 export const designTokens = {
   // Brand —— 克制使用：主 CTA、激活态、live 指示
-  colorPrimary: '#3478F6',
-  colorPrimaryHover: '#5592FF',
-  colorPrimaryActive: '#1F63E8',
-  colorPrimaryLight: '#EDF4FF',
+  colorPrimary: '#F43F5E',
+  colorPrimaryHover: '#FB5B73',
+  colorPrimaryActive: '#E11D48',
+  colorPrimaryLight: '#FFF1F3',
 
   // AI / Live —— 只在「实时 / AI / 就绪」信号使用，绝不用于纯 decoration
   colorMint: '#20B486',
@@ -23,26 +23,26 @@ export const designTokens = {
   colorWarning: '#F5A623',
   colorDanger: '#F04438',
 
-  // Neutrals —— 冰蓝底、纯白卡片、蓝墨字
-  colorBgPage: '#F6F9FC',
+  // Neutrals —— 暖白页面、纯白内容面、近黑正文
+  colorBgPage: '#F7F7F8',
   colorBgSurface: '#FFFFFF',
-  colorBgSubtle: '#F1F5FA',
-  colorTextPrimary: '#172033',
-  colorTextSecondary: '#48556A',
-  colorTextTertiary: '#8A97AA',
-  colorBorder: '#E8EEF5',
-  colorBorderLight: '#EEF3F9',
+  colorBgSubtle: '#F2F2F3',
+  colorTextPrimary: '#202124',
+  colorTextSecondary: '#55575D',
+  colorTextTertiary: '#92949A',
+  colorBorder: '#E7E7EA',
+  colorBorderLight: '#F0F0F2',
 
-  // Radius —— 主卡 16 / 小组件 12 / 按钮 10
-  radiusSm: 10,
-  radiusMd: 12,
-  radiusLg: 16,
+  // Radius —— 内容产品保持紧凑，圆形只留给头像和状态点
+  radiusSm: 6,
+  radiusMd: 8,
+  radiusLg: 8,
 
   // Shadow —— 非常弱，hover 略升；边框优先于阴影
   shadowCard:
-    '0 1px 2px rgba(23, 32, 51, 0.04), 0 4px 12px rgba(23, 32, 51, 0.04)',
+    '0 1px 2px rgba(32, 33, 36, 0.03), 0 4px 14px rgba(32, 33, 36, 0.035)',
   shadowCardHover:
-    '0 2px 4px rgba(23, 32, 51, 0.05), 0 12px 28px rgba(23, 32, 51, 0.09)',
+    '0 2px 5px rgba(32, 33, 36, 0.04), 0 12px 28px rgba(32, 33, 36, 0.07)',
 
   // Layout
   sidebarWidth: 220,

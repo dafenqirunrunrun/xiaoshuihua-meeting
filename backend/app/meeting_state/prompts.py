@@ -36,6 +36,7 @@ _EMPTY_STATE = "(尚无状态，这是第一次更新)"
 # reviewer can see both at once; the PARSE gate is `MeetingStateUpdate`, and the
 # tests assert they stay in sync.
 OUTPUT_SHAPE = """{
+  "live_summary": "面向参会人的实时会议摘要（已有有效讨论时用 2-4 句话概括；只有无意义片段时为 null）",
   "current_topic": "当前正在讨论的议题（没有明确议题时为 null）",
   "topics": [{"title": "议题", "summary": "该议题的要点", "source_segment_seqs": [1, 2]}],
   "decisions": [{"text": "已确定的结论", "source_segment_seqs": [8, 9]}],
@@ -56,13 +57,21 @@ _RULES = """要求：
   5. owner 未明确时为 null，deadline 未明确时为 null，不要写"未指定"之类的占位文本。
   6. 每条 decision / action_item / open_question / risk 都要带 source_segment_seqs，
      值为该条信息所依据的转写片段编号（即下面方括号里的数字）。
-  7. current_topic 反映最近正在讨论的议题。
-  8. 所有列表即使为空也要给出空数组。
-  9. 直接输出 JSON 本体，不要包裹在 ```json ``` 代码块中。
-  10. 不要输出 version / last_processed_segment_seq，这两个字段由系统维护。
-  11. 转写来自 ASR，可能有同音字、断句错误、口头重复和说话人编号。可删除无意义
+  7. live_summary 是给参会人直接阅读的实时会议摘要，而不是结构化字段的重复展示。
+     只要已经出现可理解的有效讨论，即使尚未形成 decision / action_item，也要用
+     2-4 句话概括截至目前的主要讨论、当前关注点和已经明确的进展；不要因为
+     '尚无结论' 就返回 null。只有新内容仅是问候、测试音频、无意义碎片，且此前
+     也没有有效讨论时，才可以为 null。
+  8. live_summary 必须基于旧摘要 + 新转写进行重新收敛，不要机械追加，不要无限变长。
+     新一轮只是闲聊或无关插话时，不要让它覆盖此前的重要会议内容；有明确修正时
+     以最新表达为准。使用自然、简洁、面向用户的中文，不写'AI认为/根据转写'。
+  9. current_topic 反映最近正在讨论的议题。
+  10. 所有列表即使为空也要给出空数组。
+  11. 直接输出 JSON 本体，不要包裹在 ```json ``` 代码块中。
+  12. 不要输出 version / last_processed_segment_seq，这两个字段由系统维护。
+  13. 转写来自 ASR，可能有同音字、断句错误、口头重复和说话人编号。可删除无意义
       语气词并合并重复内容，但不得凭常识猜测或改写不确定的人名、数字、日期和专有名词。
-  12. 同一事项出现自我修正时，以最后一次明确表达为准，并保留能说明修正过程的证据。"""
+  14. 同一事项出现自我修正时，以最后一次明确表达为准，并保留能说明修正过程的证据。"""
 
 
 def render_state(content: MeetingStateContent) -> str:

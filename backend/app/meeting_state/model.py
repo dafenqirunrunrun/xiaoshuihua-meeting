@@ -65,9 +65,9 @@ class MeetingState(Base):
     # meeting_summary *_json convention.
     state_json: Mapped[str | None] = mapped_column(Text, nullable=True)
 
-    # EMPTY (row exists, nothing processed yet) / ACTIVE / FAILED (last update
-    # failed; the PREVIOUS state_json is preserved untouched) / FROZEN (the
-    # transcript froze and the final flush completed — no further updates).
+    # EMPTY / ACTIVE / STALE (a transient update failed but last-good content is
+    # preserved) / FAILED (no usable content yet) / FROZEN (archived last-good
+    # view; its cursor may trail the independently frozen transcript).
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="EMPTY")
 
     # Provider identity of the last SUCCESSFUL update (traceability: which model

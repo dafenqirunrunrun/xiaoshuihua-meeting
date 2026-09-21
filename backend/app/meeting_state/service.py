@@ -36,11 +36,10 @@ next trigger replays exactly the segments that were not folded in.
 
 Batch / flush policy
 --------------------
-The batch is NOT flushed per segment (one LLM call per FINAL would be ruinous in
-cost and latency). The process-local scheduler merges FINALs over a short quiet
-window, capped by a maximum wait, then force-flushes that live window. Direct
-callers can still use the size thresholds (`batch_max_segments` /
-`batch_max_chars`), and the finalizer performs one last forced flush at Finish.
+The batch is NOT flushed per segment. The process-local scheduler tracks one
+pending high-watermark per meeting and triggers on segment count, silence or a
+bounded interval. One run performs at most one LLM call over one larger
+contiguous window. Finalization never drains or waits for this pipeline.
 
 Phase A / B / C
 ---------------
@@ -55,13 +54,13 @@ from __future__ import annotations
 import logging
 import time
 import uuid
-from datetime import datetime, timezone
 
 from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.meeting.meeting_model import Meeting
 from app.meeting_state import repository as state_repository
+from app.meeting_state import snapshot_repository
 from app.meeting_state import updater
 from app.meeting_state.prompts import build_repair_prompt, build_update_prompt
 from app.meeting_state.schemas import MeetingState, MeetingStateContent, MeetingStatePublic
@@ -77,6 +76,7 @@ logger = logging.getLogger(__name__)
 # machine stays four-state; this is the agent's own working status).
 STATUS_EMPTY = "EMPTY"
 STATUS_ACTIVE = "ACTIVE"
+STATUS_STALE = "STALE"
 STATUS_FAILED = "FAILED"
 STATUS_FROZEN = "FROZEN"
 
@@ -89,10 +89,6 @@ OUTCOME_SUPERSEDED = "SUPERSEDED"
 OUTCOME_TOO_LARGE = "BATCH_TOO_LARGE"
 OUTCOME_LIMIT_REACHED = "BATCH_LIMIT_REACHED"
 OUTCOME_NOT_FOUND = "MEETING_NOT_FOUND"
-
-
-def _utcnow_iso() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 
 def _publish_state_changed(
@@ -111,13 +107,14 @@ def _publish_state_changed(
     version-gated publish would hide exactly the transition the panel needs.
 
         ACTIVE vN -> ACTIVE vN+1   version moved      -> publish
-        ACTIVE|EMPTY -> FAILED     status moved       -> publish
-        FAILED -> ACTIVE           status + version   -> publish
+        ACTIVE -> STALE            status moved       -> publish
+        EMPTY -> FAILED            status moved       -> publish
+        STALE|FAILED -> ACTIVE     status + version   -> publish
         ACTIVE -> FROZEN           status moved       -> publish
-        FAILED -> FAILED           neither moved      -> SUPPRESSED
+        STALE -> STALE             neither moved      -> SUPPRESSED
 
     That last row is why this is a predicate and not a bare call: a retry that
-    fails again re-writes the same FAILED status, and waking the panel for a
+    fails again re-writes the same degraded status, and waking the panel for a
     no-op would make an outage generate a re-fetch per retry. The comparison is
     against the status/version read immediately BEFORE the write, so it reflects
     the real prior durable state rather than the state at the start of the run.
@@ -244,6 +241,7 @@ def merge_content(
         return getattr(update, name) if name in fields_set else getattr(previous, name)
 
     return MeetingStateContent(
+        live_summary=value("live_summary"),
         current_topic=value("current_topic"),
         topics=value("topics"),
         decisions=value("decisions"),
@@ -302,6 +300,12 @@ def process_pending(
     meeting = db.get(Meeting, meeting_id)
     if meeting is None:
         return {"outcome": OUTCOME_NOT_FOUND, "agent_run_id": run_id}
+    if meeting.status != "IN_PROGRESS":
+        return {
+            "outcome": OUTCOME_NO_WORK,
+            "agent_run_id": run_id,
+            "reason": f"meeting status is {meeting.status}; realtime processing stopped",
+        }
 
     # --- Phase A: read state + batch under the lock (short, no LLM) ---------
     with meeting_lock(meeting_id):
@@ -319,236 +323,165 @@ def process_pending(
             )
             return {"outcome": OUTCOME_FAILED, "agent_run_id": run_id,
                     "reason": str(exc), "from_segment_seq": cursor, "to_segment_seq": cursor}
-        frozen = stream_service.is_frozen(db, meeting_id)
         pending = _pending_segments(db, meeting_id, cursor)
 
     if not pending:
-        # Nothing new. If the transcript is frozen, this is the moment to close
-        # the state out (idempotent: FROZEN -> FROZEN is a no-op write).
-        #
-        # A FAILED row is left alone: it means the last update did not land, and
-        # the pending segments that failed are still pending — they cannot be
-        # zero here. If they ARE zero, the failure was on a batch that has since
-        # been superseded and there is nothing left to do; FROZEN would then be
-        # an unearned claim, so we report NO_WORK and leave the failure visible.
-        if frozen and row is not None and row.status == STATUS_ACTIVE:
-            with meeting_lock(meeting_id):
-                # Capture the PRIOR status BEFORE the write: `upsert` mutates the
-                # identity-mapped row in place, so reading `row.status` afterwards
-                # would return the new FROZEN value and make this look like a
-                # no-op change (see `_current_state_identity`).
-                previous_status = row.status
-                previous_version = row.version
-                state_repository.upsert(
-                    db, meeting_id,
-                    content=previous,
-                    version=version,
-                    last_processed_segment_seq=cursor,
-                    status=STATUS_FROZEN,
-                    model_name=row.model_name,
-                )
-            # ACTIVE -> FROZEN is a product-visible change (the panel switches to
-            # its archived presentation). Version deliberately does NOT move: the
-            # cursor did not advance, so there is nothing new to count.
-            _publish_state_changed(meeting_id, version=version, status=STATUS_FROZEN,
-                                   previous_version=previous_version,
-                                   previous_status=previous_status)
-            return {"outcome": OUTCOME_OK, "agent_run_id": run_id, "status": STATUS_FROZEN,
+        return {"outcome": OUTCOME_NO_WORK, "agent_run_id": run_id}
+
+    # A realtime pass is one coalesced high-watermark window and therefore at
+    # most one provider call. The old implementation split a ready range into
+    # many 8-segment calls and synchronously drained all of them, which merely
+    # hid an unbounded LLM queue inside one worker.
+    if not force_flush:
+        pending_chars = sum(len(segment.text or "") for segment in pending)
+        if (
+            len(pending) < settings.meeting_agent_batch_max_segments
+            and pending_chars < settings.meeting_agent_batch_max_chars
+        ):
+            return {"outcome": OUTCOME_NO_WORK, "agent_run_id": run_id,
+                    "buffered_segment_seqs": [s.segment_seq for s in pending],
                     "from_segment_seq": cursor, "to_segment_seq": cursor,
                     "previous_state_version": version, "new_state_version": version,
                     "batches": 0}
-        return {"outcome": OUTCOME_NO_WORK, "agent_run_id": run_id}
 
-    # --- batching -----------------------------------------------------------
-    # Normal runs flush only threshold-reaching batches and LEAVE the remainder
-    # buffered (no timer scheduler: it is picked up by the next FINAL, or by the
-    # forced flush at finish time — §5/§11).
-    #
-    # A forced flush drains the remainder too, but still through the SAME
-    # batching bounds: the bounds keep one prompt bounded, so exceeding them
-    # just means "more calls". Merging everything into one oversized call would
-    # be rejected by the size guard below — losing exactly the trailing
-    # sentences the forced flush exists to save.
-    if force_flush:
-        batches = _chunk(pending, max_segments=settings.meeting_agent_batch_max_segments,
-                         max_chars=settings.meeting_agent_batch_max_chars)
-    else:
-        batches, _remainder = select_batches(
-            pending,
-            max_segments=settings.meeting_agent_batch_max_segments,
-            max_chars=settings.meeting_agent_batch_max_chars,
-        )
-
-    if not batches:
-        # Everything pending is below the thresholds: buffer it and wait. The
-        # state (and its cursor) is untouched, so nothing is lost or re-read.
-        return {"outcome": OUTCOME_NO_WORK, "agent_run_id": run_id,
-                "buffered_segment_seqs": [s.segment_seq for s in pending],
-                "from_segment_seq": cursor, "to_segment_seq": cursor,
-                "previous_state_version": version, "new_state_version": version,
-                "batches": 0}
-
-    limit = len(batches) if force_flush else max(1, settings.meeting_agent_max_batches_per_run)
-    truncated = len(batches) > limit
-    batches = batches[:limit]
-    processed_count = sum(len(b) for b in batches)
+    batch = _coalesced_window(
+        pending, max_chars=settings.meeting_agent_max_batch_chars
+    )
 
     if provider is None:
         from app.agent.llm.factory import get_provider
 
-        provider = get_provider()
+        provider = get_provider(max_retries=0, retry_timeouts=False)
 
-    processed_batches = 0
     from_seq = cursor
-    to_seq = cursor
-
-    for batch in batches:
-        batch_end = batch[-1].segment_seq
-        batch_text = "\n".join(f"[{s.segment_seq}] <{s.speaker_id}> {s.text}" for s in batch)
-        state_text = _state_text_for_guard(previous)
-
-        reason = _guard_prompt_sizes(state_text, batch_text)
-        if reason is not None:
-            # No silent truncation: skip the batch, leave the state untouched,
-            # and report. A later trigger retries (the segments stay pending).
-            with meeting_lock(meeting_id):
-                before_status, before_version = _current_state_identity(db, meeting_id)
-                state_repository.mark_failed(db, meeting_id, reason=reason,
-                                             model_name=getattr(provider, "name", None))
-            # A failure is a product-visible change even though NOTHING else
-            # moved: content and cursor are preserved and `version` does not
-            # increment (it counts SUCCESSFUL updates). The panel must be able to
-            # say "AI 整理暂时不可用" while still showing the last good content.
-            _publish_state_changed(meeting_id, version=version, status=STATUS_FAILED,
-                                   previous_version=before_version, previous_status=before_status)
-            _log_run(meeting_id, run_id, from_seq, batch_end, version, version, 0,
-                     OUTCOME_TOO_LARGE, reason)
-            return {"outcome": OUTCOME_TOO_LARGE, "agent_run_id": run_id, "reason": reason,
-                    "from_segment_seq": from_seq, "to_segment_seq": batch_end,
-                    "previous_state_version": version, "new_state_version": version,
-                    "batches": processed_batches}
-
-        prompt = build_update_prompt(
-            meeting.title, previous, batch, last_processed_segment_seq=cursor
-        )
-
-        # --- Phase B: LLM call — NO lock, NO open transaction ---------------
-        llm_started = time.monotonic()
-        result = updater.run_update(
-            provider,
-            prompt,
-            build_repair_prompt=build_repair_prompt,
-            max_attempts=settings.meeting_agent_max_attempts,
-            repair_enabled=settings.meeting_agent_parse_repair,
-        )
-        latency_ms = int((time.monotonic() - llm_started) * 1000)
-
-        if not result.ok:
-            # Failure policy: record, do NOT advance the cursor, do NOT touch
-            # state_json. The next trigger replays exactly these segments.
-            with meeting_lock(meeting_id):
-                before_status, before_version = _current_state_identity(db, meeting_id)
-                state_repository.mark_failed(
-                    db, meeting_id, reason=result.reason or "unknown error",
-                    model_name=getattr(provider, "name", None),
-                )
-            # Same non-version-bumping failure notice as the size-guard path
-            # above, and for the same reason: the durable status changed.
-            _publish_state_changed(meeting_id, version=version, status=STATUS_FAILED,
-                                   previous_version=before_version, previous_status=before_status)
-            _log_run(meeting_id, run_id, from_seq, batch_end, version, version,
-                     latency_ms, OUTCOME_FAILED, result.reason)
-            return {"outcome": OUTCOME_FAILED, "agent_run_id": run_id,
-                    "reason": result.reason, "from_segment_seq": from_seq,
-                    "to_segment_seq": batch_end, "previous_state_version": version,
-                    "new_state_version": version, "batches": processed_batches}
-
-        merged = merge_content(previous, result.parsed)
-
-        # --- Phase C: write back under the lock, re-validating the cursor ----
+    batch_end = batch[-1].segment_seq
+    batch_text = "\n".join(
+        f"[{s.segment_seq}] <{s.speaker_id}> {s.text}" for s in batch
+    )
+    state_text = _state_text_for_guard(previous)
+    reason = _guard_prompt_sizes(state_text, batch_text)
+    if reason is not None:
         with meeting_lock(meeting_id):
-            fresh = state_repository.get(db, meeting_id)
-            fresh_cursor = fresh.last_processed_segment_seq if fresh is not None else 0
-            fresh_version = fresh.version if fresh is not None else 0
-            if fresh_cursor != cursor:
-                # Another run advanced the state while we were in the LLM call.
-                # Our update was derived from a now-stale state: discard it
-                # (never persist) and let the next trigger replay what is left.
-                _log_run(meeting_id, run_id, from_seq, batch_end, version, fresh_version,
-                         latency_ms, OUTCOME_SUPERSEDED, None)
-                return {"outcome": OUTCOME_SUPERSEDED, "agent_run_id": run_id,
-                        "from_segment_seq": from_seq, "to_segment_seq": batch_end,
-                        "previous_state_version": version,
-                        "new_state_version": fresh_version, "batches": processed_batches}
-
-            new_version = fresh_version + 1
-            status = STATUS_FROZEN if (frozen and batch_end == pending[-1].segment_seq) else STATUS_ACTIVE
-            # Captured as plain values before the write: `upsert` mutates the
-            # identity-mapped row in place, so a later `fresh.status` read would
-            # already show the new status (see `_current_state_identity`).
-            previous_status = fresh.status if fresh is not None else None
-            state_repository.upsert(
-                db, meeting_id,
-                content=merged,
-                version=new_version,
-                last_processed_segment_seq=batch_end,
-                status=status,
+            before_status, before_version = _current_state_identity(db, meeting_id)
+            failed = state_repository.mark_failed(
+                db, meeting_id, reason=reason,
                 model_name=getattr(provider, "name", None),
-                last_error=None,
             )
+        _publish_state_changed(meeting_id, version=version, status=failed.status,
+                               previous_version=before_version,
+                               previous_status=before_status)
+        _log_run(meeting_id, run_id, from_seq, batch_end, version, version, 0,
+                 OUTCOME_TOO_LARGE, reason)
+        return {"outcome": OUTCOME_TOO_LARGE, "agent_run_id": run_id,
+                "reason": reason, "from_segment_seq": from_seq,
+                "to_segment_seq": batch_end, "previous_state_version": version,
+                "new_state_version": version, "batches": 0}
 
-        # Announced AFTER the lock is released and the row is committed. This is
-        # the successful-update case (version bumped), and it also covers the
-        # recovery transition FAILED -> ACTIVE for free: `mark_failed` never
-        # bumped the version, so the next successful upsert both advances it and
-        # drops `last_error`, which is exactly what the panel needs to see.
-        # Publishing inside the critical section would only lengthen it.
-        _publish_state_changed(meeting_id, version=new_version, status=status,
-                               previous_version=fresh_version,
-                               previous_status=previous_status)
+    prompt = build_update_prompt(
+        meeting.title, previous, batch, last_processed_segment_seq=cursor
+    )
+    snapshot_repository.record_attempt(db, meeting_id)
+    llm_started = time.monotonic()
+    result = updater.run_update(
+        provider,
+        prompt,
+        build_repair_prompt=build_repair_prompt,
+        max_attempts=settings.meeting_agent_max_attempts,
+        repair_enabled=settings.meeting_agent_parse_repair,
+    )
+    latency_ms = int((time.monotonic() - llm_started) * 1000)
 
-        _log_run(meeting_id, run_id, from_seq, batch_end, version, new_version,
-                 latency_ms, OUTCOME_OK, None)
-        # Advance our own view of the state WITH the commit. `cursor` is what the
-        # next iteration's Phase C staleness check compares against, and what the
-        # next prompt reports as already-processed — leaving it at the value from
-        # Phase A would make every batch after the first look superseded and
-        # silently abandon the rest of the run.
-        previous = merged
-        version = new_version
-        cursor = batch_end
-        to_seq = batch_end
-        processed_batches += 1
+    if not result.ok:
+        with meeting_lock(meeting_id):
+            before_status, before_version = _current_state_identity(db, meeting_id)
+            failed = state_repository.mark_failed(
+                db, meeting_id, reason=result.reason or "unknown error",
+                model_name=getattr(provider, "name", None),
+            )
+        _publish_state_changed(meeting_id, version=version, status=failed.status,
+                               previous_version=before_version,
+                               previous_status=before_status)
+        _log_run(meeting_id, run_id, from_seq, batch_end, version, version,
+                 latency_ms, OUTCOME_FAILED, result.reason)
+        return {"outcome": OUTCOME_FAILED, "agent_run_id": run_id,
+                "reason": result.reason, "from_segment_seq": from_seq,
+                "to_segment_seq": batch_end, "pending_until": pending[-1].segment_seq,
+                "processed_until": cursor, "previous_state_version": version,
+                "new_state_version": version, "batches": 0}
 
-    outcome = OUTCOME_LIMIT_REACHED if truncated else OUTCOME_OK
-    if truncated:
-        logger.info(
-            "meeting state batch limit reached; remaining segments left for the next trigger",
-            extra={"meeting_id": meeting_id, "agent_run_id": run_id},
+    merged = merge_content(previous, result.parsed)
+    with meeting_lock(meeting_id):
+        fresh = state_repository.get(db, meeting_id)
+        fresh_cursor = fresh.last_processed_segment_seq if fresh is not None else 0
+        fresh_version = fresh.version if fresh is not None else 0
+        if fresh_cursor != cursor:
+            _log_run(meeting_id, run_id, from_seq, batch_end, version, fresh_version,
+                     latency_ms, OUTCOME_SUPERSEDED, None)
+            return {"outcome": OUTCOME_SUPERSEDED, "agent_run_id": run_id,
+                    "from_segment_seq": from_seq, "to_segment_seq": batch_end,
+                    "previous_state_version": version,
+                    "new_state_version": fresh_version, "batches": 0}
+
+        new_version = fresh_version + 1
+        # Finish may freeze the transcript while this provider call is in
+        # flight. Persisting its valid result is fine, but never reopen the
+        # archived state as ACTIVE afterwards.
+        status = STATUS_FROZEN if stream_service.is_frozen(db, meeting_id) else STATUS_ACTIVE
+        previous_status = fresh.status if fresh is not None else None
+        snapshot_repository.add_snapshot(
+            db,
+            meeting_id,
+            from_segment_seq=batch[0].segment_seq,
+            to_segment_seq=batch_end,
+            window_start_ms=batch[0].start_ms,
+            window_end_ms=batch[-1].end_ms,
+            content=merged,
+            model_name=getattr(provider, "name", None),
         )
+        state_repository.upsert(
+            db, meeting_id,
+            content=merged,
+            version=new_version,
+            last_processed_segment_seq=batch_end,
+            status=status,
+            model_name=getattr(provider, "name", None),
+            last_error=None,
+        )
+
+    _publish_state_changed(meeting_id, version=new_version, status=status,
+                           previous_version=fresh_version,
+                           previous_status=previous_status)
+    _log_run(meeting_id, run_id, from_seq, batch_end, version, new_version,
+             latency_ms, OUTCOME_OK, None)
+    remaining = [s.segment_seq for s in pending[len(batch):]]
     return {
-        "outcome": outcome,
+        "outcome": OUTCOME_LIMIT_REACHED if remaining else OUTCOME_OK,
         "agent_run_id": run_id,
         "from_segment_seq": from_seq,
-        "to_segment_seq": to_seq,
-        "previous_state_version": version - processed_batches,
-        "new_state_version": version,
-        "batches": processed_batches,
-        "remaining_segment_seqs": [s.segment_seq for s in pending[processed_count:]],
+        "to_segment_seq": batch_end,
+        "pending_until": pending[-1].segment_seq,
+        "processed_until": batch_end,
+        "previous_state_version": version,
+        "new_state_version": new_version,
+        "batches": 1,
+        "remaining_segment_seqs": remaining,
         "latency_ms": int((time.monotonic() - started) * 1000),
     }
 
 
-def _chunk(
-    segments: list[TranscriptSegment], *, max_segments: int, max_chars: int
-) -> list[list[TranscriptSegment]]:
-    """Split into ALL batches including the trailing one (forced-flush path)."""
-    ready, remainder = select_batches(
-        segments, max_segments=max_segments, max_chars=max_chars
-    )
-    if remainder:
-        ready.append(remainder)
-    return ready
+def _coalesced_window(
+    segments: list[TranscriptSegment], *, max_chars: int
+) -> list[TranscriptSegment]:
+    """Largest contiguous pending prefix that fits one realtime LLM call."""
+    selected: list[TranscriptSegment] = []
+    chars = 0
+    for segment in segments:
+        line_chars = len(segment.text or "")
+        if selected and chars + line_chars > max_chars:
+            break
+        selected.append(segment)
+        chars += line_chars
+    return selected
 
 
 def _state_text_for_guard(content: MeetingStateContent) -> str:
@@ -609,6 +542,40 @@ def get_state(db: Session, meeting_id: str) -> MeetingState:
         model_name=row.model_name,
         updated_at=row.updated_at.isoformat() if row.updated_at else None,
         **content.model_dump(),
+    )
+
+
+def freeze_state(db: Session, meeting_id: str) -> None:
+    """Archive the last-good realtime view without invoking the LLM.
+
+    Transcript freeze and Final Summary are independent of realtime coverage.
+    This only communicates that no more live refreshes will be scheduled; the
+    cursor still truthfully exposes how much transcript the view covered.
+    """
+    with meeting_lock(meeting_id):
+        row = state_repository.get(db, meeting_id)
+        if row is None or row.status in {STATUS_EMPTY, STATUS_FAILED, STATUS_FROZEN}:
+            return
+        previous_status = row.status
+        previous_version = row.version
+        content = state_repository.get_content(db, meeting_id)
+        state_repository.upsert(
+            db,
+            meeting_id,
+            content=content,
+            version=row.version,
+            last_processed_segment_seq=row.last_processed_segment_seq,
+            status=STATUS_FROZEN,
+            model_name=row.model_name,
+            last_error=row.last_error,
+            record_health_success=False,
+        )
+    _publish_state_changed(
+        meeting_id,
+        version=previous_version,
+        status=STATUS_FROZEN,
+        previous_version=previous_version,
+        previous_status=previous_status,
     )
 
 
@@ -703,6 +670,7 @@ def run_agent_background(
 __all__ = [
     "STATUS_ACTIVE",
     "STATUS_EMPTY",
+    "STATUS_STALE",
     "STATUS_FAILED",
     "STATUS_FROZEN",
     "merge_content",
@@ -710,5 +678,6 @@ __all__ = [
     "select_batches",
     "get_state",
     "get_public_state",
+    "freeze_state",
     "run_agent_background",
 ]

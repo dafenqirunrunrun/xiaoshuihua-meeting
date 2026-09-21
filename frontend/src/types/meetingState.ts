@@ -16,7 +16,7 @@
  * Meeting 生命周期只有 CREATED / IN_PROGRESS / FINALIZING / COMPLETED；
  * 这里描述的是 AGENT-1 自身的处理状态，两个维度互不影响。
  */
-export type MeetingStateStatus = 'EMPTY' | 'ACTIVE' | 'FAILED' | 'FROZEN'
+export type MeetingStateStatus = 'EMPTY' | 'ACTIVE' | 'STALE' | 'FAILED' | 'FROZEN'
 
 /** 一条讨论议题 */
 export interface TopicState {
@@ -76,6 +76,8 @@ export interface MeetingState {
   last_processed_segment_seq: number
   status: MeetingStateStatus
   updated_at: string | null
+  /** 面向参会人的实时会议摘要；有有效讨论时由后端随 Meeting State 增量收敛。 */
+  live_summary: string | null
   current_topic: string | null
   topics: TopicState[]
   decisions: DecisionItem[]

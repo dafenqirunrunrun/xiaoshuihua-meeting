@@ -166,12 +166,13 @@ def build_meeting_state_updated(
     deliberately NOT the same as "version incremented":
 
         ACTIVE vN -> ACTIVE vN+1   content updated
-        ACTIVE|EMPTY -> FAILED     an update failed (version does NOT move)
-        FAILED -> ACTIVE           recovered
+        ACTIVE -> STALE            transient update failed; last-good retained
+        EMPTY -> FAILED            first update failed; no last-good exists
+        STALE|FAILED -> ACTIVE     recovered
         ACTIVE -> FROZEN           meeting ended, state frozen
 
     `status` is in the payload precisely because of the non-version-bumping
-    transitions: the client cannot distinguish ACTIVE@4 from FAILED@4 by version
+    transitions: the client cannot distinguish ACTIVE@4 from STALE@4 by version
     alone. The `id:` therefore carries the status too (see STATE_ID_PREFIX).
     """
     return SSEEventEnvelope(

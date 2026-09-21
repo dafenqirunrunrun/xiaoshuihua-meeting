@@ -35,6 +35,10 @@ async def lifespan(_app: FastAPI):
     from app.audio.session_manager import audio_session_manager
 
     audio_session_manager.clear()
+    from app.meeting_state.scheduler import meeting_state_scheduler
+
+    meeting_state_scheduler.cancel_all_pending()
+    meeting_state_scheduler.wait_for_idle(timeout_seconds=2.0)
     # Close every SSE subscriber so generators end cleanly on shutdown.
     from app.realtime.event_broker import event_broker
 

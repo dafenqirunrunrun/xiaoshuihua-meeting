@@ -6,10 +6,10 @@ Step AGENT-2. Upgrades the summary input from
 
 to
 
-    Meeting State (working memory) + complete FINAL transcript  ->  LLM  ->  summary
+    complete FINAL transcript + optional latest-good memory  ->  LLM  ->  summary
 
-with priority-selected evidence used only when the complete input exceeds the
-configured capacity, and the legacy path kept intact as a FALLBACK.
+with priority-selected evidence and snapshots used only when the complete input
+exceeds configured capacity. Realtime health never gates this pipeline.
 
 Where this sits
 ---------------
@@ -19,25 +19,15 @@ material should the summary be generated from, and can we use the meeting
 state?** It returns a `SummaryPlan`; `summary_service` executes it. Nothing here
 holds a lock, calls the LLM, or writes a row.
 
-The core ordering rule (§2)
----------------------------
-The summary must not be generated from a state that has not yet absorbed the
-end of the meeting::
-
-    finish -> flush remaining FINAL -> state current -> summary
-
-This module ENFORCES the last hop: `assess_usability` compares the state's
-`last_processed_segment_seq` against the final transcript sequence and refuses
-the state when it is behind. It never silently summarizes a stale state. The
-flush that closes the gap is performed by the caller (`finalizer`) before this
-runs; a state that is STILL behind after that falls back to the legacy path
-rather than being used as if it were complete.
+The core ordering rule is now simply: freeze Transcript, then summarize that
+frozen fact set. `assess_usability` still reports memory coverage for logs and
+prompt metadata, but absent/stale/failed memory is optional context and never
+delays or changes the canonical V2 generation path.
 
 Fallback (§9)
 -------------
-`MEETING_AGENT_ENABLED=false`, no state, a FAILED state, an EMPTY state, a
-stale state, an unreadable state, or `FINAL_SUMMARY_V2_ENABLED=false` all select
-the legacy full-transcript path. The chosen source is reported as
+Only `FINAL_SUMMARY_V2_ENABLED=false` selects the legacy output contract. The
+chosen source is reported as
 `summary_source = meeting_state | transcript_fallback | empty_meeting` on the
 plan (logged, and asserted in tests). It is NOT persisted as its own column:
 that would need an ALTER on `meeting_summary`, which this step is not permitted
@@ -66,6 +56,7 @@ from app.agent.summary_schemas import MeetingSummarySchema
 from app.config import settings
 from app.meeting.meeting_model import Meeting
 from app.meeting_state import repository as state_repository
+from app.meeting_state import snapshot_repository
 from app.meeting_state.schemas import MeetingStateContent
 from app.transcript import repository as transcript_repository
 
@@ -208,6 +199,9 @@ def assess_usability(db: Session, meeting_id: str) -> StateAssessment:
         # failed are precisely the end of the meeting.
         assessment.reason = REASON_STATE_FAILED
         return assessment
+    if row.status == "STALE":
+        assessment.reason = REASON_STATE_STALE
+        return assessment
     if content == MeetingStateContent():
         assessment.reason = REASON_STATE_EMPTY
         return assessment
@@ -304,7 +298,12 @@ def build_plan(
         _log_plan(meeting_id, plan)
         return plan
 
-    if not assessment.usable:
+    # Turning V2 off is the only reason to use the legacy generation contract.
+    # In normal operation the frozen transcript is always the canonical input;
+    # Meeting State is optional working memory and may be absent, stale or from
+    # the last successful realtime pass. Realtime health must never gate final
+    # generation or force a different quality path.
+    if not settings.final_summary_v2_enabled:
         prompt, _body = legacy_material()
         plan = SummaryPlan(
             source=SOURCE_TRANSCRIPT_FALLBACK,
@@ -322,11 +321,13 @@ def build_plan(
         _log_plan(meeting_id, plan)
         return plan
 
-    # --- V2: meeting state + transcript grounding ---------------------------
+    # --- Canonical V2: full transcript + optional latest-good state ----------
     segments = transcript_repository.list_sorted(db, meeting_id)
     cited_seqs = evidence_module.cited_segment_seqs(assessment.content)
 
-    def material(selection, scope: str) -> str:
+    snapshots = snapshot_repository.prompt_material(db, meeting_id)
+
+    def material(selection, scope: str, *, include_snapshots: bool = False) -> str:
         return build_v2_prompt(
             build_summary_input(
                 meeting_id=meeting_id,
@@ -341,6 +342,12 @@ def build_plan(
                 selection=selection,
                 total_segment_count=len(segments),
                 transcript_scope=scope,
+                state_status=assessment.status,
+                # Snapshots are most useful when capacity protection means the
+                # full transcript cannot fit. For ordinary meetings the frozen
+                # transcript already provides stronger grounding without the
+                # duplicated checkpoint tokens.
+                memory_snapshots=snapshots if include_snapshots else [],
             )
         )
 
@@ -369,6 +376,11 @@ def build_plan(
         )
         transcript_scope = "selected"
         prompt = material(selection, transcript_scope)
+        with_snapshots = material(
+            selection, transcript_scope, include_snapshots=True
+        )
+        if len(with_snapshots) <= settings.final_summary_max_input_chars:
+            prompt = with_snapshots
 
     if len(prompt) > settings.final_summary_max_input_chars:
         raise SummaryPlanError(
@@ -386,6 +398,7 @@ def build_plan(
         final_transcript_seq=assessment.final_transcript_seq,
         evidence_segment_count=len(selection.segments),
         transcript_scope=transcript_scope,
+        fallback_reason=None if assessment.usable else assessment.reason,
     )
     _log_plan(meeting_id, plan)
     return plan

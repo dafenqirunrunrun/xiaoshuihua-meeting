@@ -65,24 +65,15 @@ async def finish_meeting(
 ):
     """IN_PROGRESS -> FINALIZING.
 
-    On the way out, schedules a FORCED flush of the meeting-state agent (Step
-    AGENT-1): the meeting is ending, so whatever is still buffered below the
-    batch thresholds must be folded into the state now rather than waiting for
-    FINALs that will never arrive. Fired after the response and on its own DB
-    session; disabled-agent and no-work cases are both no-ops. The agent never
-    gates this transition — the meeting finishes regardless of what the agent
-    does (or fails to do).
+    Realtime understanding stops accepting follow-up work as the meeting ends.
+    Final Summary reads the frozen transcript directly and never waits for a
+    final Meeting State flush.
     """
     if not finalize_audio:
-        meeting = meeting_service.finish_meeting(db, meeting_id)
-        if meeting.status == "FINALIZING":
-            from app.meeting_state import service as meeting_state_service
+        from app.meeting_state.scheduler import meeting_state_scheduler
 
-            background_tasks.add_task(
-                meeting_state_service.run_agent_background,
-                meeting_id,
-                force_flush=True,
-            )
+        meeting_state_scheduler.cancel_pending(meeting_id)
+        meeting = meeting_service.finish_meeting(db, meeting_id)
         return meeting
 
     # Product path: stop accepting new PCM first, but keep the meeting
@@ -115,6 +106,9 @@ async def finish_meeting(
                 ),
             ) from exc
 
+        from app.meeting_state.scheduler import meeting_state_scheduler
+
+        meeting_state_scheduler.cancel_pending(meeting_id)
         meeting = meeting_service.finish_meeting(db, meeting_id)
         payload = transcript_schemas.StreamEndEvent(
             event_id=f"audio-end-{meeting_id}"[:64],
