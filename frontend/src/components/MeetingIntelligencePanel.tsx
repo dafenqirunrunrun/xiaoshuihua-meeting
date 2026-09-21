@@ -236,6 +236,9 @@ export function MeetingIntelligencePanel({
   const currentTopicMatch = current_topic
     ? topics.find((t) => t.title === current_topic)
     : undefined
+  const discussedTopics = currentTopicMatch
+    ? topics.filter((t) => t !== currentTopicMatch)
+    : topics
 
   return (
     <div className="rail-section">
@@ -300,6 +303,18 @@ export function MeetingIntelligencePanel({
               </ul>
             </div>
           ) : null}
+
+          <ListBlock title="已讨论议题" count={discussedTopics.length}>
+            {discussedTopics.map((topic, i) => (
+              <TopicItem
+                key={`t-${i}`}
+                title={topic.title}
+                summary={topic.summary}
+                sourceSegmentSeqs={topic.source_segment_seqs}
+                onTrace={onTraceEvidence}
+              />
+            ))}
+          </ListBlock>
 
           <ListBlock title="已确认决策" count={decisions.length}>
             {decisions.map((d, i) => (

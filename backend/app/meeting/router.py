@@ -2,7 +2,7 @@
 
 from typing import Annotated, Literal
 
-from fastapi import APIRouter, BackgroundTasks, Depends, Query
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 
 from app.db import get_db
@@ -49,9 +49,18 @@ def start_meeting(meeting_id: str, db: Session = Depends(get_db)):
 
 
 @router.post("/{meeting_id}/finish", response_model=meeting_schemas.MeetingOut)
-def finish_meeting(
+async def finish_meeting(
     meeting_id: str,
     background_tasks: BackgroundTasks,
+    finalize_audio: Annotated[
+        bool,
+        Query(
+            description=(
+                "关闭并排空正式音频链路，然后冻结转写并自动生成纪要；"
+                "内部 Mock/回放调用可保持 false 并单独发送 stream-end"
+            )
+        ),
+    ] = False,
     db: Session = Depends(get_db),
 ):
     """IN_PROGRESS -> FINALIZING.
@@ -64,11 +73,62 @@ def finish_meeting(
     gates this transition — the meeting finishes regardless of what the agent
     does (or fails to do).
     """
-    meeting = meeting_service.finish_meeting(db, meeting_id)
-    if meeting.status == "FINALIZING":
-        from app.meeting_state import service as meeting_state_service
+    if not finalize_audio:
+        meeting = meeting_service.finish_meeting(db, meeting_id)
+        if meeting.status == "FINALIZING":
+            from app.meeting_state import service as meeting_state_service
 
-        background_tasks.add_task(
-            meeting_state_service.run_agent_background, meeting_id, force_flush=True
+            background_tasks.add_task(
+                meeting_state_service.run_agent_background,
+                meeting_id,
+                force_flush=True,
+            )
+        return meeting
+
+    # Product path: stop accepting new PCM first, but keep the meeting
+    # IN_PROGRESS while Tencent emits its trailing FINAL sentence(s). Only after
+    # every queue has drained do we transition and freeze the transcript.
+    from datetime import datetime, timezone
+
+    from app.agent.finalizer import run_finalizer_background
+    from app.audio.session_manager import (
+        AudioSessionStopTimeout,
+        audio_session_manager,
+    )
+    from app.config import settings
+    from app.transcript import schemas as transcript_schemas
+    from app.transcript import stream_service
+
+    device_id = settings.shuihua_audio_device_id
+    session = audio_session_manager.begin_stop(device_id, meeting_id)
+    try:
+        try:
+            await audio_session_manager.wait_until_drained(
+                session,
+                timeout_seconds=settings.audio_session_stop_timeout_seconds,
+            )
+        except AudioSessionStopTimeout as exc:
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "音频链路尚未完成排空，会议仍在进行中；请稍后重试结束会议"
+                ),
+            ) from exc
+
+        meeting = meeting_service.finish_meeting(db, meeting_id)
+        payload = transcript_schemas.StreamEndEvent(
+            event_id=f"audio-end-{meeting_id}"[:64],
+            meeting_id=meeting_id,
+            emitted_at=int(datetime.now(timezone.utc).timestamp() * 1000),
         )
-    return meeting
+        _meeting, _stream, _complete, newly_accepted = (
+            stream_service.handle_stream_end(db, meeting_id, payload)
+        )
+        if newly_accepted:
+            background_tasks.add_task(run_finalizer_background, meeting_id)
+        return meeting
+    finally:
+        # Reconnects after this point are harmless: the meeting is FINALIZING or
+        # COMPLETED, so the audio WebSocket gate rejects them until the next
+        # meeting is started and the stale device binding is replaced.
+        audio_session_manager.end_stop(device_id)

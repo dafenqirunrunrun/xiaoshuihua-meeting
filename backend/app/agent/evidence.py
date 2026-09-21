@@ -1,8 +1,9 @@
 """Evidence selection for the Final Summary (Step AGENT-2 §4).
 
-The point of AGENT-2 is that the Final Summary does NOT re-read the whole
-transcript. The Meeting State says **what mattered**; this module decides
-**which transcript lines to quote as grounding for it**.
+Normal Final Summary runs now include the whole transcript for completeness.
+This module owns the capacity fallback for an oversized prompt: Meeting State
+says **what mattered**, and this code decides **which transcript lines survive**
+when the full transcript cannot fit safely.
 
 The selection is deliberately simple, explainable and testable — no RAG, no
 embeddings, no vector store (explicitly out of scope for this step):

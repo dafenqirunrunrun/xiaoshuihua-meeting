@@ -19,6 +19,7 @@ unset API key.
 from __future__ import annotations
 
 import httpx
+import time
 
 from app.config import settings
 from .base import SummaryGenerationError
@@ -27,8 +28,6 @@ DEFAULT_TIMEOUT = settings.llm_timeout_seconds
 
 
 class DeepSeekProvider:
-    name = "deepseek-v4.1-flash"
-
     def __init__(
         self,
         *,
@@ -36,12 +35,32 @@ class DeepSeekProvider:
         api_key: str | None = None,
         model: str | None = None,
         timeout_seconds: float | None = None,
+        max_retries: int | None = None,
+        temperature: float | None = None,
+        max_output_tokens: int | None = None,
     ) -> None:
         # Allow explicit override (tests) but default to env-only config.
         self._base_url = base_url if base_url is not None else settings.deepseek_base_url
         self._api_key = api_key if api_key is not None else settings.deepseek_api_key
         self._model = model if model is not None else settings.deepseek_model
         self._timeout = timeout_seconds if timeout_seconds is not None else DEFAULT_TIMEOUT
+        self._max_retries = (
+            max(0, max_retries)
+            if max_retries is not None
+            else max(0, settings.llm_max_retries)
+        )
+        self._temperature = (
+            temperature if temperature is not None else settings.llm_temperature
+        )
+        self._max_output_tokens = (
+            max_output_tokens
+            if max_output_tokens is not None
+            else settings.llm_max_output_tokens
+        )
+
+    @property
+    def name(self) -> str:
+        return self._model
 
     def complete(self, prompt: str, *, timeout_seconds: float | None = None) -> str:
         if not self._base_url or not self._api_key:
@@ -55,24 +74,53 @@ class DeepSeekProvider:
             "model": self._model,
             "messages": [{"role": "user", "content": prompt}],
             "response_format": {"type": "json_object"},
+            "temperature": self._temperature,
+            "max_tokens": self._max_output_tokens,
         }
         timeout = timeout_seconds if timeout_seconds is not None else self._timeout
 
-        try:
-            with httpx.Client(timeout=timeout) as client:
-                resp = client.post(url, headers=self._auth_headers(), json=payload)
-                resp.raise_for_status()
-                data = resp.json()
-        except httpx.TimeoutException as exc:
-            raise SummaryGenerationError(f"deepseek request timed out after {timeout}s") from exc
-        except httpx.HTTPStatusError as exc:
-            raise SummaryGenerationError(
-                f"deepseek HTTP {exc.response.status_code}: {exc.response.text[:200]}"
-            ) from exc
-        except (httpx.TransportError, ValueError) as exc:
-            raise SummaryGenerationError(f"deepseek transport error: {exc}") from exc
+        for attempt in range(self._max_retries + 1):
+            try:
+                with httpx.Client(timeout=timeout) as client:
+                    resp = client.post(url, headers=self._auth_headers(), json=payload)
+                    resp.raise_for_status()
+                    return extract_content(resp.json())
+            except httpx.TimeoutException as exc:
+                if attempt < self._max_retries:
+                    self._retry_pause(attempt)
+                    continue
+                raise SummaryGenerationError(
+                    f"deepseek request timed out after {timeout}s"
+                ) from exc
+            except httpx.HTTPStatusError as exc:
+                retryable = (
+                    exc.response.status_code == 429
+                    or exc.response.status_code >= 500
+                )
+                if retryable and attempt < self._max_retries:
+                    self._retry_pause(attempt)
+                    continue
+                raise SummaryGenerationError(
+                    f"deepseek HTTP {exc.response.status_code}: "
+                    f"{exc.response.text[:200]}"
+                ) from exc
+            except (httpx.TransportError, ValueError, SummaryGenerationError) as exc:
+                if attempt < self._max_retries:
+                    self._retry_pause(attempt)
+                    continue
+                if isinstance(exc, SummaryGenerationError):
+                    raise
+                raise SummaryGenerationError(
+                    f"deepseek transport/response error: {exc}"
+                ) from exc
 
-        return extract_content(data)
+        raise SummaryGenerationError("deepseek request exhausted retries")
+
+    @staticmethod
+    def _retry_pause(attempt: int) -> None:
+        # One short bounded backoff is enough for the MVP; retries remain finite
+        # and only cover transient transport/429/5xx or malformed responses.
+        time.sleep(min(0.25 * (2**attempt), 1.0))
 
     def _auth_headers(self) -> dict[str, str]:
         return {"Authorization": f"Bearer {self._api_key}", "Content-Type": "application/json"}

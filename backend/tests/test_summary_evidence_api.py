@@ -114,9 +114,12 @@ def _put_raw(
 class TestProjectionUnit:
     """The projection itself, without HTTP or DB in the way."""
 
-    def test_t01_valid_v2_projects_all_four_kinds(self):
+    def test_t01_valid_v2_projects_all_five_kinds(self):
         ev = project_summary_evidence(V2_RAW)
         assert ev is not None
+        assert [t.title for t in ev.topics] == ["上线时间"]
+        assert ev.topics[0].summary == "讨论后定在下周三。"
+        assert ev.topics[0].source_segment_seqs == [1, 3]
         assert [d.text for d in ev.decisions] == ["定于下周三上线"]
         assert ev.decisions[0].source_segment_seqs == [3]
         assert ev.action_items[0].task == "完成后端接口联调"
@@ -286,6 +289,8 @@ class TestPublicResponse:
         body = _summary(client, mid)
         ev = body["summary_evidence"]
         assert ev is not None
+        assert [t["title"] for t in ev["topics"]] == ["上线时间"]
+        assert ev["topics"][0]["source_segment_seqs"] == [1, 3]
         assert [d["text"] for d in ev["decisions"]] == ["定于下周三上线"]
         assert ev["action_items"][0]["source_segment_seqs"] == [4, 5]
         assert ev["risks"][0]["source_segment_seqs"] == [6]
@@ -357,6 +362,7 @@ class TestV2EndToEnd:
 
         ev = body["summary_evidence"]
         assert ev is not None, "a real V2 generation must expose structured evidence"
+        assert [t["title"] for t in ev["topics"]] == ["上线时间"]
         assert [d["text"] for d in ev["decisions"]] == ["定于下周三上线"]
         assert ev["decisions"][0]["source_segment_seqs"] == [3]
         assert ev["action_items"][0]["owner"] == "小王"

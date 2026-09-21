@@ -1282,10 +1282,10 @@ Final Summary 重构（下一步单独做：Meeting State → Final Summary Agen
   限制）。多进程 / 多实例下两个 run 可能读到同一游标。升级路径：DB 行锁或
   `UPDATE ... WHERE version = :expected`（乐观并发）——见 §8.2 与
   “FUTURE: multi-worker sequence allocation”。
-- **merge 策略只能增改、不能删**：列表语义为“非空替换、空/缺省保留”（安全方向）。
-  模型**无法主动删除或编辑**既有条目。这是 AGENT-2 的工作。
-- **状态可能滞后于 Transcript**（设计如此）：批次阈值意味着最后一个未达阈值的尾部
-  要等到下一个 FINAL 或会议结束的强制 flush。
+- **merge 区分缺省与显式清除**：模型省略字段时保留旧值；显式返回空数组或 `null`
+  时清除旧值。因此已解决的问题、被撤回的决策和被纠正的当前议题可以从工作记忆中移除。
+- **状态是近实时而非逐字同步**：FINAL 在 2 秒静默窗口内合并，持续讲话时最迟 6 秒
+  触发一次强制 flush；实际可见时间还包含一次模型响应耗时。结束会议仍执行最终 flush。
 - **`source_segment_seqs` 依赖模型正确引用**：schema 保证字段存在且为 int 列表，
   但**不保证**引用的 seq 真的支持该结论（模型可能引用错误证据）。
 
@@ -1308,9 +1308,9 @@ AGENT-2 把这个工作记忆接进 **最终纪要**，改变的是摘要的**�
 
 ```text
 Step 7A 之前:   Full Transcript ──────────────────► LLM ──► Final Summary
-Step AGENT-2:   Meeting State（语义）  ┐
-                                       ├──► Final Summary Agent ──► Structured Summary
-                Transcript Evidence（事实）┘
+Step AGENT-2:   Meeting State（结构索引）┐
+                                        ├──► Final Summary Agent ──► Structured Summary
+                完整 FINAL Transcript（事实）┘
 ```
 
 分工是本步的核心命题：
@@ -1318,10 +1318,11 @@ Step AGENT-2:   Meeting State（语义）  ┐
 | 角色 | 回答的问题 |
 |---|---|
 | **Meeting State** | **重要信息是什么**（议题 / 决策 / 待办 / 未决 / 风险） |
-| **Transcript Evidence** | **原话证据是什么**（被引用的 FINAL 片段原文） |
+| **完整 FINAL Transcript** | **整场会议实际说了什么**（按 `segment_seq` 排序） |
 
-因此**不再默认把整份 Transcript 重新塞进 Prompt**：State 已经消化过一遍，
-Evidence 只补齐「凭什么这么说」。legacy 全量路径**完整保留**为降级路径（§20.5）。
+正常会议默认同时提供完整 FINAL Transcript，避免 Meeting State 的中间提炼遗漏上下文。
+只有组合 Prompt 超过容量上限时，才按优先级退化为 Transcript Evidence；Meeting State
+不可用时仍完整保留 legacy 全量路径作为降级路径（§20.5）。
 
 ### 20.2 §2 排序不变式（本步最重要的一条）
 
@@ -1362,9 +1363,11 @@ flush，但它跑在**另一个 BackgroundTask** 里 —— 可能失败、可�
 任一成立 → `SOURCE_TRANSCRIPT_FALLBACK`；`final_transcript_seq == 0` → 先判
 `SOURCE_EMPTY_MEETING`（§20.6）。
 
-### 20.4 Evidence Selection（`app/agent/evidence.py`）
+### 20.4 超限时的 Evidence Selection（`app/agent/evidence.py`）
 
-纯函数、无 DB、无 settings 查询（调用方传入全部策略参数），因此可单测：
+默认使用完整 FINAL Transcript。仅当 Meeting State 与完整转写组成的 Prompt 超过
+`FINAL_SUMMARY_MAX_INPUT_CHARS` 时，调用以下纯函数降容；它无 DB、无 settings 查询
+（调用方传入全部策略参数），因此可单测：
 
 1. 取 Meeting State 已在 decisions / action_items / open_questions / risks / topics
    上记录的 `source_segment_seqs`（**去重** —— 同一行常被两条目同时引用）；
@@ -1384,8 +1387,9 @@ topic 更该保留），所以上限真的咬下来时，被裁掉的是「上�
 ### 20.5 State / Evidence 冲突收口（§7）
 
 ```text
-Meeting State     = 语义候选（semantic candidate）
-Transcript Evidence = 事实依据（factual grounding）
+Meeting State        = 结构化工作记忆（structured working memory）
+FINAL Transcript     = 完整事实依据（complete factual grounding）
+Transcript Evidence  = 超限时的有界事实依据（capacity fallback）
 ```
 
 Final Summary Agent 做**第二遍收口**。二者冲突时**以证据为准**：
@@ -1463,7 +1467,7 @@ V2 明细**塞在既有 `meeting_summary.raw_model_output` 列**里（JSON），
 | `FINAL_SUMMARY_V2_ENABLED` | `true` | V2 总开关 |
 | `FINAL_SUMMARY_MAX_EVIDENCE_SEGMENTS` | `60` | evidence 上限 |
 | `FINAL_SUMMARY_EVIDENCE_NEIGHBOR_WINDOW` | `1` | 引用邻域扩展半径 |
-| `FINAL_SUMMARY_MAX_INPUT_CHARS` | `120000` | 超限 → `SummaryPlanError`（**不静默截断**） |
+| `FINAL_SUMMARY_MAX_INPUT_CHARS` | `100000` | 完整转写超限时先退化为 evidence；仍超限则报错（**不静默截断**） |
 | `FINAL_SUMMARY_MODEL` | `""` | 预留（模型覆盖） |
 
 ### 20.10 可观测性（§19）

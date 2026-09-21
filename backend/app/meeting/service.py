@@ -28,6 +28,11 @@ from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from app.config import settings
+from app.device.meeting_binding import (
+    bind_device_to_meeting,
+    device_meeting_bindings,
+)
 from app.meeting.meeting_model import Meeting
 from app.common.exceptions import InvalidMeetingStateTransition, MeetingNotFoundError
 from app.meeting import schemas as meeting_schemas
@@ -122,6 +127,9 @@ def start_meeting(db: Session, meeting_id: str) -> Meeting:
             raise MeetingNotFoundError(meeting_id)
 
         if meeting.status == "IN_PROGRESS":
+            bind_device_to_meeting(
+                db, settings.shuihua_audio_device_id, meeting_id
+            )
             return meeting  # idempotent: keep original started_at
 
         if meeting.status != "CREATED":
@@ -134,9 +142,20 @@ def start_meeting(db: Session, meeting_id: str) -> Meeting:
         if meeting.started_at is None:
             meeting.started_at = _now()
         try:
+            # Flush the state transition first, then establish the process-local
+            # binding before commit. A binding conflict therefore rolls the
+            # meeting back to CREATED, and a commit failure cannot leave the
+            # device pointing at a meeting that never started successfully.
+            db.flush()
+            bind_device_to_meeting(
+                db, settings.shuihua_audio_device_id, meeting_id
+            )
             db.commit()
-        except IntegrityError:
+        except Exception:
             db.rollback()
+            device_meeting_bindings.unbind(
+                settings.shuihua_audio_device_id, meeting_id
+            )
             raise
         db.refresh(meeting)
         # Commit-before-publish (Step 5 Part 6): only broadcast on the real
@@ -171,6 +190,11 @@ def finish_meeting(db: Session, meeting_id: str) -> Meeting:
             db.rollback()
             raise
         db.refresh(meeting)
+        # Stage 4 deliberately keeps the stale mapping until the next bind or
+        # explicit cleanup. get_active_meeting() stops resolving it immediately
+        # because FINALIZING is not active. The future hardware STOP flow must:
+        # stop new PCM -> drain PCM -> Tencent end_stream -> trailing FINAL ->
+        # then unbind, so the final sentence is never cut off or misattributed.
         # Commit-before-publish (Step 5 Part 6). Real transition only.
         sse_service.publish_meeting_status(meeting)
         return meeting

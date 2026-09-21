@@ -111,8 +111,12 @@ class _Server:
             pass
 
 
-@pytest.fixture(scope="module")
+@pytest.fixture
 def server(tmp_path_factory) -> _Server:
+    # Stage 4 adds one process-local device -> active meeting binding. Each E2E
+    # scenario owns an independent meeting, so it must also own an independent
+    # server process; otherwise an IN_PROGRESS meeting from a previous scenario
+    # correctly blocks the next scenario from claiming the same ESP32 device.
     srv = _Server(tmp_path_factory.mktemp("asr-e2e"))
     srv.start()
     yield srv

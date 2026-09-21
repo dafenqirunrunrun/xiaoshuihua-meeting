@@ -6,6 +6,7 @@ import base64
 import hashlib
 import hmac
 import json
+import logging
 import os
 import random
 import threading
@@ -13,13 +14,14 @@ import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import quote
 
 import websocket
 
 from app.config import settings
 from app.speech import result_parser
+from app.speech.result_parser import TencentSentenceResult
 
 DEFAULT_ENGINE = "16k_zh_en_speaker_2.0"
 SLICE_SIZE = 6400
@@ -27,6 +29,9 @@ SLICE_INTERVAL = 0.2
 RECEIVE_END_TIMEOUT = 30.0
 ASR_HOST = "asr.cloud.tencent.com"
 ASR_PATH_TEMPLATE = "/asr/v2/{appid}"
+SentenceCallback = Callable[[TencentSentenceResult], None]
+
+logger = logging.getLogger(__name__)
 
 
 class TencentAsrConfigError(RuntimeError):
@@ -78,9 +83,21 @@ class TencentAsrConfig:
 class TencentRealtimeAsrClient:
     """按腾讯云实时语音识别 V2 文档直接实现的 WebSocket 客户端。"""
 
-    def __init__(self, config: TencentAsrConfig | None = None, device_id: str = "") -> None:
+    def __init__(
+        self,
+        config: TencentAsrConfig | None = None,
+        device_id: str = "",
+        on_sentence: SentenceCallback | None = None,
+    ) -> None:
+        """Create a client.
+
+        ``on_sentence`` is invoked on the Tencent receiver thread, not on the
+        FastAPI event-loop thread. Callback failures are isolated from provider
+        receive so downstream business code cannot terminate the ASR session.
+        """
         self.config = config or TencentAsrConfig.from_env()
         self.device_id = device_id
+        self.on_sentence = on_sentence
         self._stream_conn: Any | None = None
         self._stream_receiver: _AsrReceiver | None = None
         self._stream_voice_id = ""
@@ -105,7 +122,11 @@ class TencentRealtimeAsrClient:
 
             result_parser.print_start(first_response, debug=self.config.debug)
             receiver = _AsrReceiver(
-                ws_conn, voice_id, self.config.debug, device_id=self.device_id
+                ws_conn,
+                voice_id,
+                self.config.debug,
+                device_id=self.device_id,
+                on_sentence=self.on_sentence,
             )
             receiver.start()
             self._stream_conn = ws_conn
@@ -155,7 +176,13 @@ class TencentRealtimeAsrClient:
         voice_id = str(uuid.uuid1())
         ws_url = _build_signed_websocket_url(self.config, voice_id)
         ws_conn = websocket.create_connection(ws_url)
-        receiver = _AsrReceiver(ws_conn, voice_id, self.config.debug, device_id=self.device_id)
+        receiver = _AsrReceiver(
+            ws_conn,
+            voice_id,
+            self.config.debug,
+            device_id=self.device_id,
+            on_sentence=self.on_sentence,
+        )
 
         try:
             first_response = _recv_json(ws_conn)
@@ -189,19 +216,77 @@ class TencentRealtimeAsrClient:
 
 
 class _AsrReceiver(threading.Thread):
-    def __init__(self, ws_conn: Any, voice_id: str, debug: bool, device_id: str = "") -> None:
+    """Tencent receive loop; sentence callbacks run on this thread."""
+
+    def __init__(
+        self,
+        ws_conn: Any,
+        voice_id: str,
+        debug: bool,
+        device_id: str = "",
+        on_sentence: SentenceCallback | None = None,
+    ) -> None:
         super().__init__(daemon=True)
         self._ws_conn = ws_conn
         self._voice_id = voice_id
         self._debug = debug
         self._device_id = device_id
+        self._on_sentence = on_sentence
+        self._partial_fingerprints: dict[int, tuple[str, int, int]] = {}
+        self._final_fingerprints: dict[int, set[tuple[str, int, int, int]]] = {}
         self.error: Exception | None = None
+
+    def _is_new_revision(self, sentence: TencentSentenceResult) -> bool:
+        sentence_id = sentence.sentence_id
+        if sentence.sentence_type == 0:
+            if sentence_id in self._final_fingerprints:
+                return False
+            fingerprint = (sentence.text, sentence.start_ms, sentence.end_ms)
+            if self._partial_fingerprints.get(sentence_id) == fingerprint:
+                return False
+            self._partial_fingerprints[sentence_id] = fingerprint
+            return True
+
+        fingerprint = (
+            sentence.text,
+            sentence.start_ms,
+            sentence.end_ms,
+            sentence.speaker_id,
+        )
+        seen_finals = self._final_fingerprints.setdefault(sentence_id, set())
+        if fingerprint in seen_finals:
+            return False
+        if seen_finals:
+            logger.warning(
+                "[ASR] conflicting FINAL revision voice_id=%s sentence_id=%d",
+                sentence.voice_id,
+                sentence_id,
+            )
+        seen_finals.add(fingerprint)
+        self._partial_fingerprints.pop(sentence_id, None)
+        return True
+
+    def _emit_sentences(self, sentences: list[TencentSentenceResult]) -> None:
+        if self._on_sentence is None:
+            return
+        for sentence in sentences:
+            if not self._is_new_revision(sentence):
+                continue
+            try:
+                self._on_sentence(sentence)
+            except Exception as exc:
+                logger.warning(
+                    "[ASR] sentence callback failed voice_id=%s sentence_id=%d: %s",
+                    sentence.voice_id,
+                    sentence.sentence_id,
+                    exc,
+                )
 
     def run(self) -> None:
         try:
             while True:
                 response = _recv_json(self._ws_conn)
-                response["voice_id"] = response.get("voice_id") or self._voice_id
+                response["voice_id"] = self._voice_id
 
                 if response.get("code", 0) != 0:
                     result_parser.print_error(response, debug=self._debug)
@@ -213,9 +298,10 @@ class _AsrReceiver(threading.Thread):
                     return
 
                 if response.get("sentences"):
-                    result_parser.print_sentences(
+                    sentences = result_parser.print_sentences(
                         response, debug=self._debug, device_id=self._device_id
                     )
+                    self._emit_sentences(sentences)
 
                 if response.get("final", 0) == 1:
                     result_parser.print_end(response, debug=self._debug)

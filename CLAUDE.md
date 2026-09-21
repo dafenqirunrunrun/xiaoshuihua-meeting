@@ -489,9 +489,9 @@ npm run build      # tsc --noEmit && vite build
     **前端大改**。
   - **Known Limitations**：① **multi-worker 不安全**（游标推进依赖进程内
     `meeting_lock`，与 Step 5/6 同一限制；升级路径 = DB 行锁或
-    `UPDATE ... WHERE version = :expected`）；② merge 策略**只能增改、不能删**
-    （列表语义「非空替换、空/缺省保留」，安全方向；模型无法主动删除/编辑既有条目，
-    属 AGENT-2）；③ 状态**可能滞后**于 Transcript（阈值设计使然）；
+    `UPDATE ... WHERE version = :expected`）；② merge 已区分**字段缺省**与**显式空值**
+    （缺省保留，空数组/`null` 清除，可表达纠正、撤回与问题解决）；③ 状态在批次未满时
+    **可能滞后**于 Transcript，结束会议会强制 flush；
     ④ `source_segment_seqs` 只保证字段存在，**不保证引用正确**。
   - 测试：`backend/tests/test_meeting_state_agent.py` **40/40 PASS**
     （含 §13 确定性 6 段脚本会议回放：schema 有效 / 游标 / 去重重放不重复 /
@@ -504,9 +504,9 @@ npm run build      # tsc --noEmit && vite build
   - **本 Step 未 push**（按用户要求：可 commit 到 `dafenqi`，等待确认后再 push）。
 - **Step AGENT-2 已完成**：Final Summary V2 —— Meeting State as the primary summary input。
   - **输入升级（本步唯一实质变更）**：`full transcript → LLM → summary` 升级为
-    `Meeting State（工作记忆）+ 选定 Transcript Evidence → LLM → summary`。
-    **Meeting State 负责「重要信息是什么」，Evidence 负责「原话证据是什么」**；
-    不再默认把整份 Transcript 喂进 Prompt。
+    `Meeting State（工作记忆）+ 完整 FINAL 转写 → LLM → summary`；仅在输入超限时
+    退化为优先选择的 Transcript Evidence。**Meeting State 负责结构和重点，完整转写
+    负责查漏与事实校验，Evidence 是超长会议的容量保护**。
   - **§2 排序不变式（本步最重要）**：`finish → flush 剩余 FINAL → Meeting State 达到最新
     → 才生成 Final Summary`。`finalize_for_meeting` 现在**自己**同步强制 flush
     （`meeting_state_service.process_pending(force_flush=True)`，Step 0）——
@@ -711,9 +711,9 @@ npm run build      # tsc --noEmit && vite build
     → `SummaryOut.summary_evidence`（可选）。
     `final_summary_schemas.project_summary_evidence(raw_model_output)` 解析
     `raw_model_output` → 识别合法 `FinalMeetingSummary` → 输出
-    `SummaryEvidence{decisions, action_items, risks, open_questions}`，
-    每条保留 `source_segment_seqs` 与业务字段（decision: text；action:
-    task/owner/deadline；risk/open_question: text）。
+    `SummaryEvidence{topics, decisions, action_items, risks, open_questions}`，
+    每条保留 `source_segment_seqs` 与业务字段（topic: title/summary；decision:
+    text；action: task/owner/deadline；risk/open_question: text）。
     **无新 DB 列、无 migration、不改 Summary 持久化结构。**
   - **V2 判定方式（唯一依据）**：`FinalMeetingSummary` 的 **`extra="forbid"`**。
     legacy payload 必带 `conclusions`（V2 未声明该字段）→ **校验失败**，而不是
@@ -739,8 +739,9 @@ npm run build      # tsc --noEmit && vite build
       会议内容」两个 Tab，点击 → 切到「会议内容」→ 定位 + 高亮。
     - **不接 auto-follow**：会后转写是静态归档，无新 FINAL 抢滚动；
       `pauseAutoFollow` / `jumpToBottom` **没有被带进 Result 页**（§7）。
-    - 两条渲染路径：`summary_evidence` 非 null → 读**结构化字段**渲染（文本由
-      字段算出，不做字符串匹配）；null → 原样扁平渲染，**无任何入口**。
+    - 两条渲染路径：`summary_evidence` 非 null → 按**核心议题 / 已确认决策 /
+      待办事项 / 未决问题 / 风险**五类结构化渲染；null → 原样扁平渲染，
+      **无任何入口**。
   - **★ 修复真实缺陷：异步 Tab 假「不可定位」**。`setActiveTab` 只改我们自己的
     state；AntD 用它**内部** activeKey 决定渲染哪个面板，并在**更晚的一次 commit**
     才同步。实测（本 Step E2E）：仅依赖 `activeTab` 的 `useEffect` **不够** ——
@@ -756,7 +757,7 @@ npm run build      # tsc --noEmit && vite build
   - **§9 展示**：仅「查看原文」轻量入口，**不显示 `source_segment_seqs` /
     Evidence ID**，**不宣称「AI 已验证」**。
   - 测试：`backend/tests/test_summary_evidence_api.py` **20/20 PASS**
-    （T01~T11 投影单测：四种类型 / null owner·deadline 保持 null / seqs 原样透传
+    （T01~T11 投影单测：五种类型 / null owner·deadline 保持 null / seqs 原样透传
     `[5,2,5,999,2]` 不变 / legacy 拒绝 / 围栏 V2 接受 / malformed·非对象·None·
     空·FAILED reason 全 None / 空会议 precomputed vs 合法空 V2 / `extra="forbid"`
     守卫；T12~T18 HTTP 面：12 键集合、404、无内部泄漏；T19~T20 走**真实链路**

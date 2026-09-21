@@ -31,6 +31,10 @@ from app.transcript import router as transcript_router
 async def lifespan(_app: FastAPI):
     create_all()  # ensure tables exist (PRD §46)
     yield
+    # Wake audio receive loops before the process event loop is torn down.
+    from app.audio.session_manager import audio_session_manager
+
+    audio_session_manager.clear()
     # Close every SSE subscriber so generators end cleanly on shutdown.
     from app.realtime.event_broker import event_broker
 

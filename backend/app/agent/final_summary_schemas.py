@@ -1,8 +1,10 @@
 """Final Summary V2 schemas (Step AGENT-2).
 
 The Final Summary is generated from the **Meeting State** (AGENT-1 working
-memory) plus a bounded set of **transcript evidence** — NOT from the whole
-transcript re-read from scratch. These are the models for that output.
+memory) plus transcript grounding. Normal meetings include the complete FINAL
+transcript so an incremental-state omission can be recovered; oversized
+meetings fall back to a bounded, priority-selected evidence set. These are the
+models for that output.
 
 Two contracts live here, and the split is deliberate:
 
@@ -153,6 +155,14 @@ class SummaryEvidenceDecision(BaseModel):
     source_segment_seqs: list[int] = Field(default_factory=list)
 
 
+class SummaryEvidenceTopic(BaseModel):
+    """A key topic + its concise summary and cited lines."""
+
+    title: str
+    summary: str
+    source_segment_seqs: list[int] = Field(default_factory=list)
+
+
 class SummaryEvidenceActionItem(BaseModel):
     """An action item + the lines it cites.
 
@@ -203,6 +213,7 @@ class SummaryEvidence(BaseModel):
     provider errors, or any internal identifier. It is content + citations only.
     """
 
+    topics: list[SummaryEvidenceTopic] = Field(default_factory=list)
     decisions: list[SummaryEvidenceDecision] = Field(default_factory=list)
     action_items: list[SummaryEvidenceActionItem] = Field(default_factory=list)
     risks: list[SummaryEvidenceRisk] = Field(default_factory=list)
@@ -253,6 +264,14 @@ def project_summary_evidence(raw_model_output: str | None) -> SummaryEvidence | 
         return None
 
     return SummaryEvidence(
+        topics=[
+            SummaryEvidenceTopic(
+                title=t.title,
+                summary=t.summary,
+                source_segment_seqs=t.source_segment_seqs,
+            )
+            for t in parsed.key_topics
+        ],
         decisions=[
             SummaryEvidenceDecision(text=d.text, source_segment_seqs=d.source_segment_seqs)
             for d in parsed.decisions
@@ -286,6 +305,7 @@ __all__ = [
     "SummaryEvidenceDecision",
     "SummaryEvidenceOpenQuestion",
     "SummaryEvidenceRisk",
+    "SummaryEvidenceTopic",
     "SummaryOpenQuestion",
     "SummaryRisk",
     "SummaryTopic",

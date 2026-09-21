@@ -85,9 +85,18 @@ def reset_inprocess_state() -> Iterator[None]:
     without this a previous test's utterances or subscribers would leak in.
     """
     from app.realtime.event_broker import event_broker
+    from app.audio.session_manager import audio_session_manager
+    from app.device.meeting_binding import device_meeting_bindings
     from app.transcript.live_cache import live_utterance_cache
+    from app.meeting_state.scheduler import meeting_state_scheduler
 
+    assert meeting_state_scheduler.wait_for_idle(timeout_seconds=10.0)
+    device_meeting_bindings.clear()
+    audio_session_manager.clear()
     yield
 
+    assert meeting_state_scheduler.wait_for_idle(timeout_seconds=10.0)
+    device_meeting_bindings.clear()
+    audio_session_manager.clear()
     live_utterance_cache.clear_all()
     event_broker.disconnect_all()

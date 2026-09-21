@@ -6,9 +6,10 @@ Step AGENT-2. Upgrades the summary input from
 
 to
 
-    Meeting State (working memory) + selected transcript evidence  ->  LLM  ->  summary
+    Meeting State (working memory) + complete FINAL transcript  ->  LLM  ->  summary
 
-with the legacy path kept intact as a FALLBACK.
+with priority-selected evidence used only when the complete input exceeds the
+configured capacity, and the legacy path kept intact as a FALLBACK.
 
 Where this sits
 ---------------
@@ -140,6 +141,7 @@ class SummaryPlan:
     last_processed_segment_seq: int | None = None
     final_transcript_seq: int | None = None
     evidence_segment_count: int = 0
+    transcript_scope: str | None = None
     fallback_reason: str | None = None
 
 
@@ -320,25 +322,54 @@ def build_plan(
         _log_plan(meeting_id, plan)
         return plan
 
-    # --- V2: meeting state + selected evidence ------------------------------
+    # --- V2: meeting state + transcript grounding ---------------------------
     segments = transcript_repository.list_sorted(db, meeting_id)
-    selection = evidence_module.select_evidence(
-        assessment.content,
-        segments,
-        max_evidence_segments=settings.final_summary_max_evidence_segments,
-        neighbor_window=settings.final_summary_evidence_neighbor_window,
+    cited_seqs = evidence_module.cited_segment_seqs(assessment.content)
+
+    def material(selection, scope: str) -> str:
+        return build_v2_prompt(
+            build_summary_input(
+                meeting_id=meeting_id,
+                title=meeting.title,
+                started_at=(
+                    meeting.started_at.isoformat() if meeting.started_at else None
+                ),
+                ended_at=meeting.ended_at.isoformat() if meeting.ended_at else None,
+                state=assessment.content,
+                state_version=assessment.version,
+                last_processed_segment_seq=assessment.last_processed_segment_seq,
+                selection=selection,
+                total_segment_count=len(segments),
+                transcript_scope=scope,
+            )
+        )
+
+    # Normal meetings carry the complete FINAL transcript. Meeting State is an
+    # index and working memory, not a lossy filter: an item the incremental
+    # agent missed can still be recovered by the final pass.
+    selection = evidence_module.EvidenceSelection(
+        segments=segments,
+        cited_seqs=cited_seqs,
+        truncated=False,
+        dropped_count=0,
     )
-    summary_input = build_summary_input(
-        meeting_id=meeting_id,
-        title=meeting.title,
-        started_at=meeting.started_at.isoformat() if meeting.started_at else None,
-        ended_at=meeting.ended_at.isoformat() if meeting.ended_at else None,
-        state=assessment.content,
-        state_version=assessment.version,
-        last_processed_segment_seq=assessment.last_processed_segment_seq,
-        selection=selection,
-    )
-    prompt = build_v2_prompt(summary_input)
+    transcript_scope = "full"
+    prompt = material(selection, transcript_scope)
+
+    # For a pathological meeting that exceeds the model input budget, retain
+    # the existing priority selection. This is explicit in the prompt/logs and
+    # preserves decisions/actions before topics; content is never sliced by
+    # raw string length.
+    if len(prompt) > settings.final_summary_max_input_chars:
+        selection = evidence_module.select_evidence(
+            assessment.content,
+            segments,
+            max_evidence_segments=settings.final_summary_max_evidence_segments,
+            neighbor_window=settings.final_summary_evidence_neighbor_window,
+        )
+        transcript_scope = "selected"
+        prompt = material(selection, transcript_scope)
+
     if len(prompt) > settings.final_summary_max_input_chars:
         raise SummaryPlanError(
             f"final summary input too large ({len(prompt)} chars > "
@@ -354,6 +385,7 @@ def build_plan(
         last_processed_segment_seq=assessment.last_processed_segment_seq,
         final_transcript_seq=assessment.final_transcript_seq,
         evidence_segment_count=len(selection.segments),
+        transcript_scope=transcript_scope,
     )
     _log_plan(meeting_id, plan)
     return plan
@@ -387,13 +419,14 @@ def _log_plan(meeting_id: str, plan: SummaryPlan) -> None:
     logger.info(
         "final_summary_plan meeting_id=%s summary_source=%s state_version=%s "
         "last_processed_segment_seq=%s final_transcript_seq=%s "
-        "evidence_segment_count=%s%s",
+        "evidence_segment_count=%s transcript_scope=%s%s",
         meeting_id,
         plan.source,
         plan.state_version,
         plan.last_processed_segment_seq,
         plan.final_transcript_seq,
         plan.evidence_segment_count,
+        plan.transcript_scope,
         f" fallback_reason={plan.fallback_reason}" if plan.fallback_reason else "",
     )
 

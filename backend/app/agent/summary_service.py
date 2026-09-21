@@ -119,7 +119,7 @@ def build_summary_prompt(meeting_title: str, segments: list[TranscriptSegment]) 
         f"{_TRANSCRIPT_DELIMITER_OPEN}\n{body}\n{_TRANSCRIPT_DELIMITER_CLOSE}\n\n"
         "输出必须是一个 JSON 对象（不要输出 markdown 代码块），结构如下：\n"
         "{\n"
-        '  "overview": "用 1-3 句话概括会议讨论内容与结论",\n'
+        '  "overview": "用 2-5 句话概括会议目的、主要讨论、结果与下一步",\n'
         '  "key_topics": ["议题1", "议题2", ...],\n'
         '  "conclusions": ["结论1", "结论2", ...],\n'
         '  "open_questions": ["待确认问题1", ...]\n'
@@ -127,7 +127,13 @@ def build_summary_prompt(meeting_title: str, segments: list[TranscriptSegment]) 
         "要求：\n"
         "  1. 只依据上面的转写内容，不得编造转写中没有的信息。\n"
         "  2. key_topics / conclusions / open_questions 是字符串数组，即使为空也要给空数组。\n"
-        "  3. 直接输出 JSON 本体，不要包裹在 ```json ``` 代码块中。"
+        "  3. 系统检查会议开头、中段和结尾，不要只总结最后几段或高频内容。\n"
+        "  4. 提议、疑问和个人意见不是已达成结论；只有明确确认的结果才能写入 conclusions。\n"
+        "  5. 明确的后续动作应保留负责人和截止时间；原文未说明时不得猜测。\n"
+        "  6. 转写来自 ASR，可能有同音字、断句错误和口头重复。可去除语气词、合并重复，"
+        "但不得猜测人名、数字、日期或专有名词。\n"
+        "  7. 同一事项有自我修正时，以最后一次明确表达为准，不要同时输出冲突版本。\n"
+        "  8. 直接输出 JSON 本体，不要包裹在 ```json ``` 代码块中。"
     )
 
 
@@ -457,9 +463,9 @@ def _run_generation(
 
     # --- Phase B: LLM call — NO lock, NO transaction ------------------------
     # Material selection (Step AGENT-2) happens here, outside the lock: the
-    # Final Summary is generated from the Meeting State + selected evidence when
-    # that state is usable, and from the full transcript otherwise. The choice,
-    # and why, is reported as `summary_source` / `fallback_reason`.
+    # Final Summary uses Meeting State + complete transcript grounding when the
+    # input fits, priority evidence for oversized meetings, and the legacy full-
+    # transcript shape when state is unusable. The choice is observable.
     raw = None
     parsed: MeetingSummarySchema | None = None
     reason: str | None = None
@@ -602,7 +608,10 @@ def _call_provider(comp: LLMProvider, prompt: str) -> str:
     from app.agent.llm.base import LLMConfigurationError
 
     try:
-        raw = comp.complete(prompt)
+        raw = comp.complete(
+            prompt,
+            timeout_seconds=settings.final_summary_llm_timeout_seconds,
+        )
     except (SummaryGenerationError, LLMConfigurationError) as exc:
         raise SummaryErrorBase(str(exc)) from exc
     if not raw or not raw.strip():

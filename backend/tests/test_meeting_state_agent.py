@@ -272,17 +272,33 @@ class TestIncremental:
         assert "<current_state>" in second_prompt
         assert "决策2" in second_prompt
 
-    def test_merge_keeps_earlier_items_when_the_update_omits_them(self, client, monkeypatch):
-        """List semantics: non-empty replaces, empty/omitted preserves."""
+    def test_merge_distinguishes_omitted_fields_from_explicit_empty_lists(
+        self, client, monkeypatch
+    ):
+        """Omitted preserves; explicit [] clears resolved/retracted content."""
         mid = _start_meeting(client)
         from app.meeting_state import service as svc
 
         previous = MeetingStateContent(
-            decisions=[{"text": "old", "source_segment_seqs": [1]}]
+            current_topic="old topic",
+            decisions=[{"text": "old", "source_segment_seqs": [1]}],
+            open_questions=[{"text": "resolved", "source_segment_seqs": [1]}],
         )
-        update = MeetingStateUpdate(decisions=[], open_questions=[])
-        merged = svc.merge_content(previous, update.model_dump() and MeetingStateContent(**update.model_dump()))
-        assert [d.text for d in merged.decisions] == ["old"]
+        omitted = MeetingStateUpdate()
+        preserved = svc.merge_content(previous, omitted)
+        assert [d.text for d in preserved.decisions] == ["old"]
+        assert [q.text for q in preserved.open_questions] == ["resolved"]
+        assert preserved.current_topic == "old topic"
+
+        explicit_empty = MeetingStateUpdate(
+            current_topic=None,
+            decisions=[],
+            open_questions=[],
+        )
+        cleared = svc.merge_content(previous, explicit_empty)
+        assert cleared.decisions == []
+        assert cleared.open_questions == []
+        assert cleared.current_topic is None
 
         replacing = MeetingStateContent(
             decisions=[{"text": "new", "source_segment_seqs": [2]}]
@@ -726,6 +742,7 @@ class TestScriptedMeetingReplay:
         def __init__(self) -> None:
             self.calls: list[str] = []
             self.seqs_seen: list[list[int]] = []
+            self.seqs_accumulated: set[int] = set()
             self.error: str | None = None
             self.raw: str | None = None
 
@@ -738,6 +755,8 @@ class TestScriptedMeetingReplay:
 
             seqs = _seqs_in_batch(prompt)
             self.seqs_seen.append(seqs)
+            self.seqs_accumulated.update(seqs)
+            known = self.seqs_accumulated
             if self.raw is not None:
                 return self.raw
 
@@ -749,35 +768,33 @@ class TestScriptedMeetingReplay:
                 "open_questions": [],
                 "risks": [],
             }
-            if 1 in seqs:
+            if 1 in known:
                 payload["current_topic"] = "上线安排"
                 payload["topics"] = [{
                     "title": "上线安排", "summary": "讨论上线时间与稳定性",
-                    "source_segment_seqs": [s for s in seqs if s in (1, 2)],
+                    "source_segment_seqs": sorted(s for s in known if s in (1, 2)),
                 }]
-            if 2 in seqs:
+            if 2 in known:
                 payload["risks"] = [{
                     "text": "下周一可能有点赶",
                     "source_segment_seqs": [2],
                 }]
-            if 3 in seqs:
+            if 3 in known:
                 payload["decisions"] = [{
                     "text": "定下周三上线",
                     "source_segment_seqs": [3],
                 }]
-            if 4 in seqs:
+            if 4 in known:
                 payload["action_items"] = [{
                     "task": "后端接口联调", "owner": "小王", "deadline": None,
                     "source_segment_seqs": [4],
                 }]
-            if 5 in seqs:
-                # Merging replaces when present, so the owner set in the previous
-                # batch must survive a later batch that only adds the deadline.
+            if 5 in known:
                 payload["action_items"] = [{
                     "task": "后端接口联调", "owner": "小王", "deadline": "周二之前",
                     "source_segment_seqs": [4, 5],
                 }]
-            if 6 in seqs:
+            if 6 in known:
                 payload["open_questions"] = [{
                     "text": "支付接口稳定性需要确认",
                     "source_segment_seqs": [6],

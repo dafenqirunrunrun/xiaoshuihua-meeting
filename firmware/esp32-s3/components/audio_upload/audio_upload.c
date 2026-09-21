@@ -74,6 +74,5 @@ esp_err_t audio_upload_send_pcm(const int16_t *samples, size_t sample_count)
     if (bytes < 0) {
         return ESP_FAIL;
     }
-    ESP_LOGI(TAG, "[AUDIO] sent frame bytes=%d", bytes);
     return ESP_OK;
 }

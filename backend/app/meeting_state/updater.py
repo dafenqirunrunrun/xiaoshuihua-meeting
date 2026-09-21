@@ -30,6 +30,7 @@ from typing import Callable, NamedTuple
 
 from pydantic import ValidationError
 
+from app.config import settings
 from app.meeting_state.schemas import MeetingStateUpdate
 from app.agent.llm.base import LLMProvider
 
@@ -107,7 +108,10 @@ def call_provider(provider: LLMProvider, prompt: str) -> str:
     from app.agent.llm.base import LLMConfigurationError, SummaryGenerationError
 
     try:
-        raw = provider.complete(prompt)
+        raw = provider.complete(
+            prompt,
+            timeout_seconds=settings.meeting_agent_llm_timeout_seconds,
+        )
     except (SummaryGenerationError, LLMConfigurationError) as exc:
         # Unknown-provider misconfiguration folds in here on purpose: it is a
         # provider-level failure, so the state is left untouched rather than

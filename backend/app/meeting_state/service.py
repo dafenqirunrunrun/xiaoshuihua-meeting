@@ -5,7 +5,7 @@ Boundary (Step AGENT-1)
 ::
 
     FINAL committed (Transcript Domain)
-        -> HTTP application layer schedules this service   (no MQ, no callback
+        -> application layer schedules this service        (no MQ, no callback
         -> Batch buffer + drain pass                        into the adapter)
         -> LLM incremental update (previous state + new batch)
         -> Pydantic validation
@@ -37,11 +37,10 @@ next trigger replays exactly the segments that were not folded in.
 Batch / flush policy
 --------------------
 The batch is NOT flushed per segment (one LLM call per FINAL would be ruinous in
-cost and latency). A batch is flushed when it reaches `batch_max_segments`
-SEGMENTS or `batch_max_chars` CHARACTERS — whichever comes first. No timers, no
-scheduler thread: flushes are driven by arriving FINALs and, at the end of the
-meeting, by the forced flush on freeze (see `process_pending(frozen=True)`),
-which guarantees the trailing sentences are never lost.
+cost and latency). The process-local scheduler merges FINALs over a short quiet
+window, capped by a maximum wait, then force-flushes that live window. Direct
+callers can still use the size thresholds (`batch_max_segments` /
+`batch_max_chars`), and the finalizer performs one last forced flush at Finish.
 
 Phase A / B / C
 ---------------
@@ -233,27 +232,24 @@ def merge_content(
 ) -> MeetingStateContent:
     """Fold one LLM update into the previous state.
 
-    List semantics are REPLACE-WHEN-PRESENT, lenient-on-absent: the model is
-    asked for the FULL updated list (it can read the previous state in the
-    prompt), so a non-empty list replaces the old one and an omitted/empty list
-    preserves it. That leniency is the safe direction — an empty list is much
-    more likely to mean "no change" than "the meeting retracted every decision",
-    and treating it as a retraction would silently destroy evidence-backed
-    content on one bad model turn.
-
-    Consequence, documented as a limitation: the model cannot INTENTIONALLY
-    remove or edit an existing item in this step. Adding explicit removal
-    semantics is AGENT-2 work.
+    The prompt asks for the FULL updated state. A field explicitly returned by
+    the model therefore replaces the previous value, including ``[]`` / null:
+    that is how a resolved question, corrected topic or retracted proposal can
+    disappear. A genuinely omitted field remains lenient and preserves the
+    previous value, which keeps older/scripted providers backward compatible.
     """
+    fields_set = update.model_fields_set
+
+    def value(name: str):
+        return getattr(update, name) if name in fields_set else getattr(previous, name)
+
     return MeetingStateContent(
-        current_topic=(
-            update.current_topic if update.current_topic is not None else previous.current_topic
-        ),
-        topics=update.topics or previous.topics,
-        decisions=update.decisions or previous.decisions,
-        action_items=update.action_items or previous.action_items,
-        open_questions=update.open_questions or previous.open_questions,
-        risks=update.risks or previous.risks,
+        current_topic=value("current_topic"),
+        topics=value("topics"),
+        decisions=value("decisions"),
+        action_items=value("action_items"),
+        open_questions=value("open_questions"),
+        risks=value("risks"),
     )
 
 
@@ -688,16 +684,20 @@ def run_agent_background(
     """
     from app.db import SessionLocal
 
-    db = SessionLocal()
-    try:
-        process_pending(db, meeting_id, provider=provider, force_flush=force_flush)
-    except Exception:  # pragma: no cover - defensive; transcript is already durable
-        logger.exception(
-            "meeting state agent failed for meeting %s (transcript is already durable; "
-            "state update is retryable)", meeting_id,
-        )
-    finally:
-        db.close()
+    from app.common.meeting_agent_lock import meeting_agent_run_lock
+
+    with meeting_agent_run_lock(meeting_id):
+        db = SessionLocal()
+        try:
+            process_pending(db, meeting_id, provider=provider, force_flush=force_flush)
+        except Exception:  # pragma: no cover - defensive; transcript is durable
+            logger.exception(
+                "meeting state agent failed for meeting %s (transcript is already "
+                "durable; state update is retryable)",
+                meeting_id,
+            )
+        finally:
+            db.close()
 
 
 __all__ = [

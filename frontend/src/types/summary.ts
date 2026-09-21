@@ -47,6 +47,13 @@ export interface SummaryEvidenceDecision {
   source_segment_seqs: number[]
 }
 
+/** 一个核心议题 + 摘要 + 原文依据 */
+export interface SummaryEvidenceTopic {
+  title: string
+  summary: string
+  source_segment_seqs: number[]
+}
+
 /** 一条 action item + 它引用的 seqs（owner / deadline 可为 null → UI 显示「待确认」） */
 export interface SummaryEvidenceActionItem {
   task: string
@@ -70,10 +77,11 @@ export interface SummaryEvidenceOpenQuestion {
 /**
  * V2 Final Summary 的结构化 evidence（后端 SummaryEvidence）。
  *
- * 四个列表都可能是空的：overview / closing_summary 是散文、不引用任何句子，
+ * 五个列表都可能是空的：overview / closing_summary 是散文、不引用任何句子，
  * 而一次真的没有决议的会议本来就会产生空列表。空 ≠ 解析失败。
  */
 export interface SummaryEvidence {
+  topics: SummaryEvidenceTopic[]
   decisions: SummaryEvidenceDecision[]
   action_items: SummaryEvidenceActionItem[]
   risks: SummaryEvidenceRisk[]

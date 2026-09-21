@@ -55,17 +55,12 @@ function formatActionItem(
  * overview / key_topics / conclusions / open_questions 均来自 actual schema。
  * 空数组不显示大空卡片（弱化）。
  *
- * UI-INTEL-2B：主要结论 / 未决问题两节带上「查看原文」入口。
- *
- * **为什么是这两节、而不是新开四节**：后端 `to_legacy_schema` 已经把这四类内容
- * 压平进来了 —— `conclusions` = decision 文本 + action item（折叠成
- *「task（owner，deadline）」），`open_questions` = open question 文本 + risk 文本。
- * 也就是说内容本来就在页面上，缺的只是「点得进去」。新开四节会让同一段文字出现
- * 两次，也会让两个契约的关系变得难以理解。
+ * UI-INTEL-2B：V2 按核心议题 / 决策 / 待办 / 未决问题 / 风险分别展示，
+ * 每个结构化条目都可带「查看原文」入口。
  *
  * **两条渲染路径，按 evidence 有无切换**：
- *   - `summary_evidence` 非 null（可验证 V2）→ 直接读**结构化字段**渲染，
- *     顺序与后端压平顺序一致。文本由字段算出，不做任何字符串匹配。
+ *   - `summary_evidence` 非 null（可验证 V2）→ 直接按五类**结构化字段**渲染，
+ *     不再把待办混进结论、把风险混进未决问题。
  *   - `summary_evidence` 为 null（legacy / fallback / FAILED / 空会议）→
  *     原样渲染扁平字符串，**不出现任何入口**（§3：不猜、不反推、关键词匹配）。
  * 这样两边的展示在各自路径上都来自真实数据，且不需要一个「按位置猜对齐」的
@@ -85,19 +80,6 @@ function SummarySections({
       body: <p className="summary__placeholder">{summary.overview}</p>,
     })
   }
-  if (summary.key_topics.length > 0) {
-    blocks.push({
-      label: '核心议题',
-      body: (
-        <ol className="summary-list">
-          {summary.key_topics.map((t, i) => (
-            <li key={i}>{t}</li>
-          ))}
-        </ol>
-      ),
-    })
-  }
-
   const ev = summary.summary_evidence
 
   // 一行 = 文本 + 可选 evidence 入口。seqs 为空时 EvidenceTraceButton 自己
@@ -110,32 +92,79 @@ function SummarySections({
   )
 
   if (ev) {
-    // --- 结构化渲染：内容与顺序都来自 V2 字段本身 ---
-    const conclusions = [
-      ...ev.decisions.map((d, i) => tracedRow(d.text, d.source_segment_seqs, i)),
-      ...ev.action_items.map((a, i) =>
-        tracedRow(
-          formatActionItem(a.task, a.owner, a.deadline),
-          a.source_segment_seqs,
-          ev.decisions.length + i,
+    // --- V2 结构化渲染：五类信息保持各自语义，不再压平混排 ---
+    if (ev.topics.length > 0) {
+      blocks.push({
+        label: '核心议题',
+        body: (
+          <ol className="summary-list">
+            {ev.topics.map((t, i) =>
+              tracedRow(`${t.title}：${t.summary}`, t.source_segment_seqs, i),
+            )}
+          </ol>
         ),
-      ),
-    ]
-    if (conclusions.length > 0) {
-      blocks.push({ label: '主要结论', body: <ol className="summary-list">{conclusions}</ol> })
+      })
     }
-
-    const questions = [
-      ...ev.open_questions.map((q, i) => tracedRow(q.text, q.source_segment_seqs, i)),
-      ...ev.risks.map((r, i) =>
-        tracedRow(r.text, r.source_segment_seqs, ev.open_questions.length + i),
-      ),
-    ]
-    if (questions.length > 0) {
-      blocks.push({ label: '未决问题', body: <ol className="summary-list">{questions}</ol> })
+    if (ev.decisions.length > 0) {
+      blocks.push({
+        label: '已确认决策',
+        body: (
+          <ol className="summary-list">
+            {ev.decisions.map((d, i) => tracedRow(d.text, d.source_segment_seqs, i))}
+          </ol>
+        ),
+      })
+    }
+    if (ev.action_items.length > 0) {
+      blocks.push({
+        label: '待办事项',
+        body: (
+          <ol className="summary-list">
+            {ev.action_items.map((a, i) =>
+              tracedRow(
+                formatActionItem(a.task, a.owner, a.deadline),
+                a.source_segment_seqs,
+                i,
+              ),
+            )}
+          </ol>
+        ),
+      })
+    }
+    if (ev.open_questions.length > 0) {
+      blocks.push({
+        label: '未决问题',
+        body: (
+          <ol className="summary-list">
+            {ev.open_questions.map((q, i) => tracedRow(q.text, q.source_segment_seqs, i))}
+          </ol>
+        ),
+      })
+    }
+    if (ev.risks.length > 0) {
+      blocks.push({
+        label: '风险 / 顾虑',
+        body: (
+          <ol className="summary-list">
+            {ev.risks.map((r, i) => tracedRow(r.text, r.source_segment_seqs, i))}
+          </ol>
+        ),
+      })
     }
   } else {
     // --- 扁平渲染（legacy / fallback）：与 UI-INTEL-2B 之前完全一致，无入口 ---
+    if (summary.key_topics.length > 0) {
+      blocks.push({
+        label: '核心议题',
+        body: (
+          <ol className="summary-list">
+            {summary.key_topics.map((t, i) => (
+              <li key={i}>{t}</li>
+            ))}
+          </ol>
+        ),
+      })
+    }
     if (summary.conclusions.length > 0) {
       blocks.push({
         label: '主要结论',

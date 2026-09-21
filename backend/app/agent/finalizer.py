@@ -147,9 +147,18 @@ def _flush_meeting_state(db: Session, meeting_id: str) -> None:
     scripting one cannot silently consume the other's responses.
     """
     from app.meeting_state import service as meeting_state_service
+    from app.common.meeting_agent_lock import meeting_agent_run_lock
 
     try:
-        report = meeting_state_service.process_pending(db, meeting_id, force_flush=True)
+        with meeting_agent_run_lock(meeting_id):
+            # The finalizer may have opened a read transaction before waiting
+            # for an in-flight state run. End that snapshot after acquiring the
+            # lock so SQLite (and any stricter isolation level) observes the
+            # state/cursor committed by the run we just waited for.
+            db.rollback()
+            report = meeting_state_service.process_pending(
+                db, meeting_id, force_flush=True
+            )
     except Exception:  # pragma: no cover - defensive; process_pending absorbs
         logger.exception(
             "meeting state flush failed for %s before summary; the summary will "

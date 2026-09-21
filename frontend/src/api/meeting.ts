@@ -20,10 +20,10 @@ export async function startMeeting(meetingId: string): Promise<Meeting> {
   return data
 }
 
-/** POST /api/meetings/:id/finish —— 结束会议（IN_PROGRESS -> FINALIZING） */
+/** 结束正式会议：排空并关闭音频链路，再冻结转写并生成纪要。 */
 export async function finishMeeting(meetingId: string): Promise<Meeting> {
   const { data } = await http.post<Meeting>(
-    `/api/meetings/${meetingId}/finish`,
+    `/api/meetings/${meetingId}/finish?finalize_audio=true`,
   )
   return data
 }

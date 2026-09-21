@@ -36,7 +36,7 @@ Final Summary
 | Meeting lifecycle | 四态机 `CREATED → IN_PROGRESS → FINALIZING → COMPLETED` |
 | Mock / Replay | Mock Producer（外部 HTTP 客户端）+ 真实 provider replay 脚本 |
 | Meeting State Agent | 增量工作记忆（AGENT-1），游标幂等 + 批次 + finish 强制 flush |
-| Final Summary V2 | 以 Meeting State + Evidence 为主输入（AGENT-2） |
+| Final Summary V2 | Meeting State + 完整 FINAL 转写；超限时退化为优先证据（AGENT-2） |
 | Evidence trace | `source_segment_seqs` 优先级选择 + ±1 邻域扩展 |
 | legacy fallback | V2 不可用时回落到全量 transcript 路径（设计内降级，非失败） |
 | FakeProvider | 离线确定性，支持 Meeting State 与 Final Summary 两种 shape |
@@ -112,15 +112,20 @@ Meeting State 当前维护：
 * `last_processed_segment_seq`
 * `version`
 
+真实 FINAL 在录音过程中通过合并调度持续更新 Meeting State：默认停顿 2 秒刷新，
+连续输入最迟 6 秒发起刷新。该窗口会强制处理未达到普通批次阈值的尾部，因此短会议
+不再等到点击结束才首次产生会议理解。
+
 Final Summary 使用：
 
 ```text
 Meeting State
 +
-Transcript Evidence
+完整 FINAL Transcript
 ```
 
-默认**不**重新把整场 Full Transcript 当主语义输入。
+默认使用整场 FINAL Transcript 保证纪要完整性；组合 Prompt 超过容量上限时，才退化为
+优先选择的 Transcript Evidence。
 
 ---
 
@@ -394,8 +399,8 @@ CI
 5. **V2 detail 当前兼容存放于现有 `raw_model_output` 列**（不新增 DB 列）。
 6. **真实 ASR 未接入**。
 7. **STREAM_END 最终 ownership 未冻结**（见 §10）。
-8. Meeting State merge 策略**只能增改、不能删**（列表语义「非空替换、
-   空/缺省保留」，安全方向）。
+8. Meeting State merge 区分**字段缺省**与**显式空值**：缺省保留旧值，空数组或
+   `null` 清除旧值；提示词要求模型在纠正、撤回或问题解决后输出完整的新状态。
 9. `source_segment_seqs` 只保证**字段存在**，不保证引用正确。
 10. **真实 provider 偶发 120s 超时**（传输层，非模型输出形状问题）。超时会使该次
     AGENT-1 状态更新 `FAILED`，但因幂等可重放，后续触发会重放该批并收敛；不需要人工

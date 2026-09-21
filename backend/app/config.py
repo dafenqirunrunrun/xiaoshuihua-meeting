@@ -36,6 +36,10 @@ class Settings(BaseSettings):
     # LLM call limits
     llm_timeout_seconds: float = 120.0
     llm_max_retries: int = 1
+    # Low variance is preferable for structured meeting facts. These are sent
+    # through the OpenAI-compatible provider request, not applied to FakeProvider.
+    llm_temperature: float = 0.1
+    llm_max_output_tokens: int = 4096
 
     # Which provider the summary pipeline uses: "fake" (default, offline
     # deterministic tests) or "deepseek" (env-only config, real internal LLM).
@@ -52,6 +56,14 @@ class Settings(BaseSettings):
 
     # Linear gain applied only to the ASR copy; raw PCM recordings are unchanged.
     asr_audio_gain: float = 1.0
+
+    # Maximum time Finish waits for the ESP32 socket, PCM sender, Tencent ASR
+    # receiver and transcript dispatcher to drain before refusing to freeze an
+    # incomplete transcript.
+    audio_session_stop_timeout_seconds: float = 40.0
+
+    # Physical audio source used by the current single-room MVP deployment.
+    shuihua_audio_device_id: str = "ESP32-001"
 
     # Tencent ASR settings are read from the existing backend .env file.
     tencent_asr_app_id: str = ""
@@ -71,6 +83,15 @@ class Settings(BaseSettings):
     # Char count is the real cost driver for the prompt, so it is checked too.
     meeting_agent_batch_max_segments: int = 8
     meeting_agent_batch_max_chars: int = 1200
+    # Real-time FINAL signals are merged for a short quiet window, but a steady
+    # stream is flushed no later than max_wait. This makes Meeting State visible
+    # during recording without turning every sentence into one LLM request.
+    meeting_agent_realtime_debounce_seconds: float = 2.0
+    meeting_agent_realtime_max_wait_seconds: float = 6.0
+    # Live understanding favours freshness. This per-attempt bound replaces the
+    # generic 120s timeout; any configured provider retry remains finite, and a
+    # later FINAL also naturally retries a failed state pass.
+    meeting_agent_llm_timeout_seconds: float = 12.0
     # Structured-output (Pydantic) validation attempts per state update, with
     # the same bounded repair-prompt semantics as the Summary pipeline.
     meeting_agent_max_attempts: int = 2
@@ -95,12 +116,9 @@ class Settings(BaseSettings):
     # kill switch: turning it off is a complete return to the legacy path, never
     # a partial state.
     final_summary_v2_enabled: bool = True
-    # Upper bound on how many transcript segments are carried into the V2 prompt
-    # as EVIDENCE. The state's source_segment_seqs are the primary selection;
-    # this bound stops a pathological meeting from reconstituting the whole
-    # transcript (which would defeat the point of consuming the state at all).
-    # Selection is priority-ordered (decisions / action items first), so the
-    # bound never silently drops the most load-bearing grounding.
+    # Upper bound used only when the complete FINAL transcript makes the V2
+    # prompt too large. The fallback is priority-ordered (decisions / action
+    # items first), so capacity protection keeps the most load-bearing evidence.
     final_summary_max_evidence_segments: int = 60
     # Neighbour window around each cited segment (0 disables). A decision cited
     # at seq 8 is easier to judge with seq 7 and 9 alongside it, and the extra
@@ -108,7 +126,10 @@ class Settings(BaseSettings):
     final_summary_evidence_neighbor_window: int = 1
     # Hard bound on the assembled V2 prompt (state + evidence). Same stance as
     # the rest of the pipeline: refuse loudly rather than silently truncate.
-    final_summary_max_input_chars: int = 120_000
+    final_summary_max_input_chars: int = 100_000
+    # Final generation gets a larger window than live state, but still fails in
+    # bounded time so the UI can offer explicit regeneration instead of hanging.
+    final_summary_llm_timeout_seconds: float = 30.0
 
     # Model name for the Final Summary Agent. Empty means "use the provider's
     # own configured model" (DeepSeekProvider already owns deepseek_model).

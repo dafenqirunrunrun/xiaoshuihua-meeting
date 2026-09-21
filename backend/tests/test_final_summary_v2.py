@@ -3,9 +3,10 @@
 Step AGENT-2 changes the final summary's INPUT, not its contract:
 
     before   full transcript -> LLM -> summary
-    after    Meeting State (working memory) + transcript evidence -> LLM -> summary
+    after    Meeting State (working memory) + complete FINAL transcript -> LLM -> summary
 
-with the legacy path kept intact as a designed FALLBACK. These tests exist
+with priority evidence used for oversized prompts and the legacy path kept
+intact as a designed FALLBACK. These tests exist
 mainly to answer the question the green legacy suites CANNOT answer: **is V2
 actually running, or is everything silently falling back?**
 
@@ -456,7 +457,32 @@ class TestUsabilityGate:
         assert plan.source == SOURCE_MEETING_STATE
         assert plan.fallback_reason is None
         assert plan.prompt and "<meeting_state>" in plan.prompt
+        assert plan.transcript_scope == "full"
+        assert plan.evidence_segment_count == 6
+        assert "以下为完整 FINAL 转写" in plan.prompt
+        for _seq, text in SCRIPT:
+            assert text in plan.prompt
         assert plan.parse is not None and plan.build_repair is not None
+
+    def test_t08b_oversized_full_transcript_degrades_to_priority_evidence(
+        self, client, db, scripted, monkeypatch
+    ):
+        mid = _seed_meeting(client)
+        _finalize(client, mid, 6)
+        full = _plan(db, mid)
+        assert full.transcript_scope == "full"
+
+        monkeypatch.setattr(
+            "app.config.settings.final_summary_max_input_chars",
+            len(full.prompt) - 1,
+        )
+        monkeypatch.setattr(
+            "app.config.settings.final_summary_max_evidence_segments", 1
+        )
+        selected = _plan(db, mid)
+        assert selected.transcript_scope == "selected"
+        assert selected.evidence_segment_count == 1
+        assert "容量保护后的重点证据" in selected.prompt
 
 
 # ===========================================================================
