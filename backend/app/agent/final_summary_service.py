@@ -4,12 +4,11 @@ Step AGENT-2. Upgrades the summary input from
 
     full transcript  ->  LLM  ->  summary
 
-to
+to an adaptive State-first path:
 
-    complete FINAL transcript + optional latest-good memory  ->  LLM  ->  summary
-
-with priority-selected evidence and snapshots used only when the complete input
-exceeds configured capacity. Realtime health never gates this pipeline.
+    current state + cited evidence + closing context  ->  summary
+    slightly stale state + cited evidence + full tail ->  summary
+    missing/failed/severely stale state + transcript  ->  summary
 
 Where this sits
 ---------------
@@ -56,7 +55,6 @@ from app.agent.summary_schemas import MeetingSummarySchema
 from app.config import settings
 from app.meeting.meeting_model import Meeting
 from app.meeting_state import repository as state_repository
-from app.meeting_state import snapshot_repository
 from app.meeting_state.schemas import MeetingStateContent
 from app.transcript import repository as transcript_repository
 
@@ -265,6 +263,35 @@ def empty_meeting_summary() -> tuple[MeetingSummarySchema, str]:
 # Plan building
 # =============================================================================
 
+def _merge_selection(
+    base: evidence_module.EvidenceSelection,
+    *groups,
+) -> evidence_module.EvidenceSelection:
+    """Union selected evidence with required context, preserving meeting order."""
+    by_seq = {seg.segment_seq: seg for seg in base.segments}
+    for group in groups:
+        for seg in group:
+            by_seq[seg.segment_seq] = seg
+    return evidence_module.EvidenceSelection(
+        segments=[by_seq[seq] for seq in sorted(by_seq)],
+        cited_seqs=base.cited_seqs,
+        truncated=base.truncated,
+        dropped_count=base.dropped_count,
+    )
+
+
+def _state_evidence(
+    content: MeetingStateContent,
+    segments,
+) -> evidence_module.EvidenceSelection:
+    return evidence_module.select_evidence(
+        content,
+        segments,
+        max_evidence_segments=settings.final_summary_max_evidence_segments,
+        neighbor_window=settings.final_summary_evidence_neighbor_window,
+    )
+
+
 def build_plan(
     db: Session,
     meeting: Meeting,
@@ -321,13 +348,67 @@ def build_plan(
         _log_plan(meeting_id, plan)
         return plan
 
-    # --- Canonical V2: full transcript + optional latest-good state ----------
+    # --- Adaptive State-first V2 ---------------------------------------------
     segments = transcript_repository.list_sorted(db, meeting_id)
-    cited_seqs = evidence_module.cited_segment_seqs(assessment.content)
+    lag = max(
+        0,
+        assessment.final_transcript_seq - assessment.last_processed_segment_seq,
+    )
+    tail_size = max(0, settings.final_summary_tail_segments)
+    closing_tail = segments[-tail_size:] if tail_size else []
 
-    snapshots = snapshot_repository.prompt_material(db, meeting_id)
+    # A state is allowed to trail only when it is otherwise healthy and the
+    # entire missing suffix can be sent cheaply. FAILED/STALE rows are not
+    # trusted: their last update may have produced an unknown partial result.
+    can_merge_tail = (
+        assessment.reason == REASON_STATE_STALE
+        and assessment.status in {"ACTIVE", "FROZEN"}
+        and assessment.content != MeetingStateContent()
+        and 0 < lag <= settings.final_summary_max_unprocessed_tail_segments
+    )
 
-    def material(selection, scope: str, *, include_snapshots: bool = False) -> str:
+    if assessment.usable:
+        prompt_state = assessment.content
+        selection = _merge_selection(
+            _state_evidence(prompt_state, segments),
+            closing_tail,
+        )
+        transcript_scope = "state_complete"
+        source = SOURCE_MEETING_STATE
+        fallback_reason = None
+        unprocessed_count = 0
+    elif can_merge_tail:
+        prompt_state = assessment.content
+        unprocessed_tail = [
+            seg for seg in segments
+            if seg.segment_seq > assessment.last_processed_segment_seq
+        ]
+        selection = _merge_selection(
+            _state_evidence(prompt_state, segments),
+            unprocessed_tail,
+            closing_tail,
+        )
+        transcript_scope = "state_with_tail"
+        source = SOURCE_MEETING_STATE
+        fallback_reason = assessment.reason
+        unprocessed_count = len(unprocessed_tail)
+    else:
+        # Full transcript is the only safe source when state is absent,
+        # unreadable, failed or too far behind. Do not include the degraded
+        # state as a competing source of truth.
+        prompt_state = MeetingStateContent()
+        selection = evidence_module.EvidenceSelection(
+            segments=segments,
+            cited_seqs=[],
+            truncated=False,
+            dropped_count=0,
+        )
+        transcript_scope = "full_fallback"
+        source = SOURCE_TRANSCRIPT_FALLBACK
+        fallback_reason = assessment.reason
+        unprocessed_count = lag
+
+    def material() -> str:
         return build_v2_prompt(
             build_summary_input(
                 meeting_id=meeting_id,
@@ -336,51 +417,19 @@ def build_plan(
                     meeting.started_at.isoformat() if meeting.started_at else None
                 ),
                 ended_at=meeting.ended_at.isoformat() if meeting.ended_at else None,
-                state=assessment.content,
+                state=prompt_state,
                 state_version=assessment.version,
                 last_processed_segment_seq=assessment.last_processed_segment_seq,
                 selection=selection,
                 total_segment_count=len(segments),
-                transcript_scope=scope,
+                transcript_scope=transcript_scope,
                 state_status=assessment.status,
-                # Snapshots are most useful when capacity protection means the
-                # full transcript cannot fit. For ordinary meetings the frozen
-                # transcript already provides stronger grounding without the
-                # duplicated checkpoint tokens.
-                memory_snapshots=snapshots if include_snapshots else [],
+                final_segment_seq=assessment.final_transcript_seq,
+                unprocessed_segment_count=unprocessed_count,
             )
         )
 
-    # Normal meetings carry the complete FINAL transcript. Meeting State is an
-    # index and working memory, not a lossy filter: an item the incremental
-    # agent missed can still be recovered by the final pass.
-    selection = evidence_module.EvidenceSelection(
-        segments=segments,
-        cited_seqs=cited_seqs,
-        truncated=False,
-        dropped_count=0,
-    )
-    transcript_scope = "full"
-    prompt = material(selection, transcript_scope)
-
-    # For a pathological meeting that exceeds the model input budget, retain
-    # the existing priority selection. This is explicit in the prompt/logs and
-    # preserves decisions/actions before topics; content is never sliced by
-    # raw string length.
-    if len(prompt) > settings.final_summary_max_input_chars:
-        selection = evidence_module.select_evidence(
-            assessment.content,
-            segments,
-            max_evidence_segments=settings.final_summary_max_evidence_segments,
-            neighbor_window=settings.final_summary_evidence_neighbor_window,
-        )
-        transcript_scope = "selected"
-        prompt = material(selection, transcript_scope)
-        with_snapshots = material(
-            selection, transcript_scope, include_snapshots=True
-        )
-        if len(with_snapshots) <= settings.final_summary_max_input_chars:
-            prompt = with_snapshots
+    prompt = material()
 
     if len(prompt) > settings.final_summary_max_input_chars:
         raise SummaryPlanError(
@@ -389,7 +438,7 @@ def build_plan(
         )
 
     plan = SummaryPlan(
-        source=SOURCE_MEETING_STATE,
+        source=source,
         prompt=prompt,
         parse=_v2_parse,
         build_repair=lambda raw, err: build_v2_repair_prompt(prompt, raw, err),
@@ -398,7 +447,7 @@ def build_plan(
         final_transcript_seq=assessment.final_transcript_seq,
         evidence_segment_count=len(selection.segments),
         transcript_scope=transcript_scope,
-        fallback_reason=None if assessment.usable else assessment.reason,
+        fallback_reason=fallback_reason,
     )
     _log_plan(meeting_id, plan)
     return plan

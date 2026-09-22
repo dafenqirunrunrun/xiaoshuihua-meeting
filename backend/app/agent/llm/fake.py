@@ -58,13 +58,9 @@ DEFAULT_JSON = (
     '"open_questions": ["是否接真实 ASR"]}'
 )
 
-# A valid MeetingStateUpdate. All lists are optional on that model, so an empty
-# update is legal and always parses — the deterministic default cannot fail
-# validation.
-DEFAULT_STATE_JSON = (
-    '{"live_summary": null, "current_topic": null, "topics": [], "decisions": [], '
-    '"action_items": [], "open_questions": [], "risks": []}'
-)
+# A valid MeetingStateDelta. An empty operation list is a legal no-op and keeps
+# offline development deterministic.
+DEFAULT_STATE_JSON = '{"operations": []}'
 
 # A valid FinalMeetingSummary (V2). Minimal but structurally complete: only
 # `overview` is required, every list defaults to empty.

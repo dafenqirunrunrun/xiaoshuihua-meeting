@@ -272,7 +272,8 @@ class TestScenarios:
         assert [s["utterance_id"] for s in segs] == ["mock-session-001:1",
                                                      "mock-session-001:2",
                                                      "mock-session-001:3"]
-        # speakerId=-1 during PARTIAL, resolved on FINAL -> never "speaker_-1"
+        # The generic ASR HTTP contract still accepts provider speaker labels;
+        # the Tencent product bridge is what neutralizes them in production.
         assert all(s["speaker_id"].startswith("speaker_") for s in segs)
 
     def test_reconnect_scenario_keeps_identities_distinct(self, server):

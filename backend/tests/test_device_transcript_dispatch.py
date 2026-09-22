@@ -128,7 +128,7 @@ def test_dispatch_resolves_device_for_each_sentence_and_preserves_domain_rules()
             "voice-A:1",
             "voice-B:1",
         ]
-        assert segments[0].speaker_id == "speaker_1"
+        assert segments[0].speaker_id == "unknown"
     finally:
         db.close()
 
@@ -245,6 +245,6 @@ def test_receiver_thread_handoff_keeps_trailing_final_during_shutdown() -> None:
         segment = db.scalar(select(TranscriptSegment))
         assert segment is not None
         assert segment.text == "断开前最后一句"
-        assert segment.speaker_id == "speaker_2"
+        assert segment.speaker_id == "unknown"
     finally:
         db.close()

@@ -29,7 +29,9 @@ a nice-to-have.
 
 from __future__ import annotations
 
-from pydantic import BaseModel, ConfigDict, Field
+from typing import Annotated, Any, Literal
+
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class TopicState(BaseModel):
@@ -124,6 +126,71 @@ class MeetingStateUpdate(BaseModel):
     risks: list[RiskItem] = Field(default_factory=list)
 
 
+_LIST_ITEM_MODELS = {
+    "topics": TopicState,
+    "decisions": DecisionItem,
+    "action_items": ActionItem,
+    "open_questions": OpenQuestion,
+    "risks": RiskItem,
+}
+
+
+class SetScalarOperation(BaseModel):
+    """Replace one cheap scalar projection without rewriting the whole state."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    op: Literal["set"]
+    field: Literal["live_summary", "current_topic"]
+    value: str | None
+
+
+class UpsertListOperation(BaseModel):
+    """Add or replace one structured fact in a state collection."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    op: Literal["upsert"]
+    field: Literal[
+        "topics", "decisions", "action_items", "open_questions", "risks"
+    ]
+    value: Any
+    # Optional previous identity when a correction also changes the item's text.
+    match: str | None = Field(default=None, max_length=2000)
+
+    @model_validator(mode="after")
+    def validate_typed_value(self) -> "UpsertListOperation":
+        model = _LIST_ITEM_MODELS[self.field]
+        self.value = model.model_validate(self.value)
+        return self
+
+
+class RemoveListOperation(BaseModel):
+    """Remove a resolved, retracted or superseded structured fact."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    op: Literal["remove"]
+    field: Literal[
+        "topics", "decisions", "action_items", "open_questions", "risks"
+    ]
+    match: str = Field(..., min_length=1, max_length=2000)
+
+
+StateOperation = Annotated[
+    SetScalarOperation | UpsertListOperation | RemoveListOperation,
+    Field(discriminator="op"),
+]
+
+
+class MeetingStateDelta(BaseModel):
+    """Preferred low-latency model contract: only emit semantic changes."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    operations: list[StateOperation] = Field(default_factory=list, max_length=32)
+
+
 class MeetingState(MeetingStateContent):
     """The durable, versioned meeting state (content + pipeline-owned cursor).
 
@@ -174,6 +241,11 @@ __all__ = [
     "RiskItem",
     "MeetingStateContent",
     "MeetingStateUpdate",
+    "SetScalarOperation",
+    "UpsertListOperation",
+    "RemoveListOperation",
+    "StateOperation",
+    "MeetingStateDelta",
     "MeetingState",
     "MeetingStatePublic",
 ]

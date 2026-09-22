@@ -24,14 +24,14 @@ export const designTokens = {
   colorDanger: '#F04438',
 
   // Neutrals —— 暖白页面、纯白内容面、近黑正文
-  colorBgPage: '#F7F7F8',
+  colorBgPage: '#F5F4F6',
   colorBgSurface: '#FFFFFF',
   colorBgSubtle: '#F2F2F3',
   colorTextPrimary: '#202124',
   colorTextSecondary: '#55575D',
   colorTextTertiary: '#92949A',
-  colorBorder: '#E7E7EA',
-  colorBorderLight: '#F0F0F2',
+  colorBorder: '#E5E2E6',
+  colorBorderLight: '#EFEDF0',
 
   // Radius —— 内容产品保持紧凑，圆形只留给头像和状态点
   radiusSm: 6,
@@ -40,12 +40,12 @@ export const designTokens = {
 
   // Shadow —— 非常弱，hover 略升；边框优先于阴影
   shadowCard:
-    '0 1px 2px rgba(32, 33, 36, 0.03), 0 4px 14px rgba(32, 33, 36, 0.035)',
+    '0 1px 2px rgba(46, 38, 42, 0.025), 0 10px 30px rgba(46, 38, 42, 0.055)',
   shadowCardHover:
-    '0 2px 5px rgba(32, 33, 36, 0.04), 0 12px 28px rgba(32, 33, 36, 0.07)',
+    '0 2px 5px rgba(46, 38, 42, 0.035), 0 16px 38px rgba(46, 38, 42, 0.08)',
 
   // Layout
-  sidebarWidth: 220,
+  sidebarWidth: 208,
   contentMaxWidth: 1200,
   railWidth: 300,
 
@@ -96,7 +96,7 @@ export const antdTheme = {
       itemSelectedBg: designTokens.colorPrimaryLight,
       itemSelectedColor: designTokens.colorPrimary,
       itemHoverBg: designTokens.colorBgSubtle,
-      itemHeight: 40,
+      itemHeight: 44,
       itemMarginInline: 10,
       itemMarginBlock: 4,
     },

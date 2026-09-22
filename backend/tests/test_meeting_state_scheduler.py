@@ -85,6 +85,29 @@ def test_continuous_signals_flush_at_max_wait() -> None:
     assert scheduler.wait_for_idle("meeting-1", timeout_seconds=1.0)
 
 
+def test_burst_signals_flush_immediately_before_quiet_window() -> None:
+    called = Event()
+    started_at = time.monotonic()
+    scheduler = MeetingStateScheduler(
+        runner=lambda _meeting_id: called.set(),
+        max_workers=1,
+        min_signals=20,
+        silence_seconds=0.5,
+        max_wait_seconds=5.0,
+        burst_signals=4,
+        burst_window_seconds=1.0,
+    )
+
+    assert scheduler.schedule("meeting-1") is True
+    for _ in range(3):
+        time.sleep(0.02)
+        assert scheduler.schedule("meeting-1") is False
+
+    assert called.wait(timeout=0.2)
+    assert time.monotonic() - started_at < 0.5
+    assert scheduler.wait_for_idle("meeting-1", timeout_seconds=1.0)
+
+
 def test_default_runner_force_flushes_the_live_tail(monkeypatch) -> None:
     calls: list[tuple[str, bool]] = []
 

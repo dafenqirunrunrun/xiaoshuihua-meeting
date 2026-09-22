@@ -19,9 +19,14 @@ class _FakeClient:
     def __exit__(self, *_args) -> None:
         return None
 
-    def post(self, url: str, *, headers: dict, json: dict) -> httpx.Response:
+    def post(
+        self, url: str, *, headers: dict, json: dict, timeout: float | None = None
+    ) -> httpx.Response:
         self._calls.append({"url": url, "headers": headers, "json": json})
         return self._responses.pop(0)
+
+    def close(self) -> None:
+        return None
 
 
 def _response(status: int, payload: dict | None = None) -> httpx.Response:
@@ -105,3 +110,87 @@ def test_non_retryable_4xx_fails_immediately(monkeypatch) -> None:
     with pytest.raises(SummaryGenerationError, match="HTTP 400"):
         provider.complete("prompt")
     assert len(calls) == 1
+
+
+def test_provider_reuses_one_http_client_across_calls(monkeypatch) -> None:
+    calls: list[dict] = []
+    clients_created = 0
+    responses = [
+        _response(200, {"choices": [{"message": {"content": '{"ok":1}'}}]}),
+        _response(200, {"choices": [{"message": {"content": '{"ok":2}'}}]}),
+    ]
+
+    def make_client(**_kwargs):
+        nonlocal clients_created
+        clients_created += 1
+        return _FakeClient(responses, calls)
+
+    monkeypatch.setattr(deepseek_module.httpx, "Client", make_client)
+    provider = DeepSeekProvider(
+        base_url="https://llm.example", api_key="secret", max_retries=0
+    )
+
+    assert provider.complete("one") == '{"ok":1}'
+    assert provider.complete("two") == '{"ok":2}'
+    assert clients_created == 1
+    assert len(calls) == 2
+
+
+def test_realtime_provider_can_disable_expensive_thinking(monkeypatch) -> None:
+    calls: list[dict] = []
+    responses = [
+        _response(200, {"choices": [{"message": {"content": '{"ok":1}'}}]})
+    ]
+    monkeypatch.setattr(
+        deepseek_module.httpx,
+        "Client",
+        lambda **_kwargs: _FakeClient(responses, calls),
+    )
+    provider = DeepSeekProvider(
+        base_url="https://llm.example",
+        api_key="secret",
+        max_retries=0,
+        thinking_enabled=False,
+    )
+
+    provider.complete("prompt")
+    assert calls[0]["json"]["thinking"] == {"type": "disabled"}
+    assert calls[0]["json"]["reasoning_effort"] == "none"
+    assert calls[0]["json"]["chat_template_kwargs"] == {
+        "enable_thinking": False
+    }
+
+
+def test_empty_content_reports_length_and_reasoning_budget(monkeypatch) -> None:
+    calls: list[dict] = []
+    responses = [
+        _response(
+            200,
+            {
+                "choices": [
+                    {
+                        "finish_reason": "length",
+                        "message": {"content": None},
+                    }
+                ],
+                "usage": {
+                    "completion_tokens": 4096,
+                    "completion_tokens_details": {"reasoning_tokens": 4096},
+                },
+            },
+        )
+    ]
+    monkeypatch.setattr(
+        deepseek_module.httpx,
+        "Client",
+        lambda **_kwargs: _FakeClient(responses, calls),
+    )
+    provider = DeepSeekProvider(
+        base_url="https://llm.example", api_key="secret", max_retries=0
+    )
+
+    with pytest.raises(
+        SummaryGenerationError,
+        match=r"finish_reason=length, completion_tokens=4096, reasoning_tokens=4096",
+    ):
+        provider.complete("prompt")

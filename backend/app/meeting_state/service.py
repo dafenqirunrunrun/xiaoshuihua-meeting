@@ -52,6 +52,7 @@ call would stall FINAL ingest for the same meeting — unacceptable.
 from __future__ import annotations
 
 import logging
+from threading import RLock
 import time
 import uuid
 
@@ -63,7 +64,16 @@ from app.meeting_state import repository as state_repository
 from app.meeting_state import snapshot_repository
 from app.meeting_state import updater
 from app.meeting_state.prompts import build_repair_prompt, build_update_prompt
-from app.meeting_state.schemas import MeetingState, MeetingStateContent, MeetingStatePublic
+from app.meeting_state.schemas import (
+    MeetingState,
+    MeetingStateContent,
+    MeetingStateDelta,
+    MeetingStatePublic,
+    MeetingStateUpdate,
+    RemoveListOperation,
+    SetScalarOperation,
+    UpsertListOperation,
+)
 from app.common.meeting_lock import meeting_lock
 from app.realtime import sse_service  # publish AFTER db.commit() only
 from app.transcript import repository as transcript_repository
@@ -89,6 +99,32 @@ OUTCOME_SUPERSEDED = "SUPERSEDED"
 OUTCOME_TOO_LARGE = "BATCH_TOO_LARGE"
 OUTCOME_LIMIT_REACHED = "BATCH_LIMIT_REACHED"
 OUTCOME_NOT_FOUND = "MEETING_NOT_FOUND"
+
+_summary_refresh_lock = RLock()
+_last_summary_refresh: dict[str, float] = {}
+
+
+def _summary_refresh_due(meeting_id: str, previous: MeetingStateContent) -> bool:
+    if previous.live_summary is None:
+        return True
+    interval = max(0.0, settings.meeting_agent_live_summary_interval_seconds)
+    with _summary_refresh_lock:
+        last = _last_summary_refresh.get(meeting_id)
+    return last is None or time.monotonic() - last >= interval
+
+
+def _record_summary_refresh(meeting_id: str) -> None:
+    with _summary_refresh_lock:
+        _last_summary_refresh[meeting_id] = time.monotonic()
+
+
+def reset_summary_refresh_gate(meeting_id: str | None = None) -> None:
+    """Clear process-local cadence state on meeting end, shutdown and tests."""
+    with _summary_refresh_lock:
+        if meeting_id is None:
+            _last_summary_refresh.clear()
+        else:
+            _last_summary_refresh.pop(meeting_id, None)
 
 
 def _publish_state_changed(
@@ -225,7 +261,7 @@ def _pending_segments(
 # =============================================================================
 
 def merge_content(
-    previous: MeetingStateContent, update: MeetingStateContent
+    previous: MeetingStateContent, update: MeetingStateUpdate | MeetingStateDelta
 ) -> MeetingStateContent:
     """Fold one LLM update into the previous state.
 
@@ -235,6 +271,9 @@ def merge_content(
     disappear. A genuinely omitted field remains lenient and preserves the
     previous value, which keeps older/scripted providers backward compatible.
     """
+    if isinstance(update, MeetingStateDelta):
+        return _apply_delta(previous, update)
+
     fields_set = update.model_fields_set
 
     def value(name: str):
@@ -249,6 +288,55 @@ def merge_content(
         open_questions=value("open_questions"),
         risks=value("risks"),
     )
+
+
+def _item_identity(field: str, item) -> str:
+    attribute = (
+        "title"
+        if field == "topics"
+        else "task"
+        if field == "action_items"
+        else "text"
+    )
+    return " ".join(str(getattr(item, attribute)).casefold().split())
+
+
+def _apply_delta(
+    previous: MeetingStateContent, delta: MeetingStateDelta
+) -> MeetingStateContent:
+    """Apply validated model operations with deterministic application logic."""
+    data = previous.model_copy(deep=True)
+    for operation in delta.operations:
+        if isinstance(operation, SetScalarOperation):
+            setattr(data, operation.field, operation.value)
+            continue
+
+        items = list(getattr(data, operation.field))
+        if isinstance(operation, RemoveListOperation):
+            match = " ".join(operation.match.casefold().split())
+            setattr(
+                data,
+                operation.field,
+                [item for item in items if _item_identity(operation.field, item) != match],
+            )
+            continue
+
+        if isinstance(operation, UpsertListOperation):
+            raw_target = operation.match or _item_identity(
+                operation.field, operation.value
+            )
+            target = " ".join(raw_target.casefold().split())
+            replacement_index = next(
+                (index for index, item in enumerate(items)
+                 if _item_identity(operation.field, item) == target),
+                None,
+            )
+            if replacement_index is None:
+                items.append(operation.value)
+            else:
+                items[replacement_index] = operation.value
+            setattr(data, operation.field, items)
+    return data
 
 
 # =============================================================================
@@ -351,7 +439,12 @@ def process_pending(
     if provider is None:
         from app.agent.llm.factory import get_provider
 
-        provider = get_provider(max_retries=0, retry_timeouts=False)
+        provider = get_provider(
+            max_retries=0,
+            retry_timeouts=False,
+            max_output_tokens=settings.meeting_agent_max_output_tokens,
+            thinking_enabled=False,
+        )
 
     from_seq = cursor
     batch_end = batch[-1].segment_seq
@@ -377,8 +470,13 @@ def process_pending(
                 "to_segment_seq": batch_end, "previous_state_version": version,
                 "new_state_version": version, "batches": 0}
 
+    refresh_live_summary = _summary_refresh_due(meeting_id, previous)
     prompt = build_update_prompt(
-        meeting.title, previous, batch, last_processed_segment_seq=cursor
+        meeting.title,
+        previous,
+        batch,
+        last_processed_segment_seq=cursor,
+        refresh_live_summary=refresh_live_summary,
     )
     snapshot_repository.record_attempt(db, meeting_id)
     llm_started = time.monotonic()
@@ -390,6 +488,17 @@ def process_pending(
         repair_enabled=settings.meeting_agent_parse_repair,
     )
     latency_ms = int((time.monotonic() - llm_started) * 1000)
+    logger.info(
+        "meeting_state_timing meeting_id=%s agent_run_id=%s provider_ms=%s "
+        "parse_ms=%s total_update_ms=%s prompt_chars=%s output_chars=%s",
+        meeting_id,
+        run_id,
+        result.provider_latency_ms,
+        result.parse_latency_ms,
+        latency_ms,
+        len(prompt),
+        len(result.raw_output),
+    )
 
     if not result.ok:
         with meeting_lock(meeting_id):
@@ -447,6 +556,12 @@ def process_pending(
             model_name=getattr(provider, "name", None),
             last_error=None,
         )
+
+    # A successful summary window advances the cadence even when the meeting is
+    # still too sparse for prose. Otherwise every meaningless audio fragment
+    # would keep paying for a summary instruction until non-null text appears.
+    if refresh_live_summary:
+        _record_summary_refresh(meeting_id)
 
     _publish_state_changed(meeting_id, version=new_version, status=status,
                            previous_version=fresh_version,

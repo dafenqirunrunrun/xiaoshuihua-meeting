@@ -23,7 +23,7 @@ from app.config import settings
 from app.speech import result_parser
 from app.speech.result_parser import TencentSentenceResult
 
-DEFAULT_ENGINE = "16k_zh_en_speaker_2.0"
+DEFAULT_ENGINE = "16k_zh_en_2.0"
 SLICE_SIZE = 6400
 SLICE_INTERVAL = 0.2
 RECEIVE_END_TIMEOUT = 30.0

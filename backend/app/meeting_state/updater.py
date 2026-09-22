@@ -26,12 +26,13 @@ from __future__ import annotations
 import json
 import logging
 import re
+import time
 from typing import Callable, NamedTuple
 
 from pydantic import ValidationError
 
 from app.config import settings
-from app.meeting_state.schemas import MeetingStateUpdate
+from app.meeting_state.schemas import MeetingStateDelta, MeetingStateUpdate
 from app.agent.llm.base import LLMProvider
 
 logger = logging.getLogger(__name__)
@@ -61,8 +62,10 @@ class UpdateResult(NamedTuple):
     """Outcome of one update attempt sequence."""
 
     raw_output: str
-    parsed: MeetingStateUpdate | None
+    parsed: MeetingStateUpdate | MeetingStateDelta | None
     reason: str | None  # set iff parsed is None
+    provider_latency_ms: int
+    parse_latency_ms: int
 
     @property
     def ok(self) -> bool:
@@ -81,7 +84,7 @@ def _prune_code_fence(text: str) -> str:
     return m.group(1) if m else text
 
 
-def parse_update(raw: str) -> MeetingStateUpdate:
+def parse_update(raw: str) -> MeetingStateUpdate | MeetingStateDelta:
     """JSON-decode + Pydantic-validate (the success criterion).
 
     Raises json.JSONDecodeError / ValidationError / StateSchemaError. There is
@@ -92,6 +95,10 @@ def parse_update(raw: str) -> MeetingStateUpdate:
     data = json.loads(pruned)  # JSONDecodeError propagates
     if not isinstance(data, dict):
         raise StateSchemaError(f"expected a JSON object, got {type(data).__name__}")
+    if "operations" in data:
+        return MeetingStateDelta.model_validate(data)
+    # Compatibility during rollout: old/scripted providers may still emit the
+    # former full-state contract. Production prompts request deltas.
     return MeetingStateUpdate.model_validate(data)
 
 
@@ -148,31 +155,37 @@ def run_update(
     """
     raw = ""
     reason: str | None = None
+    provider_latency_ms = 0
+    parse_latency_ms = 0
 
     for attempt in range(1, max(1, max_attempts) + 1):
         attempt_prompt = (
             prompt if attempt == 1 else build_repair_prompt(prompt, raw, reason or "")
         )
         try:
+            provider_started = time.monotonic()
             raw = call_provider(provider, attempt_prompt)
+            provider_latency_ms += int((time.monotonic() - provider_started) * 1000)
+            parse_started = time.monotonic()
             parsed = parse_update(raw)
-            return UpdateResult(raw_output=raw, parsed=parsed, reason=None)
+            parse_latency_ms += int((time.monotonic() - parse_started) * 1000)
+            return UpdateResult(raw, parsed, None, provider_latency_ms, parse_latency_ms)
         except StateUpdateError as exc:
             # Provider-level: not repairable.
-            return UpdateResult(raw_output=raw, parsed=None, reason=str(exc))
+            provider_latency_ms += int((time.monotonic() - provider_started) * 1000)
+            return UpdateResult(raw, None, str(exc), provider_latency_ms, parse_latency_ms)
         except (ValidationError, json.JSONDecodeError, StateSchemaError) as exc:
             reason = _describe_error(exc)
             if not repair_enabled:
                 break  # repair disabled -> FAILED after the first bad output
         except Exception as exc:  # noqa: BLE001 - never crash the ingest path
             logger.exception("unexpected failure while updating meeting state")
-            return UpdateResult(
-                raw_output=raw,
-                parsed=None,
-                reason=f"unexpected updater error: {type(exc).__name__}",
-            )
+            return UpdateResult(raw, None,
+                                f"unexpected updater error: {type(exc).__name__}",
+                                provider_latency_ms, parse_latency_ms)
 
-    return UpdateResult(raw_output=raw, parsed=None, reason=reason or "unknown error")
+    return UpdateResult(raw, None, reason or "unknown error",
+                        provider_latency_ms, parse_latency_ms)
 
 
 __all__ = [

@@ -39,6 +39,7 @@ class DeepSeekProvider:
         retry_timeouts: bool = True,
         temperature: float | None = None,
         max_output_tokens: int | None = None,
+        thinking_enabled: bool | None = None,
     ) -> None:
         # Allow explicit override (tests) but default to env-only config.
         self._base_url = base_url if base_url is not None else settings.deepseek_base_url
@@ -59,6 +60,9 @@ class DeepSeekProvider:
             if max_output_tokens is not None
             else settings.llm_max_output_tokens
         )
+        self._thinking_enabled = thinking_enabled
+        # Reuse DNS/TCP/TLS connections across realtime update windows.
+        self._client = httpx.Client(timeout=self._timeout)
 
     @property
     def name(self) -> str:
@@ -79,14 +83,31 @@ class DeepSeekProvider:
             "temperature": self._temperature,
             "max_tokens": self._max_output_tokens,
         }
+        if self._thinking_enabled is not None:
+            payload["thinking"] = {
+                "type": "enabled" if self._thinking_enabled else "disabled"
+            }
+            # The internal gateway exposes vLLM-shaped response fields. These
+            # equivalent hints cover both DeepSeek-native and vLLM chat
+            # templates; unsupported extras are ignored by compatible servers.
+            payload["reasoning_effort"] = (
+                "high" if self._thinking_enabled else "none"
+            )
+            payload["chat_template_kwargs"] = {
+                "enable_thinking": self._thinking_enabled
+            }
         timeout = timeout_seconds if timeout_seconds is not None else self._timeout
 
         for attempt in range(self._max_retries + 1):
             try:
-                with httpx.Client(timeout=timeout) as client:
-                    resp = client.post(url, headers=self._auth_headers(), json=payload)
-                    resp.raise_for_status()
-                    return extract_content(resp.json())
+                resp = self._client.post(
+                    url,
+                    headers=self._auth_headers(),
+                    json=payload,
+                    timeout=timeout,
+                )
+                resp.raise_for_status()
+                return extract_content(resp.json())
             except httpx.TimeoutException as exc:
                 if self._retry_timeouts and attempt < self._max_retries:
                     self._retry_pause(attempt)
@@ -122,6 +143,9 @@ class DeepSeekProvider:
 
         raise SummaryGenerationError("deepseek request exhausted retries")
 
+    def close(self) -> None:
+        self._client.close()
+
     @staticmethod
     def _retry_pause(attempt: int) -> None:
         # One short bounded backoff is enough for the MVP; retries remain finite
@@ -143,7 +167,23 @@ def extract_content(data: dict) -> str:
     except (KeyError, IndexError, TypeError) as exc:
         raise SummaryGenerationError(f"deepseek response missing content: {str(data)[:200]}") from exc
     if not isinstance(content, str) or not content.strip():
-        raise SummaryGenerationError("deepseek returned empty content")
+        choice = data.get("choices", [{}])[0]
+        finish_reason = choice.get("finish_reason") if isinstance(choice, dict) else None
+        usage = data.get("usage") if isinstance(data.get("usage"), dict) else {}
+        completion_tokens = usage.get("completion_tokens")
+        details = usage.get("completion_tokens_details")
+        reasoning_tokens = details.get("reasoning_tokens") if isinstance(details, dict) else None
+        diagnostics = ", ".join(
+            f"{name}={value}"
+            for name, value in (
+                ("finish_reason", finish_reason),
+                ("completion_tokens", completion_tokens),
+                ("reasoning_tokens", reasoning_tokens),
+            )
+            if value is not None
+        )
+        suffix = f" ({diagnostics})" if diagnostics else ""
+        raise SummaryGenerationError(f"deepseek returned empty content{suffix}")
     return content
 
 

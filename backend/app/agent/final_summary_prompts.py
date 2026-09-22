@@ -74,16 +74,17 @@ _RULES = """要求：
       分别在不同片段中提到），请输出合并后的最终状态，不要拆成两条。
   11. 所有列表即使为空也要给出空数组。
   12. 如果提供的是完整转写，应系统检查会议开头、中段和结尾，确保重要议题、明确
-      决策、待办、风险和未决问题没有仅因 Meeting State 漏记而遗漏。
-  13. 转写来自 ASR，可能含同音字、断句错误、口头重复和说话人编号。删除无意义
+      决策、待办、风险和未决问题没有遗漏；如果提供的是未处理尾部，必须将尾部的新
+      事实和修正合并进 Meeting State，而不是只复述旧状态。
+  13. 转写来自 ASR，可能含同音字、断句错误和口头重复。删除无意义
       语气词、合并重复表达，但不得猜测不确定的人名、数字、日期或专有名词。
   14. 同一事项存在自我修正或前后变化时，以最后一次明确表达为最终状态；必要时在
       topic summary 中简要说明变化，不要同时输出互相冲突的两个结论。
   15. overview 应覆盖会议目的、主要讨论、确定结果和下一步；没有明确结果时应如实
       说明“尚未确定”，不要用空泛的“大家进行了讨论”代替事实。
   16. key_topics 的 summary 应写出该议题的关键观点与最终状态，而不只是复述标题。
-  17. speaker_1 / speaker_2 等说话人标签只用于区分发言轮次，不代表可靠身份；除非
-      转写正文明确说出姓名或“我负责某事”，不得仅凭标签推断负责人或决策者。
+  17. 当前转写不提供可靠的发言人身份。只有正文明确出现姓名、负责人或明确的自我
+      承诺时才能填写 owner，不得根据句子顺序推断负责人或决策者。
   18. 直接输出 JSON 本体，不要包裹在 ```json ``` 代码块中。"""
 
 
@@ -99,7 +100,7 @@ def render_evidence(segments: list[TranscriptSegment]) -> str:
     if not segments:
         return _EMPTY_EVIDENCE
     return "\n".join(
-        f"[{seg.segment_seq}] <{seg.speaker_id}> {seg.text}" for seg in segments
+        f"[{seg.segment_seq}] {seg.text}" for seg in segments
     )
 
 
@@ -116,6 +117,8 @@ def build_summary_input(
     total_segment_count: int | None = None,
     transcript_scope: str = "selected",
     state_status: str = "EMPTY",
+    final_segment_seq: int | None = None,
+    unprocessed_segment_count: int = 0,
     memory_snapshots: list[dict] | None = None,
 ) -> dict:
     """The structured V2 input (step spec §3): metadata + state + evidence.
@@ -139,10 +142,15 @@ def build_summary_input(
         },
         "memory_snapshots": memory_snapshots or [],
         "evidence": [
-            {"segment_seq": seg.segment_seq, "speaker": seg.speaker_id, "text": seg.text}
+            {"segment_seq": seg.segment_seq, "text": seg.text}
             for seg in selection.segments
         ],
         "transcript_scope": transcript_scope,
+        "state_coverage": {
+            "covered_through_segment_seq": last_processed_segment_seq,
+            "final_segment_seq": final_segment_seq,
+            "unprocessed_segment_count": unprocessed_segment_count,
+        },
         "included_segment_count": len(selection.segments),
         "total_segment_count": (
             total_segment_count
@@ -167,14 +175,30 @@ def build_v2_prompt(summary_input: dict) -> str:
         summary_input.get("memory_snapshots", []), ensure_ascii=False, indent=2
     )
     evidence_lines = "\n".join(
-        f"[{e['segment_seq']}] <{e['speaker']}> {e['text']}"
+        f"[{e['segment_seq']}] {e['text']}"
         for e in summary_input["evidence"]
     ) or _EMPTY_EVIDENCE
     transcript_scope = summary_input.get("transcript_scope", "selected")
     included_count = summary_input.get("included_segment_count", 0)
     total_count = summary_input.get("total_segment_count", included_count)
-    if transcript_scope == "full":
-        scope_note = f"以下为完整 FINAL 转写，共 {total_count} 段。"
+    coverage = summary_input.get("state_coverage", {})
+    if transcript_scope == "state_complete":
+        scope_note = (
+            f"Meeting State 已覆盖全部 {total_count} 段 FINAL。以下 {included_count} 段"
+            "仅是状态引用的关键证据与结尾上下文，不是完整转写。"
+        )
+    elif transcript_scope == "state_with_tail":
+        scope_note = (
+            "Meeting State 只覆盖到片段 "
+            f"{coverage.get('covered_through_segment_seq', 0)}；以下材料包含全部 "
+            f"{coverage.get('unprocessed_segment_count', 0)} 段未处理尾部以及关键证据，"
+            "必须把尾部事实合并进最终纪要。"
+        )
+    elif transcript_scope == "full_fallback":
+        scope_note = (
+            f"Meeting State 缺失、失败或严重滞后。以下为完整 FINAL 转写，共 {total_count} 段，"
+            "请直接以完整转写为准生成纪要。"
+        )
     else:
         scope_note = (
             f"以下为容量保护后的重点证据，共 {included_count}/{total_count} 段；"

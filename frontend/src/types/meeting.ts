@@ -15,9 +15,16 @@ export interface MeetingCreate {
   description?: string | null
 }
 
+export interface MeetingUpdate {
+  title: string
+}
+
+export type MeetingListSort = 'updated_desc' | 'created_desc' | 'created_asc'
+
 /** GET /api/meetings/:id 返回（MeetingOut） */
 export interface Meeting {
   id: string
+  meeting_code: string
   title: string
   description: string | null
   status: MeetingStatus
@@ -33,6 +40,10 @@ export interface Meeting {
 /** GET /api/meetings 查询参数（Step 8B-6：status 过滤 + limit/offset 分页） */
 export interface MeetingListQuery {
   status?: MeetingStatus
+  q?: string
+  created_from?: string
+  created_to?: string
+  sort?: MeetingListSort
   limit?: number
   offset?: number
 }

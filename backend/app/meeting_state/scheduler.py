@@ -31,6 +31,8 @@ class MeetingStateScheduler:
         min_signals: int | None = None,
         target_interval_seconds: float = 0.0,
         silence_seconds: float | None = None,
+        burst_signals: int | None = None,
+        burst_window_seconds: float = 0.0,
     ) -> None:
         self._runner = runner
         # `debounce_seconds` remains as a compatibility alias for focused unit
@@ -45,6 +47,8 @@ class MeetingStateScheduler:
         )
         self._target_interval_seconds = max(0.0, target_interval_seconds)
         self._max_wait_seconds = max(0.0, max_wait_seconds)
+        self._burst_signals = max(1, burst_signals or 2**31 - 1)
+        self._burst_window_seconds = max(0.0, burst_window_seconds)
         self._executor = ThreadPoolExecutor(
             max_workers=max_workers,
             thread_name_prefix="meeting-state",
@@ -54,6 +58,7 @@ class MeetingStateScheduler:
         self._window_started_at: dict[str, float] = {}
         self._last_signal_at: dict[str, float] = {}
         self._signal_count: dict[str, int] = {}
+        self._recent_signal_times: dict[str, list[float]] = {}
         self._lock = RLock()
         self._idle = Condition(self._lock)
 
@@ -66,6 +71,15 @@ class MeetingStateScheduler:
             self._pending.add(meeting_id)
             self._last_signal_at[meeting_id] = now
             self._signal_count[meeting_id] = self._signal_count.get(meeting_id, 0) + 1
+            recent = self._recent_signal_times.setdefault(meeting_id, [])
+            recent.append(now)
+            if self._burst_window_seconds > 0:
+                cutoff = now - self._burst_window_seconds
+                first_live_index = next(
+                    (i for i, value in enumerate(recent) if value >= cutoff),
+                    len(recent),
+                )
+                del recent[:first_live_index]
             self._idle.notify_all()
             if meeting_id in self._running:
                 return False
@@ -90,6 +104,11 @@ class MeetingStateScheduler:
                 now = time.monotonic()
                 if self._signal_count.get(meeting_id, 0) >= self._min_signals:
                     remaining = 0.0
+                elif (
+                    len(self._recent_signal_times.get(meeting_id, []))
+                    >= self._burst_signals
+                ):
+                    remaining = 0.0
                 else:
                     quiet_deadline = (
                         self._last_signal_at[meeting_id] + self._silence_seconds
@@ -110,6 +129,7 @@ class MeetingStateScheduler:
                     self._window_started_at.pop(meeting_id, None)
                     self._last_signal_at.pop(meeting_id, None)
                     self._signal_count.pop(meeting_id, None)
+                    self._recent_signal_times.pop(meeting_id, None)
                     return True
                 self._idle.wait(timeout=remaining)
             return False
@@ -163,7 +183,11 @@ class MeetingStateScheduler:
             self._window_started_at.pop(meeting_id, None)
             self._last_signal_at.pop(meeting_id, None)
             self._signal_count.pop(meeting_id, None)
+            self._recent_signal_times.pop(meeting_id, None)
             self._idle.notify_all()
+        from app.meeting_state.service import reset_summary_refresh_gate
+
+        reset_summary_refresh_gate(meeting_id)
 
     def cancel_all_pending(self) -> None:
         """Cancel every waiting window during process shutdown/test cleanup."""
@@ -172,7 +196,11 @@ class MeetingStateScheduler:
             self._window_started_at.clear()
             self._last_signal_at.clear()
             self._signal_count.clear()
+            self._recent_signal_times.clear()
             self._idle.notify_all()
+        from app.meeting_state.service import reset_summary_refresh_gate
+
+        reset_summary_refresh_gate()
 
     def _is_busy(self, meeting_id: str | None) -> bool:
         if meeting_id is None:
@@ -185,6 +213,8 @@ meeting_state_scheduler = MeetingStateScheduler(
     target_interval_seconds=settings.meeting_agent_realtime_target_interval_seconds,
     silence_seconds=settings.meeting_agent_realtime_silence_seconds,
     max_wait_seconds=settings.meeting_agent_realtime_max_wait_seconds,
+    burst_signals=settings.meeting_agent_realtime_burst_segments,
+    burst_window_seconds=settings.meeting_agent_realtime_burst_window_seconds,
 )
 
 

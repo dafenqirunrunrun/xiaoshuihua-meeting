@@ -21,6 +21,10 @@ class Settings(BaseSettings):
     # Database (MVP uses SQLite; swap to company data platform later)
     database_url: str = "sqlite:///./data/xiaoshuihua.db"
 
+    # Snowflake node number. Every concurrently running backend instance that
+    # shares a database must use a different value in the range 0..1023.
+    meeting_id_worker_id: int = 0
+
     # DeepSeek (internal LLM). Values come from real internal config at 联调 time.
     deepseek_base_url: str = ""
     deepseek_api_key: str = ""
@@ -69,8 +73,12 @@ class Settings(BaseSettings):
     tencent_asr_app_id: str = ""
     tencent_asr_secret_id: str = ""
     tencent_asr_secret_key: str = ""
-    tencent_asr_engine: str = "16k_zh_en_speaker_2.0"
+    tencent_asr_engine: str = "16k_zh_en_2.0"
     tencent_asr_debug: bool = False
+    # Product-level speaker labels are disabled independently of the provider
+    # engine. This keeps an accidental provider-side speaker id from leaking
+    # into transcripts or downstream Agent prompts.
+    asr_speaker_labels_enabled: bool = False
 
     # --- Meeting State Agent (Step AGENT-1) --------------------------------
     # Master switch. When false the whole downstream consumer is inert: no
@@ -86,13 +94,22 @@ class Settings(BaseSettings):
     # Realtime understanding is near-real-time, not subtitle-real-time. FINAL
     # signals only move one pending high-watermark; these thresholds decide when
     # the sole per-meeting worker consumes that range in one LLM call.
-    meeting_agent_realtime_min_segments: int = 8
-    meeting_agent_realtime_target_interval_seconds: float = 25.0
-    meeting_agent_realtime_silence_seconds: float = 10.0
-    meeting_agent_realtime_max_wait_seconds: float = 45.0
+    meeting_agent_realtime_min_segments: int = 3
+    meeting_agent_realtime_target_interval_seconds: float = 4.0
+    meeting_agent_realtime_silence_seconds: float = 1.5
+    meeting_agent_realtime_max_wait_seconds: float = 8.0
+    # Burst mode keeps live understanding responsive during heated discussion:
+    # a dense run of FINALs should trigger immediately even if the normal
+    # quiet/interval window has not elapsed.
+    meeting_agent_realtime_burst_segments: int = 8
+    meeting_agent_realtime_burst_window_seconds: float = 10.0
     # Realtime favours freshness: a timed-out pass remains pending and may be
     # coalesced with later FINALs, but it is never retried inside the request.
     meeting_agent_llm_timeout_seconds: float = 25.0
+    meeting_agent_max_output_tokens: int = 900
+    # The fast fact extractor runs on every ready window. User-facing prose is
+    # intentionally refreshed less often so it cannot dominate output latency.
+    meeting_agent_live_summary_interval_seconds: float = 12.0
     # Structured-output (Pydantic) validation attempts per state update, with
     # the same bounded repair-prompt semantics as the Summary pipeline.
     meeting_agent_max_attempts: int = 1
@@ -120,6 +137,13 @@ class Settings(BaseSettings):
     # at seq 8 is easier to judge with seq 7 and 9 alongside it, and the extra
     # context does not need to be cited by the state to be worth showing.
     final_summary_evidence_neighbor_window: int = 1
+    # A current Meeting State only needs its cited evidence plus a short closing
+    # window. This preserves late corrections without re-sending the meeting.
+    final_summary_tail_segments: int = 6
+    # A healthy state may finish slightly behind the frozen transcript. When the
+    # gap stays within this bound, send the complete unprocessed tail; a larger
+    # gap is treated as severe staleness and falls back to the full transcript.
+    final_summary_max_unprocessed_tail_segments: int = 12
     # Hard bound on the assembled V2 prompt (state + evidence). Same stance as
     # the rest of the pipeline: refuse loudly rather than silently truncate.
     final_summary_max_input_chars: int = 100_000

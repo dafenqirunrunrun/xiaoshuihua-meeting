@@ -39,6 +39,9 @@ async def lifespan(_app: FastAPI):
 
     meeting_state_scheduler.cancel_all_pending()
     meeting_state_scheduler.wait_for_idle(timeout_seconds=2.0)
+    from app.agent.llm.factory import close_cached_providers
+
+    close_cached_providers()
     # Close every SSE subscriber so generators end cleanly on shutdown.
     from app.realtime.event_broker import event_broker
 

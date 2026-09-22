@@ -1,5 +1,6 @@
 """Pure Tencent sentence -> frozen external Transcript DTO translation."""
 
+from app.config import settings
 from app.speech.result_parser import TencentSentenceResult
 from app.transcript.asr_schemas import AsrTranscriptEvent
 
@@ -14,7 +15,11 @@ def to_asr_transcript_event(
         speaker_id = -1
     elif sentence.sentence_type == 1:
         event_type = "transcript.final"
-        speaker_id = sentence.speaker_id if sentence.speaker_id >= 0 else -1
+        speaker_id = (
+            sentence.speaker_id
+            if settings.asr_speaker_labels_enabled and sentence.speaker_id >= 0
+            else -1
+        )
     else:
         raise ValueError(f"unsupported Tencent sentence_type={sentence.sentence_type}")
 

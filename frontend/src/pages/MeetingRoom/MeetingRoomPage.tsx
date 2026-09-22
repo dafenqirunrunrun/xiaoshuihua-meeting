@@ -24,7 +24,7 @@ import { useTranscriptSnapshot } from '@/hooks/useTranscriptSnapshot'
 import { useMeetingStream } from '@/hooks/useMeetingStream'
 import { useAutoScroll } from '@/hooks/useAutoScroll'
 import { useTranscriptEvidenceNavigation } from '@/hooks/useTranscriptEvidenceNavigation'
-import { formatDuration, elapsedMs } from '@/utils/time'
+import { durationBetweenMs, formatDuration, elapsedMs } from '@/utils/time'
 import { startMeeting, finishMeeting, normalizeApiError } from '@/api'
 import type { Meeting } from '@/types/meeting'
 import type { PartialUtterance, TranscriptSegment } from '@/types/transcript'
@@ -48,44 +48,39 @@ function useNowTick(active: boolean, startIso: string | null | undefined) {
 function Header({
   meeting,
   action,
-  timer,
   onBack,
   details,
 }: {
   meeting: Meeting
   action?: React.ReactNode
-  timer?: string
   onBack?: () => void
   details?: React.ReactNode
 }) {
   const title = meeting.title?.trim() || '未命名会议'
   return (
     <header className="room__header">
-      <div className="room__header-main">
-        <div className="room__header-identity">
-          {onBack ? (
-            <button type="button" className="room__back" onClick={onBack}>
-              <ArrowLeftOutlined aria-hidden />
-              返回会议列表
-            </button>
-          ) : null}
-          <div className="room__title-row">
-            <h1 className="room__title h-m0" title={meeting.title || undefined}>
-              {title}
-            </h1>
-            <MeetingStatusTag status={meeting.status} />
-          </div>
-          <div className="room__meta">
-            {meeting.id ? <span className="room__id">#{meeting.id}</span> : null}
-            {timer ? (
-              <>
-                <span className="meta-sep" />
-                <span className="u-tabular">{timer}</span>
-              </>
-            ) : null}
-          </div>
-        </div>
+      <div className="room__header-toolbar">
+        {onBack ? (
+          <button type="button" className="room__back" onClick={onBack}>
+            <ArrowLeftOutlined aria-hidden />
+            返回会议列表
+          </button>
+        ) : <span />}
         {action ? <div className="room__header-action">{action}</div> : null}
+      </div>
+      <div className="room__identity-grid">
+        <div className="room-identity room-identity--name">
+          <span className="room-identity__label">会议名称</span>
+          <strong className="room__title" title={meeting.title || undefined}>{title}</strong>
+        </div>
+        <div className="room-identity">
+          <span className="room-identity__label">会议号</span>
+          <strong className="room__id" title={meeting.meeting_code}>{meeting.meeting_code}</strong>
+        </div>
+        <div className="room-identity">
+          <span className="room-identity__label">会议状态</span>
+          <strong><MeetingStatusTag status={meeting.status} /></strong>
+        </div>
       </div>
       {details ? <div className="room__status-strip">{details}</div> : null}
     </header>
@@ -135,48 +130,11 @@ function transcriptPlaceholder(status: Meeting['status']) {
   }
 }
 
-/** 便于阅读的时长偏移：无起止时间则隐藏，不制造时间戳（只展示真实字段）。 */
-function timingText(startMs: number | null, endMs: number | null): string {
-  if (startMs === null || endMs === null) return ''
-  return `${(startMs / 1000).toFixed(1)}s`
-}
-
-interface TranscriptGroup {
-  speakerId: string
-  segments: TranscriptSegment[]
-}
-
-/** Consecutive FINALs from one speaker are one visual message, while every
- * segment remains in the DOM as an evidence-addressable record. */
-function groupTranscriptSegments(segments: TranscriptSegment[]): TranscriptGroup[] {
-  return segments.reduce<TranscriptGroup[]>((groups, segment) => {
-    const current = groups[groups.length - 1]
-    if (current?.speakerId === segment.speaker_id) {
-      current.segments.push(segment)
-      return groups
-    }
-    groups.push({ speakerId: segment.speaker_id, segments: [segment] })
-    return groups
-  }, [])
-}
-
-function speakerLabel(speakerId: string): string {
-  const normalized = speakerId.trim()
-  const generic = normalized.match(/^speaker[_\s-]?(\d+)$/i)
-  if (generic) return `发言人 ${generic[1]}`
-  return normalized || '未知发言人'
-}
-
-function speakerInitial(speakerId: string): string {
-  const label = speakerLabel(speakerId)
-  const generic = label.match(/^发言人\s*(\d+)$/)
-  return generic ? generic[1].slice(-2) : label.slice(0, 1).toUpperCase()
-}
-
-function speakerTone(speakerId: string): number {
-  let hash = 0
-  for (const character of speakerId) hash = (hash * 31 + character.charCodeAt(0)) >>> 0
-  return hash % 6
+/** 会议开始后的真实时间偏移；缺少 ASR 时间戳时不制造展示值。 */
+function timelineTimeText(startMs: number | null): string {
+  if (startMs === null) return ''
+  const duration = formatDuration(startMs)
+  return duration.startsWith('00:') ? duration.slice(3) : duration
 }
 
 /** 实时转写状态标签：meeting.status 与 streamStatus 是两个不同维度。 */
@@ -204,7 +162,8 @@ function streamStatusTag(
 
 /**
  * 转写内容区：已持久化 FINAL（正式稳定）+ 实时 PARTIAL（次级轻量）+ 空态 / 失败态。
- * meeting-notes 风格（非聊天气泡）：speaker 弱化小字，PARTIAL 带小薄荷 live 点。
+ * FINAL 是紧凑时间线纯文本；PARTIAL 是唯一保留消息框的“正在输入”内容。
+ * speaker_id 继续留在数据层，但不向用户展示不可靠的话者身份。
  */
 function TranscriptBody({
   status,
@@ -228,7 +187,6 @@ function TranscriptBody({
   const placeholder = transcriptPlaceholder(status)
   const hasContent = segments.length > 0 || partials.length > 0
   const reconnecting = streamStatus === 'reconnecting' || streamStatus === 'connecting'
-  const groups = groupTranscriptSegments(segments)
 
   if (loading && segments.length === 0 && partials.length === 0) {
     return (
@@ -276,40 +234,24 @@ function TranscriptBody({
 
   return (
     <div className="transcript-surface transcript-surface--top">
-      <ol className="transcript-segments transcript-chat" ref={listRef}>
-        {groups.map((group) => {
-          const first = group.segments[0]
+      <ol className="transcript-segments transcript-timeline" ref={listRef}>
+        {segments.map((segment) => {
+          const time = timelineTimeText(segment.start_ms)
           return (
-            <li key={first.segment_seq} className="transcript-message-group">
-              <span
-                className="transcript-avatar"
-                data-avatar-tone={speakerTone(group.speakerId)}
-                aria-hidden
-              >
-                {speakerInitial(group.speakerId)}
-              </span>
-              <div className="transcript-message">
-                <div className="transcript-message__meta">
-                  <span className="transcript-message__speaker">
-                    {speakerLabel(group.speakerId)}
-                  </span>
-                  {timingText(first.start_ms, first.end_ms) ? (
-                    <span className="transcript-message__time">
-                      {timingText(first.start_ms, first.end_ms)}
-                    </span>
-                  ) : null}
-                </div>
-                <div className="transcript-message__bubble">
-                  {group.segments.map((seg) => (
-                    <div
-                      key={seg.segment_seq}
-                      className="transcript-segment"
-                      /* segment_seq remains the sole evidence navigation key. */
-                      data-segment-seq={seg.segment_seq}
-                    >
-                      <span className="transcript-segment__text">{seg.text}</span>
-                    </div>
-                  ))}
+            <li key={segment.segment_seq} className="transcript-timeline__item">
+              <span className="transcript-timeline__dot" aria-hidden />
+              <div className="transcript-timeline__content">
+                {time ? (
+                  <time className="transcript-timeline__time" aria-label={`会议开始后 ${time}`}>
+                    {time}
+                  </time>
+                ) : null}
+                <div
+                  className="transcript-segment transcript-timeline__text"
+                  /* segment_seq remains the sole evidence navigation key. */
+                  data-segment-seq={segment.segment_seq}
+                >
+                  <span className="transcript-segment__text">{segment.text}</span>
                 </div>
               </div>
             </li>
@@ -318,37 +260,76 @@ function TranscriptBody({
         {partials.map((p) => (
           <li
             key={p.utterance_id}
-            className="transcript-message-group transcript-message-group--partial"
+            className="transcript-timeline__item transcript-timeline__item--current"
           >
-            <span
-              className="transcript-avatar transcript-avatar--live"
-              data-avatar-tone={speakerTone(p.speaker_id)}
-              aria-hidden
-            >
-              {speakerInitial(p.speaker_id)}
-            </span>
-            <div className="transcript-message">
-              <div className="transcript-message__meta">
-                <span className="transcript-message__speaker">{speakerLabel(p.speaker_id)}</span>
-                <span className="transcript-message__live">
+            <span className="transcript-timeline__dot transcript-timeline__dot--current" aria-hidden />
+            <div className="transcript-current">
+              <div className="transcript-current__meta">
+                <span className="transcript-current__live">
                   <AudioOutlined aria-hidden />
-                  正在说
+                  正在转写
+                </span>
+                <span className="transcript-typing" aria-hidden>
+                  <i />
+                  <i />
+                  <i />
                 </span>
               </div>
-              <div className="transcript-message__bubble transcript-message__bubble--partial">
-                <div className="transcript-segment transcript-segment--partial">
-                  <span className="transcript-segment__text">{p.text}</span>
-                  <span className="transcript-typing" aria-hidden>
-                    <i />
-                    <i />
-                    <i />
-                  </span>
-                </div>
+              <div className="transcript-segment transcript-segment--partial transcript-current__text">
+                <span className="transcript-segment__text">{p.text}</span>
               </div>
             </div>
           </li>
         ))}
       </ol>
+    </div>
+  )
+}
+
+function TranscriptActivity({
+  status,
+  streamStatus,
+}: {
+  status: Meeting['status']
+  streamStatus: ReturnType<typeof useMeetingStore.getState>['streamStatus']
+}) {
+  const connected = streamStatus === 'connected'
+  const isActive = connected && (status === 'IN_PROGRESS' || status === 'FINALIZING')
+  const isPending = streamStatus === 'connecting' || streamStatus === 'reconnecting'
+
+  const primary = status === 'COMPLETED'
+    ? '会议音频已结束'
+    : status === 'FINALIZING'
+      ? '正在接收最后的会议音频'
+      : isPending
+        ? '正在恢复音频连接'
+        : connected
+          ? '正在接收会议音频'
+          : '等待会议音频'
+  const secondary = status === 'COMPLETED'
+    ? '转写已保存'
+    : status === 'FINALIZING'
+      ? '转写收尾中'
+      : connected
+        ? '实时转写中'
+        : isPending
+          ? '连接中'
+          : '等待连接'
+
+  return (
+    <div
+      className={`transcript-activity${isActive ? ' transcript-activity--active' : ''}${isPending ? ' transcript-activity--pending' : ''}`}
+      role="status"
+      aria-live="polite"
+    >
+      <span className="transcript-activity__label">
+        <span className="transcript-activity__dot" aria-hidden />
+        {primary}
+      </span>
+      <span className="transcript-activity__wave" aria-hidden>
+        {Array.from({ length: 32 }, (_, index) => <i key={index} />)}
+      </span>
+      <span className="transcript-activity__state">{secondary}</span>
     </div>
   )
 }
@@ -399,10 +380,9 @@ export function MeetingRoomPage() {
   )
   const durationText = meeting?.started_at
     ? formatDuration(
-        elapsedMs(
-          meeting.started_at,
-          meeting.ended_at ? new Date(meeting.ended_at) : new Date(now),
-        ),
+        meeting.ended_at
+          ? durationBetweenMs(meeting.started_at, meeting.ended_at)
+          : elapsedMs(meeting.started_at, new Date(now)),
       )
     : '--'
 
@@ -658,12 +638,19 @@ export function MeetingRoomPage() {
         okButtonProps={{ danger: true, loading: finishLoading }}
         onConfirm={handleFinish}
       >
-        <Button type="primary" danger icon={<StopOutlined />} loading={finishLoading}>
+        <Button
+          className="room__primary-action room__primary-action--danger"
+          type="primary"
+          danger
+          icon={<StopOutlined />}
+          loading={finishLoading}
+        >
           结束会议
         </Button>
       </Popconfirm>
     ) : meeting.status === 'COMPLETED' ? (
       <Button
+        className="room__primary-action"
         type="primary"
         icon={<FileTextOutlined />}
         onClick={() => navigate(`/meetings/${meetingId}/result`)}
@@ -688,11 +675,10 @@ export function MeetingRoomPage() {
         : 'AI 实时转写 · 自动保存'
 
   return (
-    <div className="page page--wide" style={{ minHeight: 0 }}>
+    <div className="page page--wide room-page--workspace">
       <Header
         meeting={meeting}
         action={headerAction}
-        timer={meeting.status === 'IN_PROGRESS' ? durationText : undefined}
         onBack={() => navigate('/meetings')}
         details={headerDetails}
       />
@@ -746,6 +732,8 @@ export function MeetingRoomPage() {
             onRetry={retryTranscript}
             listRef={segmentsRef}
           />
+
+          <TranscriptActivity status={meeting.status} streamStatus={streamStatus} />
 
           {/* 8B-4 FAB：悬浮于转写面板右下，出现时轻升起；hover 轻抬、点击微压。
               UI-INTEL-2A：evidence 跳转后此按钮即「回到最新」的唯一恢复入口 ——

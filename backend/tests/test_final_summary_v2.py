@@ -3,10 +3,10 @@
 Step AGENT-2 changes the final summary's INPUT, not its contract:
 
     before   full transcript -> LLM -> summary
-    after    Meeting State (working memory) + complete FINAL transcript -> LLM -> summary
+    after    Meeting State + key evidence/tail -> LLM -> summary
+             full transcript only when state is unavailable or severely stale
 
-with priority evidence used for oversized prompts and the legacy path kept
-intact as a designed FALLBACK. These tests exist
+The legacy path remains intact behind its feature flag. These tests exist
 mainly to answer the question the green legacy suites CANNOT answer: **is V2
 actually running, or is everything silently falling back?**
 
@@ -48,6 +48,7 @@ from app.agent.final_summary_service import (
     SOURCE_EMPTY_MEETING,
     SOURCE_MEETING_STATE,
     SOURCE_TRANSCRIPT_FALLBACK,
+    SummaryPlanError,
     assess_usability,
     build_plan,
     empty_meeting_summary,
@@ -471,33 +472,109 @@ class TestUsabilityGate:
         assert plan.source == SOURCE_MEETING_STATE
         assert plan.fallback_reason is None
         assert plan.prompt and "<meeting_state>" in plan.prompt
-        assert plan.transcript_scope == "full"
+        assert plan.transcript_scope == "state_complete"
         assert plan.evidence_segment_count == 6
-        assert "以下为完整 FINAL 转写" in plan.prompt
+        assert "Meeting State 已覆盖全部" in plan.prompt
         for _seq, text in SCRIPT:
             assert text in plan.prompt
         assert plan.parse is not None and plan.build_repair is not None
 
-    def test_t08b_oversized_full_transcript_degrades_to_priority_evidence(
+    def test_t08b_oversized_state_first_input_is_refused_without_string_truncation(
         self, client, db, scripted, monkeypatch
     ):
         mid = _seed_meeting(client)
         _finalize(client, mid, 6)
         full = _plan(db, mid)
-        assert full.transcript_scope == "full"
+        assert full.transcript_scope == "state_complete"
 
         monkeypatch.setattr(
             "app.config.settings.final_summary_max_input_chars",
             len(full.prompt) - 1,
         )
-        monkeypatch.setattr(
-            "app.config.settings.final_summary_max_evidence_segments", 1
-        )
-        selected = _plan(db, mid)
-        assert selected.transcript_scope == "selected"
-        assert selected.evidence_segment_count == 1
-        assert "容量保护后的重点证据" in selected.prompt
+        with pytest.raises(SummaryPlanError):
+            _plan(db, mid)
 
+    def test_t08c_current_state_uses_key_evidence_and_short_tail_only(
+        self, client, db, scripted, monkeypatch
+    ):
+        monkeypatch.setattr(settings, "final_summary_tail_segments", 3)
+        mid = _create_and_start(client)
+        for seq in range(1, 15):
+            _final(client, mid, seq, f"唯一片段-{seq}")
+        state_repository.upsert(
+            db, mid,
+            content=MeetingStateContent(
+                decisions=[DecisionItem(text="关键决定", source_segment_seqs=[2])]
+            ),
+            version=1,
+            last_processed_segment_seq=14,
+            status="ACTIVE",
+            model_name="test",
+        )
+        db.commit()
+
+        plan = _plan(db, mid)
+
+        assert plan.transcript_scope == "state_complete"
+        assert "唯一片段-2" in plan.prompt
+        assert "唯一片段-12" in plan.prompt and "唯一片段-14" in plan.prompt
+        assert "唯一片段-8" not in plan.prompt
+        assert "speaker_" not in plan.prompt
+
+    def test_t08d_slightly_stale_state_merges_the_complete_unprocessed_tail(
+        self, client, db, scripted, monkeypatch
+    ):
+        monkeypatch.setattr(settings, "final_summary_tail_segments", 2)
+        monkeypatch.setattr(settings, "final_summary_max_unprocessed_tail_segments", 3)
+        mid = _create_and_start(client)
+        for seq in range(1, 11):
+            _final(client, mid, seq, f"尾部测试-{seq}")
+        state_repository.upsert(
+            db, mid,
+            content=MeetingStateContent(
+                topics=[TopicState(title="议题", summary="状态", source_segment_seqs=[2])]
+            ),
+            version=1,
+            last_processed_segment_seq=7,
+            status="ACTIVE",
+            model_name="test",
+        )
+        db.commit()
+
+        plan = _plan(db, mid)
+
+        assert plan.source == SOURCE_MEETING_STATE
+        assert plan.transcript_scope == "state_with_tail"
+        for seq in (8, 9, 10):
+            assert f"尾部测试-{seq}" in plan.prompt
+        assert "尾部测试-5" not in plan.prompt
+
+    def test_t08e_severely_stale_state_falls_back_to_the_full_transcript(
+        self, client, db, scripted, monkeypatch
+    ):
+        monkeypatch.setattr(settings, "final_summary_max_unprocessed_tail_segments", 3)
+        mid = _create_and_start(client)
+        for seq in range(1, 9):
+            _final(client, mid, seq, f"全量兜底-{seq}")
+        state_repository.upsert(
+            db, mid,
+            content=MeetingStateContent(
+                topics=[TopicState(title="旧议题", summary="旧状态", source_segment_seqs=[1])]
+            ),
+            version=1,
+            last_processed_segment_seq=1,
+            status="ACTIVE",
+            model_name="test",
+        )
+        db.commit()
+
+        plan = _plan(db, mid)
+
+        assert plan.source == SOURCE_TRANSCRIPT_FALLBACK
+        assert plan.transcript_scope == "full_fallback"
+        assert "以下为完整 FINAL 转写" in plan.prompt
+        for seq in range(1, 9):
+            assert f"全量兜底-{seq}" in plan.prompt
 
 # ===========================================================================
 # T09-T10  Empty meeting (§16)

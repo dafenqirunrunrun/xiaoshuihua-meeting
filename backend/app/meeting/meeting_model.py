@@ -6,12 +6,17 @@ from sqlalchemy import DateTime, String, func
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db import Base
+from app.meeting.id_generator import generate_meeting_code
 
 
 class Meeting(Base):
     __tablename__ = "meeting"
 
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    meeting_code: Mapped[str] = mapped_column(
+        String(9), nullable=False, unique=True, index=True,
+        default=generate_meeting_code,
+    )
     title: Mapped[str] = mapped_column(String(255), nullable=False)
     description: Mapped[str | None] = mapped_column(String(2000), nullable=True)
 

@@ -21,10 +21,9 @@ Controller contract (from Step 2 spec):
 """
 
 import threading
-import uuid
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -34,6 +33,7 @@ from app.device.meeting_binding import (
     device_meeting_bindings,
 )
 from app.meeting.meeting_model import Meeting
+from app.meeting.id_generator import SnowflakeGenerator, generate_meeting_code
 from app.common.exceptions import InvalidMeetingStateTransition, MeetingNotFoundError
 from app.meeting import schemas as meeting_schemas
 from app.realtime import sse_service  # publish AFTER db.commit() only
@@ -44,6 +44,9 @@ VALID_MEETING_STATUSES = ("CREATED", "IN_PROGRESS", "FINALIZING", "COMPLETED")
 # 列表默认 / 上限（Step 8B-6 §3）：一次不返回无限历史。
 LIST_DEFAULT_LIMIT = 20
 LIST_MAX_LIMIT = 100
+CREATE_ID_MAX_ATTEMPTS = 8
+
+_meeting_id_generator = SnowflakeGenerator(settings.meeting_id_worker_id)
 
 
 def _now() -> datetime:
@@ -68,20 +71,26 @@ _MEETING_LOCK = threading.RLock()
 
 
 def create_meeting(db: Session, payload: meeting_schemas.MeetingCreate) -> Meeting:
-    meeting = Meeting(
-        id=f"meeting_{uuid.uuid4().hex[:8]}",
-        title=payload.title,
-        description=payload.description,
-        status="CREATED",
-    )
-    db.add(meeting)
-    try:
-        db.commit()
-    except IntegrityError:
-        db.rollback()
-        raise
-    db.refresh(meeting)
-    return meeting
+    for attempt in range(CREATE_ID_MAX_ATTEMPTS):
+        meeting = Meeting(
+            id=_meeting_id_generator.next_id(),
+            meeting_code=generate_meeting_code(),
+            title=payload.title,
+            description=payload.description,
+            status="CREATED",
+        )
+        db.add(meeting)
+        try:
+            db.commit()
+        except IntegrityError:
+            db.rollback()
+            if attempt + 1 == CREATE_ID_MAX_ATTEMPTS:
+                raise
+            continue
+        db.refresh(meeting)
+        return meeting
+
+    raise RuntimeError("meeting identifier allocation exhausted")
 
 
 def get_meeting(db: Session, meeting_id: str) -> Meeting:
@@ -95,29 +104,134 @@ def list_meetings(
     db: Session,
     *,
     status: str | None = None,
+    q: str | None = None,
+    created_from: date | None = None,
+    created_to: date | None = None,
+    sort: str = "updated_desc",
     limit: int = LIST_DEFAULT_LIMIT,
     offset: int = 0,
 ) -> tuple[list[Meeting], int]:
     """Meeting 列表（Step 8B-6，Meeting Discovery）。
 
-    - 按 `updated_at DESC, created_at DESC` 稳定排序（最近更新优先）。
-    - 可选 status filter（四态之一），由 router 负责 422 校验（无效值不达这里）。
+    - 默认按 `updated_at DESC, created_at DESC` 稳定排序（最近更新优先）。
+    - 可选状态、标题/会议号/内部 ID 关键词和创建日期范围过滤。
     - MVP 无用户体系：返回当前业务库全部会议，不做 owner 隔离
       （后续接公司统一身份再扩展 user_id / tenant_id，见 architecture.md）。
     - limit 由 router 收敛到 [1, LIST_MAX_LIMIT]（默认 LIST_DEFAULT_LIMIT）。
     """
-    q = select(Meeting)
+    keyword = (q or "").strip()
+    stmt = select(Meeting)
     if status is not None:
-        q = q.where(Meeting.status == status)
-    total = db.scalar(select(func.count()).select_from(q.subquery()))
+        stmt = stmt.where(Meeting.status == status)
+    if keyword:
+        lowered = keyword.lower()
+        stmt = stmt.where(
+            or_(
+                func.lower(Meeting.title).contains(lowered, autoescape=True),
+                Meeting.meeting_code.contains(keyword, autoescape=True),
+                func.lower(Meeting.id).contains(lowered, autoescape=True),
+            )
+        )
+    if created_from is not None:
+        stmt = stmt.where(func.date(Meeting.created_at) >= created_from.isoformat())
+    if created_to is not None:
+        stmt = stmt.where(func.date(Meeting.created_at) <= created_to.isoformat())
+    total = db.scalar(select(func.count()).select_from(stmt.subquery()))
+
+    if sort == "created_desc":
+        order_by = (Meeting.created_at.desc(), Meeting.id.desc())
+    elif sort == "created_asc":
+        order_by = (Meeting.created_at.asc(), Meeting.id.asc())
+    else:
+        order_by = (
+            Meeting.updated_at.desc(),
+            Meeting.created_at.desc(),
+            Meeting.id.desc(),
+        )
     rows = list(
         db.scalars(
-            q.order_by(Meeting.updated_at.desc(), Meeting.created_at.desc())
+            stmt.order_by(*order_by)
             .offset(offset)
             .limit(limit)
         )
     )
     return rows, total or 0
+
+
+def update_meeting(
+    db: Session,
+    meeting_id: str,
+    payload: meeting_schemas.MeetingUpdate,
+) -> Meeting:
+    """Rename a meeting without changing its lifecycle state."""
+    with _MEETING_LOCK:
+        meeting = db.get(Meeting, meeting_id)
+        if meeting is None:
+            raise MeetingNotFoundError(meeting_id)
+
+        title = payload.title.strip()
+        if not title:
+            raise ValueError("meeting title cannot be blank")
+        meeting.title = title
+        try:
+            db.commit()
+        except Exception:
+            db.rollback()
+            raise
+        db.refresh(meeting)
+        sse_service.publish_meeting_status(meeting)
+        return meeting
+
+
+def delete_meeting(db: Session, meeting_id: str) -> None:
+    """Delete a non-active meeting and every durable record it owns.
+
+    SQLite foreign-key cascades are not assumed to be enabled in every MVP
+    environment, so dependent rows are removed explicitly in one transaction.
+    Active/finalizing meetings are protected from races with audio and agent
+    workers; users must finish them before deletion.
+    """
+    from app.agent.summary_model import MeetingSummary
+    from app.meeting_state.model import MeetingState
+    from app.meeting_state.snapshot_model import (
+        MeetingMemorySnapshot,
+        MeetingStateHealth,
+    )
+    from app.transcript.segment_model import TranscriptSegment
+    from app.transcript.stream_model import TranscriptStream
+
+    with _MEETING_LOCK:
+        meeting = db.get(Meeting, meeting_id)
+        if meeting is None:
+            raise MeetingNotFoundError(meeting_id)
+        if meeting.status not in {"CREATED", "COMPLETED"}:
+            raise InvalidMeetingStateTransition(
+                f"meeting {meeting_id} status {meeting.status} cannot be deleted "
+                "(only CREATED or COMPLETED meetings can be deleted)"
+            )
+
+        dependent_models = (
+            MeetingSummary,
+            MeetingMemorySnapshot,
+            MeetingStateHealth,
+            MeetingState,
+            TranscriptSegment,
+            TranscriptStream,
+        )
+        try:
+            for model in dependent_models:
+                db.execute(delete(model).where(model.meeting_id == meeting_id))
+            db.delete(meeting)
+            db.commit()
+        except Exception:
+            db.rollback()
+            raise
+
+        # Clear process-local references only after the durable delete commits.
+        from app.meeting_state.scheduler import meeting_state_scheduler
+
+        meeting_state_scheduler.cancel_pending(meeting_id)
+        device_meeting_bindings.unbind(settings.shuihua_audio_device_id, meeting_id)
 
 
 def start_meeting(db: Session, meeting_id: str) -> Meeting:

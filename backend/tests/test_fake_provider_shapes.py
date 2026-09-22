@@ -33,7 +33,7 @@ from app.agent.llm.fake import (
 )
 from app.agent.summary_schemas import MeetingSummarySchema
 from app.meeting_state.prompts import build_update_prompt
-from app.meeting_state.schemas import MeetingStateContent, MeetingStateUpdate
+from app.meeting_state.schemas import MeetingStateContent, MeetingStateDelta
 from app.transcript.segment_model import TranscriptSegment
 
 
@@ -97,8 +97,8 @@ def test_v2_prompt_is_not_mistaken_for_a_state_update(seg):
 
 # -- the defaults must actually VALIDATE (this was the bug) ------------------
 
-def test_state_default_validates_against_meeting_state_update():
-    MeetingStateUpdate.model_validate(json.loads(DEFAULT_STATE_JSON))
+def test_state_default_validates_against_meeting_state_delta():
+    MeetingStateDelta.model_validate(json.loads(DEFAULT_STATE_JSON))
 
 
 def test_v2_default_validates_against_final_meeting_summary():

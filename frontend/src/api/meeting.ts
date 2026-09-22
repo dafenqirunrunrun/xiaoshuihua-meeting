@@ -4,6 +4,7 @@ import type {
   MeetingCreate,
   MeetingList,
   MeetingListQuery,
+  MeetingUpdate,
 } from '@/types/meeting'
 
 /** POST /api/meetings —— 创建会议（PRD §37） */
@@ -31,6 +32,20 @@ export async function finishMeeting(meetingId: string): Promise<Meeting> {
 /** GET /api/meetings/:id —— 查询单个会议 */
 export async function getMeeting(meetingId: string): Promise<Meeting> {
   const { data } = await http.get<Meeting>(`/api/meetings/${meetingId}`)
+  return data
+}
+
+/** DELETE /api/meetings/:id —— 删除待开始或已完成会议及其关联记录。 */
+export async function deleteMeeting(meetingId: string): Promise<void> {
+  await http.delete(`/api/meetings/${meetingId}`)
+}
+
+/** PATCH /api/meetings/:id —— 只修改可编辑元数据，不改变生命周期状态。 */
+export async function updateMeeting(
+  meetingId: string,
+  payload: MeetingUpdate,
+): Promise<Meeting> {
+  const { data } = await http.patch<Meeting>(`/api/meetings/${meetingId}`, payload)
   return data
 }
 

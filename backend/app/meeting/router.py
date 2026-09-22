@@ -1,8 +1,9 @@
 """会议生命周期路由。"""
 
+from datetime import date
 from typing import Annotated, Literal
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Response
 from sqlalchemy.orm import Session
 
 from app.db import get_db
@@ -20,13 +21,38 @@ def list_meetings(
         Literal["CREATED", "IN_PROGRESS", "FINALIZING", "COMPLETED"] | None,
         Query(description="按 Meeting 状态过滤（四态之一）"),
     ] = None,
+    q: Annotated[
+        str | None,
+        Query(min_length=1, max_length=255, description="按会议名称、会议号或内部 ID 搜索"),
+    ] = None,
+    created_from: Annotated[
+        date | None,
+        Query(description="创建日期起点（含当天）"),
+    ] = None,
+    created_to: Annotated[
+        date | None,
+        Query(description="创建日期终点（含当天）"),
+    ] = None,
+    sort: Annotated[
+        Literal["updated_desc", "created_desc", "created_asc"],
+        Query(description="列表排序方式"),
+    ] = "updated_desc",
     limit: Annotated[int, Query(ge=1, le=meeting_service.LIST_MAX_LIMIT)] = (
         meeting_service.LIST_DEFAULT_LIMIT
     ),
     offset: Annotated[int, Query(ge=0)] = 0,
 ) -> meeting_schemas.MeetingListOut:
+    if created_from is not None and created_to is not None and created_from > created_to:
+        raise HTTPException(status_code=422, detail="created_from must not exceed created_to")
     items, total = meeting_service.list_meetings(
-        db, status=status, limit=limit, offset=offset
+        db,
+        status=status,
+        q=q,
+        created_from=created_from,
+        created_to=created_to,
+        sort=sort,
+        limit=limit,
+        offset=offset,
     )
     return meeting_schemas.MeetingListOut(
         items=items, total=total, limit=limit, offset=offset
@@ -41,6 +67,21 @@ def create_meeting(payload: meeting_schemas.MeetingCreate, db: Session = Depends
 @router.get("/{meeting_id}", response_model=meeting_schemas.MeetingOut)
 def get_meeting(meeting_id: str, db: Session = Depends(get_db)):
     return meeting_service.get_meeting(db, meeting_id)
+
+
+@router.patch("/{meeting_id}", response_model=meeting_schemas.MeetingOut)
+def update_meeting(
+    meeting_id: str,
+    payload: meeting_schemas.MeetingUpdate,
+    db: Session = Depends(get_db),
+):
+    return meeting_service.update_meeting(db, meeting_id, payload)
+
+
+@router.delete("/{meeting_id}", status_code=204)
+def delete_meeting(meeting_id: str, db: Session = Depends(get_db)) -> Response:
+    meeting_service.delete_meeting(db, meeting_id)
+    return Response(status_code=204)
 
 
 @router.post("/{meeting_id}/start", response_model=meeting_schemas.MeetingOut)

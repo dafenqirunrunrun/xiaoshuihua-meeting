@@ -84,7 +84,7 @@ def test_partial_and_final_normalization() -> None:
     assert partial.type == "transcript.partial"
     assert partial.speakerId == -1
     assert final.type == "transcript.final"
-    assert final.speakerId == 1
+    assert final.speakerId == -1
     assert partial.asrSessionId == final.asrSessionId == "voice-A"
     assert partial.sentenceId == final.sentenceId == 1
 
@@ -95,6 +95,16 @@ def test_partial_and_final_normalization() -> None:
         final, path_meeting_id="meeting-1"
     )
     assert partial_internal.utterance_id == final_internal.utterance_id
+
+
+def test_speaker_label_can_only_be_restored_by_explicit_product_flag(monkeypatch) -> None:
+    monkeypatch.setattr("app.config.settings.asr_speaker_labels_enabled", True)
+
+    final = to_asr_transcript_event(
+        _sentence(sentence_type=1, speaker_id=2), meeting_id="meeting-1"
+    )
+
+    assert final.speakerId == 2
 
 
 def test_reconnect_voice_ids_produce_distinct_utterance_identity() -> None:
@@ -259,7 +269,7 @@ def test_bridge_ingests_through_existing_asr_service() -> None:
         asr_service.ingest_asr_event(db, meeting_id, final)
         segments = list(db.scalars(select(TranscriptSegment)))
         assert len(segments) == 1
-        assert segments[0].speaker_id == "speaker_0"
+        assert segments[0].speaker_id == "unknown"
         assert segments[0].utterance_id == "voice-A:1"
 
         asr_service.ingest_asr_event(db, meeting_id, final)

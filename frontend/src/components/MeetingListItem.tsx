@@ -1,10 +1,10 @@
 import type { ReactNode } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { Button } from 'antd'
-import { PlayCircleOutlined } from '@ant-design/icons'
+import { Button, Popconfirm, Tooltip } from 'antd'
+import { DeleteOutlined, EditOutlined, PlayCircleOutlined } from '@ant-design/icons'
 import type { Meeting } from '@/types/meeting'
 import { MeetingStatusTag } from '@/components/MeetingStatusTag'
-import { formatDateTime, formatDuration, elapsedMs } from '@/utils/time'
+import { durationBetweenMs, formatDateTime, formatDuration, elapsedMs } from '@/utils/time'
 
 /**
  * 状态驱动的列表项 CTA（Step 8B-6 §13）。语义：
@@ -42,7 +42,7 @@ export function meetingDurationText(meeting: Meeting): string {
     meeting.started_at &&
     meeting.ended_at
   ) {
-    return formatDuration(elapsedMs(meeting.ended_at, new Date(meeting.started_at)))
+    return formatDuration(durationBetweenMs(meeting.started_at, meeting.ended_at))
   }
   return ''
 }
@@ -73,6 +73,10 @@ interface MeetingListItemProps {
   statusTag?: ReactNode
   /** 自定义右侧 CTA 区（默认按状态渲染） */
   onNavigate?: (meeting: Meeting) => void
+  /** 仅 CREATED / COMPLETED 可删除；未提供时不显示删除入口。 */
+  onDelete?: (meeting: Meeting) => Promise<void>
+  deleteLoading?: boolean
+  onRename?: (meeting: Meeting) => void
 }
 
 /**
@@ -83,6 +87,9 @@ export function MeetingListItem({
   meeting,
   statusTag,
   onNavigate,
+  onDelete,
+  deleteLoading = false,
+  onRename,
 }: MeetingListItemProps) {
   const navigate = useNavigate()
   const { label, to } = meetingCta(meeting)
@@ -94,11 +101,23 @@ export function MeetingListItem({
           <span className="meeting-item__title" title={meeting.title || undefined}>
             {meeting.title?.trim() || '未命名会议'}
           </span>
+          {onRename ? (
+            <Tooltip title="修改会议名称">
+              <Button
+                type="text"
+                size="small"
+                className="meeting-item__edit"
+                icon={<EditOutlined />}
+                onClick={() => onRename(meeting)}
+                aria-label={`修改会议名称 ${meeting.title?.trim() || '未命名会议'}`}
+              />
+            </Tooltip>
+          ) : null}
           {statusTag ?? <MeetingStatusTag status={meeting.status} />}
         </div>
         <div className="meeting-item__meta">
           <span className="meeting-item__id">
-            {meeting.id}
+            会议号 {meeting.meeting_code}
           </span>
           <span className="meta-sep" aria-hidden />
           <span>{meetingMetaText(meeting)}</span>
@@ -110,14 +129,38 @@ export function MeetingListItem({
           ) : null}
         </div>
       </div>
-      <Button
-        type={meeting.status === 'IN_PROGRESS' ? 'primary' : 'default'}
-        size="small"
-        className="meeting-item__cta"
-        onClick={() => (onNavigate ? onNavigate(meeting) : navigate(to))}
-      >
-        {label}
-      </Button>
+      <div className="meeting-item__actions">
+        <Button
+          type={meeting.status === 'IN_PROGRESS' ? 'primary' : 'default'}
+          size="small"
+          className="meeting-item__cta"
+          onClick={() => (onNavigate ? onNavigate(meeting) : navigate(to))}
+        >
+          {label}
+        </Button>
+        {onDelete && (meeting.status === 'CREATED' || meeting.status === 'COMPLETED') ? (
+          <Popconfirm
+            title={`删除“${meeting.title?.trim() || '未命名会议'}”？`}
+            description="转写、AI 会议理解和纪要将一并删除，且无法恢复。"
+            okText="删除"
+            cancelText="取消"
+            okButtonProps={{ danger: true }}
+            placement="topRight"
+            onConfirm={() => onDelete(meeting)}
+          >
+            <Tooltip title="删除会议">
+              <Button
+                type="text"
+                size="small"
+                className="meeting-item__delete"
+                icon={<DeleteOutlined />}
+                loading={deleteLoading}
+                aria-label={`删除会议 ${meeting.title?.trim() || '未命名会议'}`}
+              />
+            </Tooltip>
+          </Popconfirm>
+        ) : null}
+      </div>
     </div>
   )
 }

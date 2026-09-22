@@ -31,6 +31,10 @@ export function useMeetingList(
   // 引用会导致「请求 → setState → 重渲染 → 新引用 → 再次请求」的无限
   // 循环，表现为首页持续抖动（每次响应都闪现 loading 骨架）。
   const status = query.status ?? null
+  const search = query.q?.trim() ?? ''
+  const createdFrom = query.created_from ?? ''
+  const createdTo = query.created_to ?? ''
+  const sort = query.sort ?? 'updated_desc'
   const limit = query.limit ?? DEFAULT_LIMIT
   const offset = query.offset ?? 0
 
@@ -38,7 +42,15 @@ export function useMeetingList(
     const reqId = ++inFlight.current
     setLoading(true)
     setError(null)
-    listMeetings({ status: status ?? undefined, limit, offset })
+    listMeetings({
+      status: status ?? undefined,
+      q: search || undefined,
+      created_from: createdFrom || undefined,
+      created_to: createdTo || undefined,
+      sort,
+      limit,
+      offset,
+    })
       .then((res) => {
         if (inFlight.current !== reqId) return
         setMeetings(res.items)
@@ -52,7 +64,7 @@ export function useMeetingList(
       .finally(() => {
         if (inFlight.current === reqId) setLoading(false)
       })
-  }, [status, limit, offset])
+  }, [status, search, createdFrom, createdTo, sort, limit, offset])
 
   const reload = useCallback(() => setRetry((k) => k + 1), [])
 

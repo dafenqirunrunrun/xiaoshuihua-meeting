@@ -30,12 +30,13 @@ export function AppShell() {
       : location.pathname.startsWith('/meetings')
         ? '/meetings'
         : location.pathname
+  const isHome = location.pathname === '/'
 
   return (
-    <Layout style={{ minHeight: '100vh' }}>
+    <Layout className="app-shell">
       <Sider
         className="app-sider"
-        width={220}
+        width={208}
         theme="light"
         style={{ borderRight: '1px solid var(--color-border-light)' }}
       >
@@ -73,9 +74,9 @@ export function AppShell() {
         <div className="app-side-footer">让每一次会议，都有回响。</div>
       </Sider>
 
-      <Layout>
-        <Content>
-          <div className="app-content">
+      <Layout className="app-main">
+        <Content className="app-main__content">
+          <div className={`app-content${isHome ? ' app-content--home' : ''}`}>
             <Outlet />
           </div>
         </Content>

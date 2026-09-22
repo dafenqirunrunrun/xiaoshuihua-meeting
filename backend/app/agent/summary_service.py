@@ -107,7 +107,7 @@ def build_summary_prompt(meeting_title: str, segments: list[TranscriptSegment]) 
     MeetingSummarySchema; the repair variant (below) re-states this.
     """
     body = "\n".join(
-        f"[{i}] <{seg.speaker_id}> {seg.text}" for i, seg in enumerate(segments, start=1)
+        f"[{i}] {seg.text}" for i, seg in enumerate(segments, start=1)
     )
     if not body:
         body = "(空转写)"
@@ -406,6 +406,10 @@ def _run_generation(
         model_override,
         max_retries=1,
         retry_timeouts=False,
+        # Final summaries require a bounded structured JSON answer. With the
+        # current DeepSeek gateway, implicit thinking can consume the entire
+        # max_tokens budget before message.content is emitted.
+        thinking_enabled=False,
     )
 
     # --- Phase A: gate + idempotency ---------------------------------------
@@ -584,7 +588,7 @@ def _legacy_material(
             "refusing to silently truncate. Split the meeting or raise the bound."
         )
     body = "\n".join(
-        f"[{i}] <{seg.speaker_id}> {seg.text}" for i, seg in enumerate(segments, start=1)
+        f"[{i}] {seg.text}" for i, seg in enumerate(segments, start=1)
     )
     return build_summary_prompt(meeting.title, segments), body
 

@@ -32,6 +32,7 @@ from app.transcript.segment_model import TranscriptSegment
 from app.config import settings
 from app.db import SessionLocal
 from app.common.exceptions import MeetingNotFoundError
+from app.common.datetime_utils import utc_iso
 from app.transcript import repository as transcript_repository
 from app.realtime.schemas import SSEEventEnvelope
 from app.realtime.event_broker import Subscriber, event_broker
@@ -91,9 +92,9 @@ def build_final(meeting_id: str, segment: TranscriptSegment) -> SSEEventEnvelope
 def build_meeting_status(meeting: Meeting) -> SSEEventEnvelope:
     payload: dict = {"status": meeting.status}
     if meeting.started_at is not None:
-        payload["started_at"] = meeting.started_at.isoformat()
+        payload["started_at"] = utc_iso(meeting.started_at)
     if meeting.ended_at is not None:
-        payload["ended_at"] = meeting.ended_at.isoformat()
+        payload["ended_at"] = utc_iso(meeting.ended_at)
     return SSEEventEnvelope(
         sse_id=None,
         event_type="meeting.status",

@@ -16,7 +16,7 @@ import { useSummaryResultStream } from '@/hooks/useSummaryResultStream'
 import { useTranscriptEvidenceNavigation } from '@/hooks/useTranscriptEvidenceNavigation'
 import { useTranscriptSnapshotResult } from '@/hooks/useTranscriptSnapshotResult'
 import { useMeetingStore } from '@/stores/meetingStore'
-import { formatDateTime, formatDuration } from '@/utils/time'
+import { durationBetweenMs, elapsedMs, formatDateTime, formatDuration } from '@/utils/time'
 import type { Meeting } from '@/types/meeting'
 import type { MeetingSummary } from '@/types/summary'
 
@@ -25,10 +25,10 @@ const { Title } = Typography
 /** 时长（已结束会议：started_at -> ended_at/now） */
 function resultDurationText(meeting: Meeting): string {
   if (meeting.started_at && meeting.ended_at) {
-    return formatDuration(Math.max(0, new Date(meeting.ended_at).getTime() - new Date(meeting.started_at).getTime()))
+    return formatDuration(durationBetweenMs(meeting.started_at, meeting.ended_at))
   }
   if (meeting.status === 'IN_PROGRESS' && meeting.started_at) {
-    return formatDuration(Date.now() - new Date(meeting.started_at).getTime())
+    return formatDuration(elapsedMs(meeting.started_at))
   }
   return ''
 }
@@ -692,7 +692,7 @@ export function MeetingResultPage() {
       <div className="result-head">
         <button type="button" className="room__back" onClick={handleBack}>
           <ArrowLeftOutlined aria-hidden />
-          返回
+          返回会议列表
         </button>
         <Title level={1} className="result-head__title h-m0">
           {meeting.title?.trim() || '未命名会议'}
@@ -711,10 +711,10 @@ export function MeetingResultPage() {
               <span className="u-tabular">{durationText}</span>
             </>
           ) : null}
-          {meeting.id ? (
+          {meeting.meeting_code ? (
             <>
               <span aria-hidden>#</span>
-              <span className="result-head__id">{meeting.id}</span>
+              <span className="result-head__id">会议号 {meeting.meeting_code}</span>
             </>
           ) : null}
         </div>
@@ -722,7 +722,6 @@ export function MeetingResultPage() {
 
       <Card
         className="result-tabs"
-        style={{ borderRadius: 16, borderColor: '#E8EEF5' }}
         styles={{ body: { padding: '4px 24px 24px' } }}
       >
         <Tabs

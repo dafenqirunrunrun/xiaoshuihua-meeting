@@ -33,7 +33,7 @@ const SETTINGS_ENTRIES = [
  */
 export function SettingsPage() {
   return (
-    <div className="page">
+    <div className="page settings-page">
       <div className="section-header" style={{ marginBottom: 20 }}>
         <div>
           <Title level={3} className="h-m0">
@@ -45,7 +45,7 @@ export function SettingsPage() {
         </div>
       </div>
 
-      <div className="panel">
+      <div className="panel settings-panel">
         {SETTINGS_ENTRIES.map((entry) => (
           <div className="settings-entry" key={entry.name}>
             <div className="settings-entry__icon">{entry.icon}</div>

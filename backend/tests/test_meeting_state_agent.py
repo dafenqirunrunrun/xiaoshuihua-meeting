@@ -315,6 +315,63 @@ class TestIncremental:
         merged2 = svc.merge_content(previous, replacing)
         assert [d.text for d in merged2.decisions] == ["new"]
 
+    def test_delta_operations_upsert_correct_and_remove_deterministically(self):
+        from app.meeting_state.schemas import MeetingStateDelta
+
+        previous = MeetingStateContent(
+            current_topic="部署",
+            action_items=[{
+                "task": "接口联调", "owner": "小王", "deadline": None,
+                "source_segment_seqs": [4],
+            }],
+            open_questions=[{
+                "text": "发布日期是否确定", "source_segment_seqs": [3],
+            }],
+        )
+        delta = MeetingStateDelta.model_validate({
+            "operations": [
+                {"op": "set", "field": "current_topic", "value": "发布计划"},
+                {
+                    "op": "upsert", "field": "action_items", "match": "接口联调",
+                    "value": {
+                        "task": "接口联调", "owner": "小王", "deadline": "周二",
+                        "source_segment_seqs": [4, 5],
+                    },
+                },
+                {
+                    "op": "remove", "field": "open_questions",
+                    "match": "发布日期是否确定",
+                },
+                {
+                    "op": "upsert", "field": "decisions",
+                    "value": {"text": "周三发布", "source_segment_seqs": [6]},
+                },
+            ]
+        })
+
+        merged = state_service.merge_content(previous, delta)
+        assert merged.current_topic == "发布计划"
+        assert len(merged.action_items) == 1
+        assert merged.action_items[0].deadline == "周二"
+        assert merged.action_items[0].source_segment_seqs == [4, 5]
+        assert merged.open_questions == []
+        assert [item.text for item in merged.decisions] == ["周三发布"]
+
+    def test_prompt_can_skip_live_summary_on_fast_fact_pass(self):
+        from app.meeting_state.prompts import build_update_prompt
+        from app.transcript.segment_model import TranscriptSegment
+
+        segment = TranscriptSegment(
+            meeting_id="m", segment_seq=1, utterance_id="u", speaker_id="s",
+            event_id="e", start_ms=0, end_ms=100, text="确认周三发布",
+        )
+        prompt = build_update_prompt(
+            "发布会", MeetingStateContent(), [segment],
+            last_processed_segment_seq=0, refresh_live_summary=False,
+        )
+        assert "本轮不要输出 live_summary 操作" in prompt
+        assert "<s>" not in prompt
+        assert "speaker_" not in prompt
 
 class TestIdempotency:
     def test_duplicate_final_is_not_processed_twice(self, client, agent, monkeypatch):
@@ -737,10 +794,10 @@ class TestEvidenceTrace:
         describe the same object — otherwise the model is asked for a shape that
         cannot validate."""
         from app.meeting_state.prompts import OUTPUT_SHAPE
-        from app.meeting_state.schemas import MeetingStateUpdate
+        from app.meeting_state.schemas import MeetingStateDelta
 
         declared = json.loads(OUTPUT_SHAPE)
-        produced = MeetingStateUpdate.model_validate(declared)
+        produced = MeetingStateDelta.model_validate(declared)
         assert set(produced.model_dump()) == set(declared)
 
 
