@@ -16,10 +16,15 @@ import {
 } from '@ant-design/icons'
 import { EmptyPlaceholder } from '@/components/EmptyPlaceholder'
 import { MeetingIntelligencePanel } from '@/components/MeetingIntelligencePanel'
+import { CaptainPanel } from '@/components/CaptainPanel'
+import { PixelCaptainDock } from '@/components/PixelCaptainDock'
+import { DemoComposer } from '@/components/DemoComposer'
 import { MeetingStatusTag } from '@/components/MeetingStatusTag'
 import { useMeetingStore } from '@/stores/meetingStore'
 import { useMeetingLoad } from '@/hooks/useMeetingLoad'
 import { useMeetingIntelligence } from '@/hooks/useMeetingIntelligence'
+import { useCaptainReferee } from '@/hooks/useCaptainReferee'
+import { usePixelCaptainState } from '@/hooks/usePixelCaptainState'
 import { useTranscriptSnapshot } from '@/hooks/useTranscriptSnapshot'
 import { useMeetingStream } from '@/hooks/useMeetingStream'
 import { useAutoScroll } from '@/hooks/useAutoScroll'
@@ -400,15 +405,52 @@ export function MeetingRoomPage() {
     !!meeting && meeting.status !== 'CREATED',
   )
 
+  // ADR-002 前端接入：水华队长裁判面板。同样是独立数据域 —— 数据留在 hook 内，
+  // 失败只降级本面板，绝不影响转写 / 生命周期 / Meeting Intelligence。
+  // enabled 条件与 Meeting State 略有不同：FINALIZING 仍可请求裁判（PRD 允许），
+  // 而 COMPLETED 属归档态、不再新建报告。
+  const canTriggerCaptain =
+    meeting?.status === 'IN_PROGRESS' || meeting?.status === 'FINALIZING'
+  const captain = useCaptainReferee(
+    meetingId,
+    !!meeting && meeting.status !== 'CREATED',
+  )
+
+  // Phase 3-1：水华队长像素角色。**不是第二个数据源** —— 它的状态完全由上面
+  // 那几个真实字段派生（见 usePixelCaptainState 的状态来源对照表）。
+  // 没有计时器，没有乐观完成：COMPLETED 只在服务端真的落库了报告之后出现。
+  // 展开状态也留在 hook 内，MeetingRoomPage 只读一个 view 对象。
+  const pixelCaptain = usePixelCaptainState(
+    {
+      report: captain.report,
+      loading: captain.loading,
+      triggering: captain.triggering,
+      error: captain.error,
+    },
+    canTriggerCaptain,
+  )
+
   // 8B-4：SSE 流（含 Snapshot-first 连接、断线恢复、meeting.status→GET Meeting）
   // UI-INTEL-1：**复用同一条 /events 连接**承接 meeting.state.updated 失效通知，
   // 收到后 refreshState() 重新 GET /state —— 不新增第二条 EventSource。
+  // ADR-002 Phase 2-A：同一条连接也承接 captain.completed / captain.failed，
+  // 收到后按 report_id 回源读那一份报告（同样不消费 payload）。
+  // Task 6：captain.quick_assessment 是同一条连接上的第三种裁判事件 ——
+  // 它是两阶段裁判的第一段，**不回源**（报告还没落盘），直接交给 captain
+  // 面板渲染临时卡片，同时**不停止** loading。
   useMeetingStream({
     meetingId,
     status: meeting?.status,
     snapshotReady,
     maxSegmentSeq,
     onStateInvalidated: intelligence.refreshState,
+    // Phase C.5：两个裁判事件共用这**一个**回调，而不是分别接 invalidate /
+    // acceptQuick。原因是归属规则必须由**同一个** owner 持有：如果
+    // `captain.completed(A)` 和 `captain.quick_assessment(B)` 分别进入两个
+    // 独立回调，接受 B 的临时结果时就没有任何东西知道「A 已经是终态」——
+    // 那份临时卡片会挂到已经落盘的 A 上。合并成一个入口后，hook 内部持有
+    // reportId / status 两个 ref，两条规则在一处判定。
+    onCaptainEvent: captain.handleCaptainEvent,
   })
 
   // 8B-4：自动滚动（跟随底部 / 向上查历史暂停 / 回到底部 FAB）
@@ -751,6 +793,54 @@ export function MeetingRoomPage() {
         </section>
 
         <aside className="room__intelligence">
+          {/* Phase 3-1：水华队长像素角色常驻在右轨顶部。它平时只是一个安静的
+              小角色（IDLE），不占面板高度；触发后表演，COMPLETED 时给出展开
+              开关。它不遮挡任何内容 —— 角色与气泡全部在文档流内，没有
+              absolute / fixed，所以既不会盖住左边的转写，也不会盖住底部的
+              演示输入条（对照：.transcript-jump 是 absolute，但它被转写面板
+              自己的 stacking context 关在里面）。 */}
+          {isLive ? (
+            <PixelCaptainDock
+              phase={pixelCaptain.phase}
+              caption={pixelCaptain.caption}
+              canTrigger={canTriggerCaptain}
+              hasReport={pixelCaptain.hasReport}
+              expanded={pixelCaptain.expanded}
+              onToggle={pixelCaptain.toggle}
+              // IDLE / FAILED 两个阶段的轻量入口。**与演示输入条的快捷发送
+              // 是两条真实路径**：快捷发送走唤醒词 ingress（一句话落库 + 服务端
+              // 判定唤醒），这里走 POST /captain（服务端取当前高水位）。
+              // 两条都合法、都幂等，服务端各自负责锚定；前端不伪造 anchor。
+              onTrigger={() => void captain.trigger()}
+              triggering={captain.triggering}
+              report={captain.report}
+            />
+          ) : null}
+
+          {/* ADR-002：裁判报告就绪 / 分析中 / 真的出错时才「跳出来」。
+              会议从未被裁判过（error === 'no_report'）是**正常状态**，不是
+              值得占一屏的空态 —— 那时右轨留给 AI 会议理解，裁判通过演示输入
+              的快捷按钮或直接说出唤醒词唤起。
+
+              Phase 3-1：**只有像素角色把报告展开时**才渲染这个面板。
+              其数据展示能力原样保留（同一个组件、同一批 props），但不再
+              无条件占据右轨 —— 两个入口指向同一份 COMPLETED 报告，
+              不会出现两份。角色自身（IDLE/TRIGGERED/ANALYZING/FAILED）
+              已经承担了「还没有报告」时的全部说明。 */}
+          {pixelCaptain.expanded ? (
+            <CaptainPanel
+              report={captain.report}
+              quick={captain.quick}
+              loading={captain.loading}
+              triggering={captain.triggering}
+              error={captain.error}
+              canTrigger={canTriggerCaptain}
+              onTrigger={() => void captain.trigger()}
+              onRefresh={() => captain.invalidate()}
+              onTraceEvidence={handleTraceEvidence}
+            />
+          ) : null}
+
           <MeetingIntelligencePanel
             state={intelligence.state}
             loading={intelligence.loading}
@@ -762,6 +852,17 @@ export function MeetingRoomPage() {
           />
         </aside>
       </div>
+
+      {/* 演示输入：会议进行中常驻于页面底部。它提交的每一句都会成为真实
+          持久化 FINAL（走与 ESP32 相同的 ingress），所以这里看到的是真实链路，
+          不是模拟数据。会议结束后不再接受发言，故不渲染。 */}
+      {isLive ? (
+        <DemoComposer
+          meetingId={meeting.id}
+          disabled={false}
+          onSent={() => jumpToBottom()}
+        />
+      ) : null}
     </div>
   )
 }

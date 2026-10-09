@@ -152,6 +152,125 @@ def build_heartbeat(meeting_id: str) -> SSEEventEnvelope:
     )
 
 
+def build_captain_completed(meeting_id: str, *, report: dict) -> SSEEventEnvelope:
+    """Referee report ready (ADR-002 Phase 2-A).
+
+    DELIBERATE DEVIATION from the `meeting.state.updated` / `summary.*` house
+    rule, which keeps SSE a PURE INVALIDATION signal and always re-reads content
+    over HTTP. Here the payload DOES carry the report substance
+    (`report_id`, `anchor_seq`, `positions`, `dispute_points`, `uncertainty`)
+    so the panel can render the moment the referee finishes speaking.
+
+    The deviation is safe only because `report_id` is in the payload: the event
+    stays non-durable and is never replayed, so a client that was disconnected,
+    refreshing or reconnecting misses it — and recovers by GET
+    /api/meetings/{id}/captain/{report_id} (or /latest). The event is a fast
+    path, never the fact source. Same contract as `transcript.final` rendering
+    from the event while `/transcript` remains the recovery read.
+
+    NEVER carries: raw model output, `model_name`, `last_error`, a prompt, a
+    provider stack. `uncertainty` is the report's OWN field, not an error
+    channel — its presence is a product requirement (the referee must state what
+    it does not know), not a leak.
+    """
+    payload: dict = {
+        "report_id": report.get("report_id"),
+        "anchor_seq": report.get("anchor_segment_seq"),
+        "positions": report.get("positions") or [],
+        "dispute_points": report.get("dispute_points") or [],
+        "uncertainty": report.get("uncertainty") or "",
+        # Phase C.5. ADDITIVE and defaulted: added to an event that has already
+        # shipped, so a client written against the previous payload keeps working
+        # — `report.get` and the `or` fallback mean a report row written before
+        # this field existed still produces a well-formed event.
+        #
+        # It rides here rather than on `captain.quick_assessment` because
+        # research finishes between the two events: the Quick event is emitted
+        # BEFORE the search starts, so it cannot carry the search's outcome. A
+        # client that wants to say "外部资料检索未完成" can do so from this event
+        # without string-matching the Chinese disclosure sentence in
+        # `uncertainty`.
+        "research_status": report.get("research_status") or "not_required",
+        "external_evidence_count": len(report.get("external_evidence") or []),
+    }
+    return SSEEventEnvelope(
+        sse_id=f"captain:{meeting_id}:{payload['report_id']}:completed",
+        event_type="captain.completed",
+        meeting_id=meeting_id,
+        emitted_at=_utcnow_iso(),
+        payload=payload,
+    )
+
+
+def build_captain_quick_assessment(
+    meeting_id: str, *, report_id: str, quick: dict
+) -> SSEEventEnvelope:
+    """The fast first pass of the two-stage referee (Task 6).
+
+    Deliberately NOT folded into `captain.completed`: that event means "the
+    durable report is written", and a client that received it has everything it
+    needs. A client that receives THIS one must keep waiting. If the Quick
+    substance rode on `captain.completed` as a sub-field, every client would
+    have to inspect that sub-field to decide whether to stop showing a spinner —
+    the "looks complete, is not" confusion the report `status` field exists to
+    prevent, reintroduced at the transport layer.
+
+    Carries content (issue / key_evidence / provisional_judgement /
+    question_to_resolve) under the same recorded deviation as
+    `build_captain_completed`: `report_id` is always present, the event is
+    non-durable and never replayed, and the durable GET remains the fact source.
+
+    `provisional` is not decoration — it is the report's own semantics
+    (`QuickAssessment.provisional_judgement`) surfaced so a client can label the
+    first answer as provisional rather than presenting a 1-second opinion and a
+    30-second analysis as equally final.
+
+    NEVER carries: raw model output, `model_name`, a prompt, a provider stack.
+    """
+    payload: dict = {
+        "report_id": report_id,
+        "provisional": True,
+        "issue": quick.get("issue") or "",
+        "key_evidence": quick.get("key_evidence") or [],
+        "provisional_judgement": quick.get("provisional_judgement") or "",
+        "question_to_resolve": quick.get("question_to_resolve") or "",
+    }
+    return SSEEventEnvelope(
+        sse_id=f"captain:{meeting_id}:{report_id}:quick_assessment",
+        event_type="captain.quick_assessment",
+        meeting_id=meeting_id,
+        emitted_at=_utcnow_iso(),
+        payload=payload,
+    )
+
+
+def build_captain_failed(
+    meeting_id: str, *, report_id: str, anchor_seq: int | None, reason: str = ""
+) -> SSEEventEnvelope:
+    """Referee report failed (ADR-002 Phase 2-A).
+
+    Carries NO report content — there is none, and there never will be for this
+    report_id (a failure leaves `report_json` NULL by design). `reason` is a
+    short product-safe code, NOT a provider stack trace.
+
+    `anchor_seq` is included so the panel can attribute the failure to the
+    trigger the user just made; the client is expected to clear its spinner and
+    say the referee could not produce a report, rather than retrying silently.
+    """
+    payload: dict = {
+        "report_id": report_id,
+        "anchor_seq": anchor_seq,
+        "reason": reason,
+    }
+    return SSEEventEnvelope(
+        sse_id=f"captain:{meeting_id}:{report_id}:failed",
+        event_type="captain.failed",
+        meeting_id=meeting_id,
+        emitted_at=_utcnow_iso(),
+        payload=payload,
+    )
+
+
 def build_meeting_state_updated(
     meeting_id: str, *, version: int, status: str
 ) -> SSEEventEnvelope:
@@ -252,6 +371,52 @@ def publish_meeting_state_updated(
     )
 
 
+def publish_captain_completed(meeting_id: str, *, report: dict) -> None:
+    """captain.completed — MUST be published AFTER mark_completed committed.
+
+    Commit-before-publish (ADR D4): the durable row is already on disk, so a
+    failed publish (no subscribers, full queue) never rolls the report back.
+    Callers must therefore treat publish as best-effort and NEVER let it change
+    the analysis outcome.
+    """
+    event_broker.publish(meeting_id, build_captain_completed(meeting_id, report=report))
+
+
+def publish_captain_quick_assessment(
+    meeting_id: str, *, report_id: str, quick: dict
+) -> None:
+    """captain.quick_assessment — published while the report is STILL ANALYZING.
+
+    NOT commit-before-publish, and that is correct rather than a violation: this
+    event announces a result that is deliberately not durable yet. It must be
+    published as soon as the Quick pass returns — waiting for the Deep commit
+    would delay it by the Deep pass's own latency, which is exactly the wait the
+    two-stage design exists to remove. The row stays ANALYZING, so a client that
+    missed the event recovers by polling the report and nothing is lost.
+
+    Best-effort, like every other sidecar publish: a subscriber-less or full
+    broker must not be able to fail a report that is still being computed.
+    """
+    event_broker.publish(
+        meeting_id,
+        build_captain_quick_assessment(
+            meeting_id, report_id=report_id, quick=quick
+        ),
+    )
+
+
+def publish_captain_failed(
+    meeting_id: str, *, report_id: str, anchor_seq: int | None, reason: str = ""
+) -> None:
+    """captain.failed — MUST be published AFTER mark_failed committed."""
+    event_broker.publish(
+        meeting_id,
+        build_captain_failed(
+            meeting_id, report_id=report_id, anchor_seq=anchor_seq, reason=reason
+        ),
+    )
+
+
 # --- Gap-free connect (Part 10/11) ------------------------------------------
 
 def connect(meeting_id: str, after_segment_seq: int) -> tuple[Subscriber, list[SSEEventEnvelope]]:
@@ -343,6 +508,8 @@ __all__ = [
     "publish_summary_completed",
     "publish_summary_failed",
     "publish_meeting_state_updated",
+    "publish_captain_completed",
+    "publish_captain_failed",
 ]
 
 

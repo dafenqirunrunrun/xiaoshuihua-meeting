@@ -14,6 +14,29 @@ Event types produced in this step:
   - transcript.final        (persisted; replayed via catch-up)
   - meeting.status          (live only, no replay)
   - heartbeat               (liveness signal, no `id:`)
+  - captain.completed       (live only, no replay; carries the referee report)
+  - captain.failed          (live only, no replay)
+  - captain.quick_assessment (live only, no replay; the fast first pass)
+
+`captain.quick_assessment` (Task 6, two-stage referee)
+-----------------------------------------------------
+The two-stage referee produces a QUICK result in ~1-2s and a DEEP result
+seconds later. Without an event for the first one the client would have to poll
+to render it, which is the whole latency the two-stage design exists to remove.
+
+It is a SEPARATE event rather than a field on `captain.completed` for one
+reason: ordering. `captain.completed` means "the durable report is written", and
+a client that received it has everything; a client that receives
+`captain.quick_assessment` must keep waiting. Folding the Quick payload into
+`captain.completed` would force every client to inspect a sub-field to learn
+whether it should stop showing a spinner — the same "looks complete, is not"
+trap the report's own `status` field avoids.
+
+Both the Quick and the Deep substance travel in the payload, following the
+DELIBERATE deviation `captain.completed` already documents (see
+`sse_service.build_captain_completed`): the event carries content, `report_id` is
+always present, and the durable GET remains the fact source because the event is
+never replayed.
 
 Reserved for later steps (never produced here; NOT in the Literal so a stray
 publish is a typing error): summary.started / summary.completed / summary.failed.
@@ -43,6 +66,9 @@ SSE_EVENT_TYPES = Literal[
     "summary.completed",
     "summary.failed",
     "meeting.state.updated",
+    "captain.completed",
+    "captain.failed",
+    "captain.quick_assessment",
     "heartbeat",
 ]
 
@@ -65,6 +91,18 @@ SUMMARY_ID_PREFIX = "summary:"
 # event sequence — and this id is only ever a client-side dedup key, since the
 # event itself is non-durable and never replayed.
 STATE_ID_PREFIX = "state:"
+
+# Stable SSE `id:` prefix for a referee lifecycle event (ADR-002 Phase 2-A):
+#   captain:<meeting_id>:<report_id>:completed|failed
+#
+# UNLIKE `final:` / `summary:` this id is NOT derivable from (meeting, version):
+# a referee report is keyed by its own `report_id` and the anchor segment that
+# triggered it. The trailing status is included because the two terminal states
+# share the same report_id — and, since Task 6, because a report now has TWO
+# published moments (`quick_assessment` while ANALYZING, then `completed`), which
+# share that report_id too. As with `state:`, this is only ever a client-side
+# dedup key — the event is non-durable and never replayed.
+CAPTAIN_ID_PREFIX = "captain:"
 
 
 class SSEEventEnvelope(BaseModel):

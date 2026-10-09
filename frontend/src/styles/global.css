@@ -1751,7 +1751,9 @@ body {
 @media (min-width: 1100px) {
   .room-page--workspace {
     display: grid;
-    grid-template-rows: auto minmax(0, 1fr);
+    /* 三行：Header（自适应）/ 主工作区（占满剩余）/ 演示输入（自适应）。
+       演示输入是 auto 而不是 1fr —— 它不该跟转写抢高度。 */
+    grid-template-rows: auto minmax(0, 1fr) auto;
     gap: 16px;
     height: 100%;
     min-height: 0;
@@ -3391,6 +3393,859 @@ body {
 }
 
 /* ============================================================
+   水华队长裁判面板 + 演示输入（ADR-002 前端接入）
+   视觉体系严格沿用既有卡片 / 圆角 / 边框 / 文字层级：
+   不新增调色板、不加发光、不用渐变强调。裁判与 AI 理解是并列的两块，
+   层级只靠字号 / 颜色 / 间距建立。
+   ============================================================ */
+
+/* 右轨现在是两块的堆叠容器：裁判面板（有报告时）在上，AI 理解在下。 */
+.room-page--workspace .room__intelligence {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  min-height: 0;
+}
+
+/* 两块面板高度分配：AI 理解是常驻主区，裁判按需出现。
+   `flex-shrink` 让并排时两者都能滚动（各自的 .intel-scroll 独立滚动），
+   而不是互相挤压到无法阅读。 */
+.room-page--workspace .room__intelligence > .intelligence-panel {
+  flex: 1 1 0;
+}
+
+/* 演示输入条：贴在工作区底部，独立于两栏内容。 */
+.demo-composer {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 12px 16px 14px;
+  background: var(--color-bg-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-card);
+  transition: border-color var(--motion-base) ease, opacity var(--motion-base) ease;
+}
+.demo-composer--disabled {
+  opacity: 0.6;
+}
+.demo-composer__head {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+}
+/* 「演示」标识刻意可见：这是一个写入真实转写的入口，用户必须知道。 */
+.demo-composer__eyebrow {
+  padding: 2px 8px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  color: var(--color-primary);
+  background: var(--color-primary-light);
+  border-radius: 999px;
+}
+.demo-composer__hint {
+  font-size: 12px;
+  color: var(--color-text-tertiary);
+}
+
+.demo-composer__speakers {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.demo-speaker {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 12px;
+  font-family: inherit;
+  font-size: 13px;
+  color: var(--color-text-secondary);
+  background: var(--color-bg-page);
+  border: 1px solid var(--color-border-light);
+  border-radius: 999px;
+  cursor: pointer;
+  transition: color var(--motion-fast) ease, border-color var(--motion-fast) ease,
+    background var(--motion-fast) ease;
+}
+.demo-speaker:hover:not(:disabled) {
+  border-color: var(--color-border);
+}
+.demo-speaker:focus-visible {
+  outline: 2px solid var(--color-primary);
+  outline-offset: 2px;
+}
+.demo-speaker:disabled {
+  cursor: not-allowed;
+  opacity: 0.6;
+}
+/* 选中态：用角色自己的色调做点 + 边框，文字保持主色可读。 */
+.demo-speaker--on {
+  color: var(--color-text-primary);
+  background: var(--color-bg-surface);
+  border-color: var(--speaker-tint, var(--color-primary));
+}
+.demo-speaker__dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--speaker-tint, var(--color-primary));
+  opacity: 0.45;
+  transition: opacity var(--motion-fast) ease;
+}
+.demo-speaker--on .demo-speaker__dot {
+  opacity: 1;
+}
+
+.demo-composer__row {
+  display: flex;
+  align-items: flex-end;
+  gap: 8px;
+}
+.demo-composer__quick.ant-btn {
+  flex: none;
+  color: var(--color-primary);
+  background: var(--color-primary-light);
+  border-color: transparent;
+}
+.demo-composer__quick.ant-btn:hover:not(:disabled) {
+  color: var(--color-primary-hover);
+  background: var(--color-primary-light);
+  border-color: var(--color-primary);
+}
+.demo-composer__input.ant-input {
+  flex: 1;
+  min-width: 0;
+}
+.demo-composer__send.ant-btn {
+  flex: none;
+}
+
+/* ---- 裁判报告内部块 ---- */
+
+/* 讨论概要：与 AI 理解的 .intel-summary 同一视觉语言，但用左边的色条区分
+   「这是裁判的结论」而非「AI 的实时理解」。 */
+.captain-summary {
+  padding: 12px 14px;
+  margin-bottom: 4px;
+  background: var(--color-primary-light);
+  border-radius: var(--radius-md);
+}
+.captain-summary .intel-summary__label {
+  color: var(--color-primary-active);
+}
+.captain-summary .intel-summary__text {
+  color: var(--color-text-primary);
+}
+
+/* 观点标签：中性的短标签胶囊。**不是**立场标记，也不承载人名。 */
+.captain-position__label {
+  align-self: flex-start;
+  padding: 1px 8px;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--color-text-secondary);
+  background: var(--color-bg-subtle);
+  border-radius: var(--radius-sm);
+}
+
+/* 无分歧时的静默说明 —— 是「没有分歧」这一结论，不是「暂无数据」。 */
+.captain-quiet {
+  padding: 6px 0 2px;
+  font-size: 12.5px;
+  line-height: 1.6;
+  color: var(--color-text-tertiary);
+}
+
+/* 不确定性与下一步：与结论区分开，用极轻的底色块。
+   不确定性是 ADR-002 的必填项，视觉上不应被当作次要信息藏起来。 */
+.captain-uncertainty {
+  margin-top: 12px;
+  padding: 10px 12px;
+  background: var(--color-bg-page);
+  border: 1px solid var(--color-border-light);
+  border-radius: var(--radius-md);
+}
+.captain-uncertainty--suggestion {
+  background: transparent;
+}
+.captain-uncertainty__label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 4px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--color-text-secondary);
+}
+.captain-uncertainty__text {
+  font-size: 13px;
+  line-height: 1.65;
+  color: var(--color-text-primary);
+  overflow-wrap: anywhere;
+}
+
+/* 逐字引文：左侧细线表示「这是原文」，与模型的叙述区分开。 */
+.captain-quote {
+  padding-left: 10px;
+  font-size: 13px;
+  line-height: 1.6;
+  color: var(--color-text-secondary);
+  border-left: 2px solid var(--color-border);
+  overflow-wrap: anywhere;
+}
+
+/* ---- 两阶段裁判：临时判断卡片（Task 6）--------------------------------
+   第一段（Quick）先到、Deep 仍在跑时出现。三条视觉纪律：
+   1. 与 durable 报告**分区**：虚线边框 + 浅底，一眼看出「还没定稿」；
+   2. 「临时判断」徽章常驻 —— 它必须看起来像半成品，而不是像结论；
+   3. 不新增调色板：全部复用既有 token，与管理面板同一套语言。 */
+.captain-quick {
+  margin-top: 12px;
+  padding: 12px 14px;
+  background: var(--color-bg-subtle);
+  border: 1px dashed var(--color-border);
+  border-radius: var(--radius-md);
+}
+.captain-quick__head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-bottom: 8px;
+}
+.captain-quick__badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 1px 8px;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--color-text-secondary);
+  background: var(--color-bg-page);
+  border: 1px solid var(--color-border-light);
+  border-radius: var(--radius-sm);
+}
+.captain-quick__hint {
+  font-size: 12px;
+  color: var(--color-text-tertiary);
+}
+.captain-quick__issue {
+  font-size: 13.5px;
+  font-weight: 600;
+  line-height: 1.55;
+  color: var(--color-text-primary);
+  overflow-wrap: anywhere;
+}
+.captain-quick__label {
+  margin-top: 10px;
+  margin-bottom: 3px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--color-text-secondary);
+}
+.captain-quick__judgement {
+  font-size: 13px;
+  line-height: 1.65;
+  color: var(--color-text-primary);
+  overflow-wrap: anywhere;
+}
+.captain-quick__evidence {
+  margin: 10px 0 0;
+  padding: 0;
+  list-style: none;
+}
+.captain-quick__resolve {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  margin-top: 12px;
+  padding-top: 10px;
+  border-top: 1px solid var(--color-border-light);
+}
+.captain-quick__resolve-label {
+  font-size: 11.5px;
+  font-weight: 600;
+  color: var(--color-text-tertiary);
+}
+.captain-quick__resolve-text {
+  font-size: 13px;
+  line-height: 1.6;
+  color: var(--color-text-primary);
+  overflow-wrap: anywhere;
+}
+
+/* 落盘版本：报告已终态，边框改为实线（不再是「还没定稿」的虚线）。 */
+.captain-quick--durable {
+  margin-top: 0;
+  background: transparent;
+  border-style: solid;
+  border-color: var(--color-border-light);
+}
+
+/* ---- 两阶段裁判：Deep 推理正文（Task 3-5）---------------------------- */.captain-deep {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+/* 「已修正」提示：非静默反转是契约要求，视觉上必须比正文更显眼。 */
+.captain-deep__supersede {
+  margin-bottom: 12px;
+  padding: 10px 12px;
+  background: var(--color-bg-subtle);
+  border-left: 3px solid var(--color-warning);
+  border-radius: var(--radius-sm);
+}
+.captain-deep__supersede-label {
+  margin-bottom: 3px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--color-text-secondary);
+}
+.captain-deep__supersede-text {
+  font-size: 13px;
+  line-height: 1.6;
+  color: var(--color-text-primary);
+  overflow-wrap: anywhere;
+}
+.captain-deep__issue {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  margin-bottom: 12px;
+}
+.captain-deep__issue-text {
+  font-size: 14px;
+  font-weight: 600;
+  line-height: 1.55;
+  color: var(--color-text-primary);
+  overflow-wrap: anywhere;
+}
+.captain-deep__judgement {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  margin-top: 12px;
+}
+.captain-deep__judgement-text {
+  font-size: 13.5px;
+  line-height: 1.7;
+  color: var(--color-text-primary);
+  overflow-wrap: anywhere;
+}
+/* 证据强度：等级胶囊 + 依据。**没有百分比** —— 等级是可核对的说法。 */
+.captain-strength {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  flex-wrap: wrap;
+}
+.captain-strength__claim {
+  font-size: 13px;
+  color: var(--color-text-primary);
+}
+.captain-strength__level {
+  padding: 1px 7px;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--color-text-secondary);
+  background: var(--color-bg-subtle);
+  border-radius: var(--radius-sm);
+}
+
+/* ---- 外部资料（Phase 3-2）--------------------------------------------
+   与转写证据分区：没有「查看原文」按钮（网页不是会议内容），只给外链。 */
+.captain-ext {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  overflow-wrap: anywhere;
+}
+.captain-ext__id {
+  flex-shrink: 0;
+  font-size: 11.5px;
+  font-weight: 600;
+  color: var(--color-text-tertiary);
+}
+.captain-ext__title {
+  font-size: 13px;
+  line-height: 1.55;
+  color: var(--color-text-primary);
+}
+
+.captain-panel__foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 12px;
+}
+.captain-panel__foot .intel-foot {
+  margin-top: 0;
+}
+
+/* ============================================================
+   水华队长像素角色（Phase 3-1）
+   ------------------------------------------------------------------
+   只为「会议页的状态可视化」而存在，不新增调色板、不引入动画库。
+
+   两条自缚的约束，写在这里以免后来者改坏：
+
+   1. **全部在文档流内**。没有任何 absolute / fixed 定位 —— 角色与气泡
+      占据右轨顶部自己的一行，因此它不可能盖住左边的转写主区或底部的
+      演示输入条。对照：`.transcript-jump` 是 absolute，但它只出现在
+      转写面板内部（该面板有自己的 stacking context），所以两者不会打架。
+   2. **动效只做位移/透明度/背景色**，时长沿用既有 motion token；
+      `.pixel-captain__*` 的 animation 全部在文件末尾的 reduced-motion
+      块里被显式关闭（见该处列表）。
+   ============================================================ */
+.pixel-captain {
+  display: flex;
+  align-items: flex-end;
+  gap: 10px;
+  flex: none;
+  padding: 11px 13px;
+  background: var(--color-bg-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-card);
+  /* 相位切换时整体轻微过渡（如 TRIGGERED 弹入），不是每帧动画 */
+  transition: border-color var(--motion-base) ease;
+}
+/* TRIGGERED：整块边框亮一次，表示「收到了」。用颜色/边框而非缩放，
+   避免整卡放大挤压右轨布局。 */
+.pixel-captain[data-phase='TRIGGERED'] {
+  border-color: var(--color-primary);
+}
+.pixel-captain[data-phase='FAILED'] {
+  border-color: var(--color-warning);
+}
+
+/* ---- 像素小人 ---- */
+
+/* 固定 56x72 的舞台：所有部件在这套坐标里手工排布（无 sprite sheet）。
+   坐标系与包围盒（top-origin）——
+       灯    x 24..32  y  0.. 8
+       天线杆 x 26..30  y  8..16
+       面罩   x  6..50  y 14..40
+         左眼 x 14..22  y 22..30      右眼 x 34..42  y 22..30
+       躯干   x 10..46  y 38..60
+       底座   x  6..50  y 58..66
+       小锤   x 44..52  y 26..38（判官动作时出现）
+       投影   x 10..46  y 66..70
+   最大 x = 52 < 56，最大 y = 70 < 72 —— 每个部件都在框内，不溢出不裁切。
+   改动任何坐标前请重算这张表。 */
+.pixel-captain__sprite {
+  position: relative;
+  flex: none;
+  width: 56px;
+  height: 72px;
+}
+/* 地面投影：让角色「站」着。 */
+.pixel-captain__ground {
+  position: absolute;
+  top: 66px;
+  left: 10px;
+  width: 36px;
+  height: 4px;
+  background: var(--color-border-light);
+  transition: background var(--motion-base) ease;
+}
+.pixel-captain[data-phase='TRIGGERED'] .pixel-captain__ground,
+.pixel-captain[data-phase='ANALYZING'] .pixel-captain__ground {
+  background: var(--color-primary-light);
+}
+.pixel-captain[data-phase='COMPLETED'] .pixel-captain__ground {
+  background: var(--color-mint-light);
+}
+.pixel-captain[data-phase='FAILED'] .pixel-captain__ground {
+  background: var(--color-bg-subtle);
+}
+
+/* 浮动层：IDLE 轻微上下，ANALYZING 幅度更大（像在思考）。
+   所有部件的绝对坐标都相对这一层，所以整只角色一起动。 */
+.pixel-captain__bob {
+  position: absolute;
+  inset: 0;
+  animation: pixel-captain-idle 2.8s ease-in-out infinite;
+}
+.pixel-captain[data-phase='TRIGGERED'] .pixel-captain__bob {
+  animation: pixel-captain-pop 320ms cubic-bezier(0.2, 1.5, 0.4, 1) 1 both;
+}
+.pixel-captain[data-phase='ANALYZING'] .pixel-captain__bob {
+  animation: pixel-captain-hover 1.5s ease-in-out infinite;
+}
+.pixel-captain[data-phase='COMPLETED'] .pixel-captain__bob {
+  /* key 变化会重建本节点 → 每进入一次 COMPLETED 完整播一次 Judge */
+  animation: pixel-captain-judge 760ms cubic-bezier(0.3, 1.4, 0.5, 1) 1 both;
+}
+.pixel-captain[data-phase='FAILED'] .pixel-captain__bob {
+  animation: pixel-captain-shake 460ms ease-in-out 1 both;
+}
+
+/* 天线：杆 + 指示灯。灯在 ANALYZING 闪烁，TRIGGERED/COMPLETED 换色常亮。
+   这一层只是把两个零件归组，自身不画东西。 */
+.pixel-captain__antenna {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 56px;
+  height: 16px;
+}
+.pixel-captain__rod {
+  position: absolute;
+  top: 8px;
+  left: 26px;
+  width: 4px;
+  height: 8px;
+  background: var(--color-text-tertiary);
+  transition: background var(--motion-base) ease;
+}
+.pixel-captain__lamp {
+  position: absolute;
+  top: 0;
+  left: 24px;
+  width: 8px;
+  height: 8px;
+  background: var(--color-text-tertiary);
+  transition: background var(--motion-base) ease, box-shadow var(--motion-base) ease;
+}
+.pixel-captain[data-phase='TRIGGERED'] .pixel-captain__lamp {
+  background: var(--color-primary);
+}
+.pixel-captain[data-phase='TRIGGERED'] .pixel-captain__rod {
+  background: var(--color-primary);
+}
+/* ANALYZING：灯每 0.9s 闪一次 —— 唯一的「工作指示」，不再加别的动画。 */
+.pixel-captain[data-phase='ANALYZING'] .pixel-captain__lamp {
+  background: var(--color-primary);
+  animation: pixel-captain-blink 900ms steps(1, end) infinite;
+}
+.pixel-captain[data-phase='ANALYZING'] .pixel-captain__rod {
+  background: var(--color-primary);
+}
+.pixel-captain[data-phase='COMPLETED'] .pixel-captain__lamp {
+  background: var(--color-mint);
+  box-shadow: 0 0 0 2px var(--color-mint-light);
+}
+.pixel-captain[data-phase='COMPLETED'] .pixel-captain__rod {
+  background: var(--color-mint);
+}
+.pixel-captain[data-phase='FAILED'] .pixel-captain__lamp {
+  background: var(--color-warning);
+}
+.pixel-captain[data-phase='FAILED'] .pixel-captain__rod {
+  background: var(--color-warning);
+}
+
+/* 面罩：头部主体。**平涂**，不加内层渐变/白色蒙版 ——
+   像素画的对比来自纯色块并置，蒙版会把眼睛的白色压成灰蓝，头也不再是「一块深色」。 */
+.pixel-captain__visor {
+  position: absolute;
+  top: 14px;
+  left: 6px;
+  width: 44px;
+  height: 26px;
+  background: var(--color-text-primary);
+  transition: background var(--motion-base) ease;
+}
+/* 「眉檐」：顶部一条更深的分隔，用两色并置代替蒙版建立头的厚度。 */
+.pixel-captain__visor::after {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 44px;
+  height: 4px;
+  background: var(--color-bg-page);
+  opacity: 0.22;
+}
+.pixel-captain[data-phase='FAILED'] .pixel-captain__visor {
+  background: var(--color-text-secondary);
+}
+
+/* 眼睛：像素方点。ANALYZING 时左右扫视（像在翻看记录）。 */
+.pixel-captain__eye {
+  position: absolute;
+  top: 8px;
+  left: 8px;
+  width: 8px;
+  height: 8px;
+  background: var(--color-bg-surface);
+}
+.pixel-captain__eye--right {
+  left: auto;
+  right: 8px;
+}
+.pixel-captain[data-phase='ANALYZING'] .pixel-captain__eye {
+  animation: pixel-captain-scan 1.8s ease-in-out infinite;
+}
+.pixel-captain[data-phase='ANALYZING'] .pixel-captain__eye--right {
+  animation-direction: reverse;
+}
+/* COMPLETED：Judge 动作收尾时眯一下眼 —— 与 bob 的 keyframes 同一时长 */
+.pixel-captain[data-phase='COMPLETED'] .pixel-captain__eye {
+  animation: pixel-captain-nod 760ms ease-out 1 both;
+}
+.pixel-captain[data-phase='FAILED'] .pixel-captain__eye {
+  background: var(--color-warning);
+}
+
+/* 像素小锤：默认不可见，COMPLETED 的 Judge 动作里出现并敲下。 */
+.pixel-captain__gavel {
+  position: absolute;
+  top: 26px;
+  left: 44px;
+  width: 8px;
+  height: 12px;
+  background: var(--color-warning);
+  opacity: 0;
+}
+.pixel-captain[data-phase='COMPLETED'] .pixel-captain__gavel {
+  animation: pixel-captain-gavel 760ms cubic-bezier(0.3, 1.4, 0.5, 1) 1 both;
+}
+
+/* 躯干 */
+.pixel-captain__torso {
+  position: absolute;
+  top: 38px;
+  left: 10px;
+  width: 36px;
+  height: 22px;
+  background: var(--color-bg-subtle);
+  border: 1px solid var(--color-border);
+  transition: background var(--motion-base) ease, border-color var(--motion-base) ease;
+}
+/* 胸前徽标：主色一小块 —— 角色身上唯一的品牌色，克制使用。 */
+.pixel-captain__torso::after {
+  content: '';
+  position: absolute;
+  top: 6px;
+  left: 13px;
+  width: 8px;
+  height: 8px;
+  background: var(--color-primary);
+  transition: background var(--motion-base) ease;
+}
+.pixel-captain[data-phase='COMPLETED'] .pixel-captain__torso {
+  background: var(--color-mint-light);
+  border-color: var(--color-mint);
+}
+.pixel-captain[data-phase='COMPLETED'] .pixel-captain__torso::after {
+  background: var(--color-mint);
+}
+.pixel-captain[data-phase='FAILED'] .pixel-captain__torso::after {
+  background: var(--color-warning);
+}
+
+/* 底座：让人物落地 */
+.pixel-captain__base {
+  position: absolute;
+  top: 58px;
+  left: 6px;
+  width: 44px;
+  height: 8px;
+  background: var(--color-text-primary);
+  transition: background var(--motion-base) ease;
+}
+.pixel-captain[data-phase='FAILED'] .pixel-captain__base {
+  background: var(--color-text-secondary);
+}
+
+/* ---- 角色旁的说明 + 动作 ---- */
+
+.pixel-captain__say {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+/* 气泡：一句话。**不是**带尖角的漫画气泡 —— 这是产品界面，
+   保持与 .intel-notice 同一视觉语言（底色块 + 小圆角）。 */
+.pixel-captain__bubble {
+  margin: 0;
+  font-size: 12.5px;
+  font-weight: 500;
+  line-height: 1.5;
+  color: var(--color-text-primary);
+}
+.pixel-captain[data-phase='IDLE'] .pixel-captain__bubble {
+  color: var(--color-text-tertiary);
+  font-weight: 400;
+}
+.pixel-captain[data-phase='FAILED'] .pixel-captain__bubble {
+  color: var(--color-text-secondary);
+}
+
+.pixel-captain__actions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px 8px;
+}
+/* 动作按钮与面板按钮同一视觉语言（.captain-panel__trigger），
+   但更小一号：它是角色的一部分，不该抢面板 CTA 的注意力。 */
+.pixel-captain__action {
+  padding: 2px 9px;
+  font-family: inherit;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--color-primary);
+  background: var(--color-primary-light);
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  transition: color var(--motion-fast) ease, border-color var(--motion-fast) ease,
+    background var(--motion-fast) ease;
+}
+.pixel-captain__action:hover:not(:disabled) {
+  color: var(--color-primary-hover);
+  border-color: var(--color-primary);
+}
+.pixel-captain__action:disabled {
+  cursor: not-allowed;
+  opacity: 0.6;
+}
+.pixel-captain__action--quiet {
+  color: var(--color-text-secondary);
+  background: var(--color-bg-page);
+}
+.pixel-captain__action--quiet:hover:not(:disabled) {
+  color: var(--color-primary);
+}
+
+/* 角色名 + 判过的时刻：最次要的一行，字号最小、颜色最浅。 */
+.pixel-captain__meta {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 6px;
+  font-size: 11px;
+  color: var(--color-text-tertiary);
+}
+.pixel-captain__time {
+  font-variant-numeric: tabular-nums;
+}
+
+@keyframes pixel-captain-idle {
+  0%,
+  100% {
+    transform: translateY(0);
+  }
+  50% {
+    transform: translateY(-3px);
+  }
+}
+@keyframes pixel-captain-hover {
+  0%,
+  100% {
+    transform: translateY(-1px);
+  }
+  50% {
+    transform: translateY(-6px);
+  }
+}
+/* 弹出：从「贴地缩着」到站定。只改 translateY，不改宽高 —— 布局零抖动。 */
+@keyframes pixel-captain-pop {
+  0% {
+    transform: translateY(10px);
+    opacity: 0.35;
+  }
+  60% {
+    transform: translateY(-4px);
+    opacity: 1;
+  }
+  100% {
+    transform: translateY(0);
+    opacity: 1;
+  }
+}
+/* Judge：抬手 → 落下 → 点头。锤子在同一时长里出现并敲下。 */
+@keyframes pixel-captain-judge {
+  0% {
+    transform: translateY(0);
+  }
+  35% {
+    transform: translateY(-5px);
+  }
+  60% {
+    transform: translateY(2px);
+  }
+  100% {
+    transform: translateY(0);
+  }
+}
+@keyframes pixel-captain-gavel {
+  0% {
+    opacity: 0;
+    transform: translate(0, 0);
+  }
+  30% {
+    opacity: 1;
+    transform: translate(-6px, -8px);
+  }
+  60% {
+    opacity: 1;
+    transform: translate(-6px, 0);
+  }
+  100% {
+    opacity: 0;
+    transform: translate(-6px, 0);
+  }
+}
+@keyframes pixel-captain-nod {
+  0%,
+  30% {
+    height: 8px;
+  }
+  45% {
+    height: 4px;
+  }
+  60%,
+  100% {
+    height: 8px;
+  }
+}
+@keyframes pixel-captain-scan {
+  0%,
+  100% {
+    transform: translateX(0);
+  }
+  50% {
+    transform: translateX(6px);
+  }
+}
+@keyframes pixel-captain-blink {
+  0%,
+  49% {
+    opacity: 1;
+  }
+  50%,
+  100% {
+    opacity: 0.25;
+  }
+}
+/* 失败：只摇两次、幅度小。裁判失败是正常业务结果，不该像报错一样剧烈。 */
+@keyframes pixel-captain-shake {
+  0%,
+  100% {
+    transform: translateX(0);
+  }
+  20% {
+    transform: translateX(-2px);
+  }
+  40% {
+    transform: translateX(2px);
+  }
+  60% {
+    transform: translateX(-1px);
+  }
+  80% {
+    transform: translateX(1px);
+  }
+}
+
+/* ============================================================
    Reduced motion —— 关闭位移 / 脉冲 / 平滑滚动，保留基础透明度过渡
    ============================================================ */
 @media (prefers-reduced-motion: reduce) {
@@ -3429,4 +4284,15 @@ body {
   .home-hero-wave span {
     animation: none;
   }
+  /* 水华队长像素角色：一律清零而不是靠上面的 `*` 兜底。
+     兜底规则把 iteration-count 压到 1，会让 `pixel-captain-blink` 停在
+     opacity:0.25 的中间帧上 —— 灯就永远半亮着。显式 `none` 让每个部件
+     回到自己的静态样式：灯常亮、眼睛不扫视、人物不浮动。 */
+  .pixel-captain__bob,
+  .pixel-captain__lamp,
+  .pixel-captain__eye,
+  .pixel-captain__gavel {
+    animation: none;
+  }
+  /* 动作按钮/相位的过渡保留（它们只是颜色变化，不构成动效负担）。 */
 }

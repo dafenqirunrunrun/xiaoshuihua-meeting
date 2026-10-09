@@ -22,42 +22,40 @@ class TencentSentenceResult:
 
 
 def parse_sentences(response: dict[str, Any]) -> list[TencentSentenceResult]:
-    """Normalize valid Tencent sentence items and skip malformed ones."""
+    """Normalize valid Tencent sentence items and skip malformed ones.
+
+    Two response shapes are accepted:
+
+    ``{"result": {...}}`` — what ``/asr/v2`` actually returns. One sentence per
+    message, identified by ``index``, with the text in ``voice_text_str`` and
+    the lifecycle in ``slice_type`` (0 = sentence starts, 1 = continues,
+    2 = sentence ends).
+    ``{"sentences": [...]}`` — the legacy list shape.
+    """
+    items = _sentence_items(response)
     voice_id = response.get("voice_id")
     if not isinstance(voice_id, str) or not voice_id:
-        if _sentence_items(response.get("sentences")):
+        if items:
             logger.warning("[ASR] malformed sentences skipped: missing voice_id")
         return []
 
     results: list[TencentSentenceResult] = []
-    for index, item in enumerate(_sentence_items(response.get("sentences"))):
+    for index, item in enumerate(items):
         try:
-            sentence_id = _required_int(item, "sentence_id")
-            sentence_type = _required_int(item, "sentence_type")
+            sentence_id = _required_int(item, "sentence_id", fallback="index")
+            sentence_type = _sentence_type(item)
             start_ms = _required_int(item, "start_time")
             end_ms = _required_int(item, "end_time")
 
             if sentence_id < 0:
                 raise ValueError("sentence_id must be >= 0")
-            if sentence_type not in (0, 1):
-                raise ValueError(f"unknown sentence_type={sentence_type}")
             if start_ms < 0 or end_ms < 0:
                 raise ValueError("start_time and end_time must be >= 0")
             if end_ms < start_ms:
                 raise ValueError("end_time must be >= start_time")
 
-            speaker_value = item.get("speaker_id", -1)
-            speaker_id = (
-                speaker_value
-                if isinstance(speaker_value, int)
-                and not isinstance(speaker_value, bool)
-                and speaker_value >= 0
-                else -1
-            )
-            sentence_text = item.get("sentence")
-            if not isinstance(sentence_text, str) or not sentence_text:
-                sentence_text = item.get("text", "")
-            text = sentence_text if isinstance(sentence_text, str) else ""
+            speaker_id = _speaker_id(item)
+            text = _sentence_text(item)
 
             results.append(
                 TencentSentenceResult(
@@ -80,11 +78,59 @@ def parse_sentences(response: dict[str, Any]) -> list[TencentSentenceResult]:
     return results
 
 
-def _required_int(item: dict[str, Any], field: str) -> int:
+def _required_int(
+    item: dict[str, Any], field: str, *, fallback: str | None = None
+) -> int:
+    """Read a required int, optionally accepting an alternate field name."""
     value = item.get(field)
+    if (isinstance(value, bool) or not isinstance(value, int)) and fallback:
+        value = item.get(fallback)
     if isinstance(value, bool) or not isinstance(value, int):
         raise ValueError(f"{field} must be an integer")
     return value
+
+
+def _sentence_type(item: dict[str, Any]) -> int:
+    """Normalize the sentence lifecycle to 0 = partial, 1 = final.
+
+    The legacy shape carries ``sentence_type`` directly. The real
+    ``/asr/v2`` shape carries ``slice_type`` instead: 0 = the sentence
+    starts, 1 = it continues, 2 = it ends. Only a completed slice (2) is a
+    FINAL, because downstream (``transcript_bridge`` / ``transcript_dispatcher``)
+    keys on ``sentence_type == 1``.
+    """
+    if "sentence_type" in item:
+        sentence_type = _required_int(item, "sentence_type")
+        if sentence_type not in (0, 1):
+            raise ValueError(f"unknown sentence_type={sentence_type}")
+        return sentence_type
+
+    slice_type = _required_int(item, "slice_type")
+    if slice_type in (0, 1):
+        return 0
+    if slice_type == 2:
+        return 1
+    raise ValueError(f"unknown slice_type={slice_type}")
+
+
+def _speaker_id(item: dict[str, Any]) -> int:
+    """Speaker id, or -1 when unknown (never a synthetic speaker_-1 label)."""
+    value = item.get("speaker_id")
+    if isinstance(value, bool) or not isinstance(value, int):
+        speaker_info = item.get("speaker_info")
+        value = speaker_info.get("speaker_id") if isinstance(speaker_info, dict) else None
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return -1
+    return value
+
+
+def _sentence_text(item: dict[str, Any]) -> str:
+    """Sentence text across both shapes: sentence / text / voice_text_str."""
+    for field in ("sentence", "text", "voice_text_str"):
+        value = item.get(field)
+        if isinstance(value, str) and value:
+            return value
+    return ""
 
 
 def _debug_raw(enabled: bool, response: dict[str, Any]) -> None:
@@ -137,7 +183,17 @@ def print_error(response: dict[str, Any], *, debug: bool = False) -> None:
     print(f"message={response.get('message', '')}")
 
 
-def _sentence_items(sentences: Any) -> list[dict[str, Any]]:
+def _sentence_items(response: dict[str, Any]) -> list[dict[str, Any]]:
+    """Extract sentence dicts from either response shape.
+
+    ``/asr/v2`` sends one ``result`` object per message; the legacy shape
+    sends a ``sentences`` list.
+    """
+    result = response.get("result")
+    if isinstance(result, dict):
+        return [result]
+
+    sentences = response.get("sentences")
     if isinstance(sentences, list):
         return [item for item in sentences if isinstance(item, dict)]
     if not isinstance(sentences, dict):

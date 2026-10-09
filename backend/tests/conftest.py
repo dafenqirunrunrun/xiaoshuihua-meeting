@@ -29,6 +29,12 @@ _TMP_DIR = Path(tempfile.mkdtemp(prefix="xiaoshuihua-tests-"))
 os.environ["DATABASE_URL"] = f"sqlite:///{(_TMP_DIR / 'test.db').as_posix()}"
 os.environ["LLM_PROVIDER"] = "fake"
 os.environ["DEEPSEEK_API_KEY"] = ""
+# The two-stage referee is opt-in and the offline suite was written against the
+# single-call default (see `captain_two_stage_enabled` in app/config.py). A
+# developer who turned it on in their own `.env` must not thereby change what the
+# suite exercises — same reason LLM_PROVIDER is pinned above. Tests that want
+# two-stage turn it on themselves via `monkeypatch.setattr(settings, ...)`.
+os.environ["CAPTAIN_TWO_STAGE_ENABLED"] = "false"
 # Small queue so the eviction path is reachable without huge payloads.
 os.environ["SSE_QUEUE_MAXSIZE"] = "100"
 # Keep the heartbeat out of the way of short-lived assertions.
@@ -54,6 +60,7 @@ def fresh_schema(app_module) -> Iterator[None]:
 
     # Import the models so they are registered on Base.metadata before create.
     from app.agent.summary_model import MeetingSummary  # noqa: F401
+    from app.captain.model import CaptainReport  # noqa: F401
     from app.meeting.meeting_model import Meeting  # noqa: F401
     from app.meeting_state.model import MeetingState  # noqa: F401
     from app.meeting_state.snapshot_model import (  # noqa: F401
@@ -92,7 +99,22 @@ def reset_inprocess_state() -> Iterator[None]:
     from app.audio.session_manager import audio_session_manager
     from app.device.meeting_binding import device_meeting_bindings
     from app.transcript.live_cache import live_utterance_cache
+    from app.captain.service import reset_throttle as reset_captain_throttle
+    from app.captain.worker import captain_worker
+    from app.captain.search.cache import reset_cache as reset_search_cache
     from app.meeting_state.scheduler import meeting_state_scheduler
+
+    # Drain the referee queue BEFORE dropping the schema, so a background
+    # analysis cannot write into a table the next test just recreated.
+    assert captain_worker.drain(timeout=10.0)
+    reset_captain_throttle()
+    # The search cache is a process-wide singleton with TTLs measured in HOURS
+    # (TECH_FACT) and DAYS (STATIC_FACT), so it survives the whole test session.
+    # Without this reset, one test's scripted search response is served to the
+    # next test that happens to plan the same query — which makes the later
+    # test's assertions depend on an earlier test's fixtures rather than on the
+    # code under test.
+    reset_search_cache()
 
     meeting_state_scheduler.cancel_all_pending()
     assert meeting_state_scheduler.wait_for_idle(timeout_seconds=10.0)
@@ -112,6 +134,8 @@ def reset_inprocess_state() -> Iterator[None]:
     audio_session_manager.clear()
     yield
 
+    assert captain_worker.drain(timeout=10.0)
+    reset_captain_throttle()
     meeting_state_scheduler.cancel_all_pending()
     assert meeting_state_scheduler.wait_for_idle(timeout_seconds=10.0)
     device_meeting_bindings.clear()

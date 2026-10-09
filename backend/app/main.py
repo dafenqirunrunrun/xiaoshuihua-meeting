@@ -18,7 +18,9 @@ from app.common.exceptions import (
 )
 from app.agent import router as agent_router
 from app.audio import router as audio_router
+from app.captain import router as captain_router
 from app.common import health_router
+from app.demo import router as demo_router
 from app.meeting import router as meeting_router
 from app.meeting_state import router as meeting_state_router
 from app.realtime import router as realtime_router
@@ -39,6 +41,12 @@ async def lifespan(_app: FastAPI):
 
     meeting_state_scheduler.cancel_all_pending()
     meeting_state_scheduler.wait_for_idle(timeout_seconds=2.0)
+    # 水华队长 dispatch worker (ADR-002). Stopped AFTER the meeting-state agent so
+    # an in-flight transcript drain is not competing for the DB during shutdown.
+    # Its thread is a daemon, so a stuck provider call cannot delay exit.
+    from app.captain.worker import captain_worker
+
+    captain_worker.stop(timeout=2.0)
     from app.agent.llm.factory import close_cached_providers
 
     close_cached_providers()
@@ -91,6 +99,18 @@ app.include_router(meeting_state_router.router, prefix="/api")
 # Intelligence Panel reads. Additive route, distinct path from every existing
 # one; the internal debug router above is untouched.
 app.include_router(meeting_state_router.public_router, prefix="/api")
+# 水华队长 AI Referee (ADR-002): an ON-DEMAND sidecar over the same read-only
+# FINAL transcript. Additive routes under a distinct path prefix; it shares no
+# implementation with the Meeting State agent above and stays fully functional
+# when that agent is disabled.
+app.include_router(captain_router.router, prefix="/api")
+# 演示输入（会议室页「模拟参会人发言」）: a product-level ingress that turns a
+# typed line into a REAL FINAL by reusing the existing ASR ingress application
+# layer — so ordering / idempotency / SSE / Meeting State / 水华队长 wake-up are
+# the same code path the hardware uses, with no second implementation to drift.
+# It never hands `segment_seq` ownership to the browser (CLAUDE.md hard rule).
+# Set `DEMO_INGRESS_ENABLED=false` to remove the route entirely.
+app.include_router(demo_router.router, prefix="/api")
 # Focused docs for the collaborator-facing internal ASR contract
 # (GET /api/internal/docs + /api/internal/openapi.json) — derived from the real
 # routes above, so it cannot drift from the implementation.

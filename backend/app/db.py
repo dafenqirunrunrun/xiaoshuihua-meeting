@@ -44,6 +44,7 @@ SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
 def create_all() -> None:
     """Create tables (imports models first)."""
     from app.agent.summary_model import MeetingSummary  # noqa: F401
+    from app.captain.model import CaptainReport  # noqa: F401
     from app.meeting.meeting_model import Meeting  # noqa: F401
     from app.meeting_state.model import MeetingState  # noqa: F401
     from app.meeting_state.snapshot_model import (  # noqa: F401

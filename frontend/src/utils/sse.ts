@@ -25,6 +25,9 @@ export const SSE_EVENT_TYPES = [
   'summary.completed',
   'summary.failed',
   'meeting.state.updated',
+  'captain.completed',
+  'captain.failed',
+  'captain.quick_assessment',
   'heartbeat',
 ] as const satisfies readonly SseEventType[]
 

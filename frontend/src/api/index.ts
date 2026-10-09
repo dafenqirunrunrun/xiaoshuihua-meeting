@@ -1,4 +1,6 @@
 export { http, normalizeApiError, ApiError } from './http'
+export * from './captain'
+export * from './demo'
 export * from './meeting'
 export * from './meetingState'
 export * from './transcript'

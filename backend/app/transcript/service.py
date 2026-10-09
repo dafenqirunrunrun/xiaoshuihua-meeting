@@ -75,6 +75,63 @@ def _schedule_agent(background_tasks, meeting_id: str, applied: FinalApplied) ->
     meeting_state_scheduler.schedule(meeting_id)
 
 
+def _maybe_trigger_captain(meeting_id: str, applied: FinalApplied) -> None:
+    """Offer a newly committed FINAL to the 水华队长 referee (ADR-002).
+
+    Structurally identical to `_schedule_agent` above, and deliberately placed
+    at the SAME choke point rather than in the ASR adapter. The referee is a
+    second, independent downstream consumer of the same committed fact:
+
+        ASR adapter -> Transcript Domain -> [application layer] -> captain
+
+    Placing it here (and NOT in `speech/transcript_dispatcher.py`) is what keeps
+    the two trigger paths — the HTTP ingress and the real ASR callback —
+    identical by construction. Wiring them separately is how the meeting-state
+    agent ended up with two hooks that could drift.
+
+    The wake word is matched on FINAL text only, inside the captain package. The
+    whole decision is one substring check; on a miss this costs nothing.
+
+    This function is FAILURE-ISOLATED: every exception is swallowed and logged.
+    The referee must never be able to break transcript persistence or SSE
+    broadcast — FINAL commit has already happened and is the fact source.
+    """
+    try:
+        from app.captain import wake_word
+        from app.captain.worker import captain_worker
+        from app.captain import service as captain_service
+        from app.db import SessionLocal
+
+        db = SessionLocal()
+        try:
+            segment = transcript_repository.get_by_seq(
+                db, meeting_id, applied.segment_seq
+            )
+            if segment is None or not wake_word.match(segment.text):
+                return
+            # Anchor on the segment that SPOKE the wake word, so a re-delivered
+            # wake word collapses onto the same report (zero LLM spend).
+            from app.config import settings
+
+            if not settings.captain_enabled:
+                return
+            if captain_service.throttle_remaining(meeting_id) > 0:
+                return
+            row, created = captain_service.trigger(
+                db, meeting_id, anchor_segment_seq=applied.segment_seq
+            )
+            if created:
+                captain_worker.submit(meeting_id, row.report_id)
+        finally:
+            db.close()
+    except Exception:  # noqa: BLE001 - the referee must never break ingest
+        import logging
+
+        logging.getLogger(__name__).exception(
+            "captain wake-word trigger failed for meeting %s", meeting_id
+        )
+
+
 def _canonical(seg: TranscriptSegment) -> tuple[str, str, int | None, int | None]:
     """Canonical content for idempotency comparison (ADR D5)."""
     return (seg.text, seg.speaker_id, seg.start_ms, seg.end_ms)
@@ -148,6 +205,11 @@ def handle_event(
     # callback (no business work happens here, and no lock is needed to do it).
     if applied is not None:
         _schedule_agent(background_tasks, path_meeting_id, applied)
+        # 水华队长 (ADR-002) is a SECOND, independent consumer of the same
+        # committed FINAL. It is not gated on `background_tasks` on purpose:
+        # the real ASR callback path has no BackgroundTasks, and the referee
+        # dispatches through its own worker instead.
+        _maybe_trigger_captain(path_meeting_id, applied)
     return applied
 
 

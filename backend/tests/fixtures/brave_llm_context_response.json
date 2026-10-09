@@ -1,0 +1,32 @@
+{
+  "_fixture_note": "Brave LLM Context API — SYNTHETIC fixture, NOT a captured live response. Constructed from the official API reference shape (grounding.generic passages + a sources map keyed by URL). Phase 3-2E must replace this with a real sanitised capture on the first live call.",
+  "_sanitisation": "No subscription token, no API key, no query-bearing URL params. Domains are *.test.",
+  "grounding": {
+    "generic": [
+      {
+        "url": "https://docs1.test/redis/configuration",
+        "title": "Redis configuration reference",
+        "snippet": "By default Redis listens on port 6379. This can be changed with the port directive."
+      },
+      {
+        "url": "https://docs2.test/redis/faq",
+        "title": "Redis FAQ",
+        "snippet": "The default port is 6379 and the default configuration file is redis.conf."
+      }
+    ]
+  },
+  "sources": {
+    "https://docs1.test/redis/configuration": {
+      "title": "Redis configuration reference",
+      "url": "https://docs1.test/redis/configuration"
+    },
+    "https://docs2.test/redis/faq": {
+      "title": "Redis FAQ",
+      "url": "https://docs2.test/redis/faq"
+    },
+    "https://docs3.test/redis/ports": {
+      "title": "Redis ports overview",
+      "url": "https://docs3.test/redis/ports"
+    }
+  }
+}

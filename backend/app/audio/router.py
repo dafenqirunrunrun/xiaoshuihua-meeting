@@ -30,6 +30,9 @@ PCM_FLUSH_INTERVAL = 25
 ASR_FEED_LOG_INTERVAL = 25
 ASR_QUEUE_DROP_LOG_INTERVAL = 25
 ASR_SEND_INTERVAL_SECONDS = 0.2
+# The ESP32 streams continuously; this much silence means the peer is gone.
+# Bounds how long a silently dead connection can hold the device's session.
+AUDIO_RECEIVE_TIMEOUT_SECONDS = 30.0
 
 
 @dataclass
@@ -87,11 +90,21 @@ async def _receive_until_stopped(
     websocket: WebSocket,
     stop_requested: asyncio.Event,
 ) -> dict | None:
-    """Receive one frame, while allowing the Finish request to wake the loop."""
+    """Receive one frame, while allowing the Finish request to wake the loop.
+
+    A read timeout guards against a silently dead TCP connection: the ESP32
+    streams continuously, so ``AUDIO_RECEIVE_TIMEOUT_SECONDS`` without a single
+    frame means the peer is gone (a chip reset sends no TCP FIN). Without this,
+    the session would stay registered forever and every reconnect would be
+    rejected with 1013. Returning ``None`` tears the session down so the device
+    can register again.
+    """
     receive_task = asyncio.create_task(websocket.receive())
     stop_task = asyncio.create_task(stop_requested.wait())
     done, pending = await asyncio.wait(
-        {receive_task, stop_task}, return_when=asyncio.FIRST_COMPLETED
+        {receive_task, stop_task},
+        timeout=AUDIO_RECEIVE_TIMEOUT_SECONDS,
+        return_when=asyncio.FIRST_COMPLETED,
     )
 
     # Preserve a frame that arrived at the same instant as the stop request.

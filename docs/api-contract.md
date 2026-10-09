@@ -150,6 +150,138 @@ PARTIAL 永远不会出现在此接口。Meeting 不存在 → **404**。
 
 ---
 
+## 1b. 水华队长 Captain（`/api`，ADR-002）
+
+> 按需触发的**讨论裁判**旁路能力。不是实时分析 Agent（Meeting State）的一部分，
+> 不读 `meeting_state`，不改 transcript 主链路。
+
+### POST /api/meetings/{meeting_id}/captain — 触发裁判
+
+- Body（可省略）：`{"anchor_segment_seq": int?}` —— 触发本报告的 FINAL。
+  语音唤醒路径传入已知锚点；按钮路径省略，服务端取当前 FINAL 高水位。
+  传入锚点使触发**幂等**（重投同一唤醒词不再付第二次 LLM 成本）。
+- **202 Accepted**，立即返回，绝不等待 LLM：
+  `{report_id, meeting_id, status, anchor_segment_seq, created, reused}`。
+- 分析在 captain 派发 worker（单 daemon 线程）上执行。
+- **409**：Meeting 状态不是 `IN_PROGRESS` / `FINALIZING`。
+- **404**：Meeting 不存在。
+- **429**：距上次触发不足 `CAPTAIN_MIN_INTERVAL_SECONDS`（默认 30s），
+  **不创建任何行**（否则去重键会挡住用户的正常重试）。
+- **503**：`CAPTAIN_ENABLED=false`；或队列满 —— 此时**当场把该报告标记 FAILED**
+  并广播 `captain.failed`，绝不留一个永远 PENDING 的行。
+
+### GET /api/meetings/{meeting_id}/captain/latest — 最近一份报告
+
+- 刷新 / 重连的**恢复读**。返回 `CaptainReportPublic`。
+- **404**：该会议从未触发过裁判（「尚无报告」与「报告正在跑」必须可区分）。
+
+### GET /api/meetings/{meeting_id}/captain/{report_id} — 单份报告
+
+- 裁判 UI 的**事实源**。返回 `CaptainReportPublic`；`meeting_id` 不匹配 → **404**。
+- `status` ∈ `PENDING` / `ANALYZING` / `COMPLETED` / `FAILED`；
+  `report` 内容仅在 `COMPLETED` 时非空（失败**绝不**留半份报告）。
+- `report_json` 损坏时降级为 `FAILED`，不 500、不回写。
+- ⚠️ **`window_to_seq` 的真实语义**：它是**触发那句（锚点）**，而锚点按设计
+  **总被排除**在分析内容之外（「水华队长，你说说」不是讨论内容 —— 见
+  `captain/context.py` 模块文档）。所以 UI **不要**把
+  `window_from_seq`–`window_to_seq` 渲染成「分析了第 X–Y 条」，
+  那会读成「锚点也在内」。目前前端如实写作「第 X 条起（触发的那一句不计入）」。
+  字段名沿用了「窗口上界」的直觉，是既有的命名债。
+
+### 报告内容（`report`）
+
+```text
+{
+  discussion_summary, positions[1..5]{label,statement,source_segment_seqs},
+  agreement_points[], dispute_points[], evidence[]{segment_seq,quote,supports},
+  uncertainty, suggestion
+}
+```
+
+- **观点不预设两个**：`positions` 由模型从窗口内自主识别 1..N 簇（**上限 5**），
+  `dispute_points` 允许为空 —— 「不强行制造冲突」是 schema 层的结构性性质。
+  理由：产品说话人标签默认关闭（`ASR_SPEAKER_LABELS_ENABLED=false`），
+  「A 方 / B 方」会诱导模型把主张归因到它无法识别的身份上。
+- `uncertainty` **必填且非空**；`source_segment_seqs` / `evidence.quote` 由
+  `captain/evidence.py` 用**纯函数**（绝不二次调模型）对已持久化 transcript 复核，
+  越界引用 / 非逐字引文一律剔除，剔除结果并入 `uncertainty`。
+- 每字段 `extra="forbid"`；所有模型调用经 `LLMProvider`。
+
+### SSE `captain.completed` / `captain.failed` / `captain.quick_assessment`（`GET /events` 同一连接）
+
+- `captain.completed` payload：
+  `{report_id, anchor_seq, positions, dispute_points, uncertainty,
+  research_status, external_evidence_count}`。
+  `research_status` / `external_evidence_count` 是 **Phase C.5 增量新增**的字段：
+  老客户端按原样工作，老 `report_json` 也仍产生格式良好的事件（读取用
+  `report.get(...)` 带默认值）。它们**只**出现在这个事件上，因为检索发生在两个事件
+  **之间**——`captain.quick_assessment` 在检索开始**之前**就发出，结构上不可能携带
+  检索结果。取值见 `research_status` 词表（`not_required` / `success` / `partial` /
+  `timeout` / `failed`）：客户端可以据此渲染「外部资料检索未完成」，而不必对
+  `uncertainty` 里的中文句子做字符串匹配。
+- `captain.quick_assessment` payload：
+  `{report_id, provisional: true, issue, key_evidence, provisional_judgement,
+  question_to_resolve}` —— 两阶段裁判的**第一段**结果（Task 6）。
+- `captain.failed` payload：`{report_id, anchor_seq, reason}`（**无**报告内容，
+  `reason` 是固定短码，**绝不是** provider 堆栈 / `last_error` 原文）。
+- 稳定 id：`captain:<meeting_id>:<report_id>:<completed|failed|quick_assessment>`。
+- **非 durable，不随 `after_segment_seq` 回放**（与 `summary.*` / `meeting.state.updated`
+  一致）。
+- ⚠️ **与既有约定的一处刻意偏离**：`meeting.state.updated` / `summary.*` 是**纯失效
+  通知**（payload 仅标量，内容一律回 GET）。`captain.completed` **例外地**直接携带
+  报告内容，以便面板在裁判返回的瞬间即可渲染，无需再等一次 GET。
+  之所以安全，是因为 `report_id` 始终在 payload 中：断线 / 刷新 / 重连的客户端
+  收不到该事件，靠 `GET .../captain/{report_id}`（或 `/latest`）恢复。
+  **事件是快路径，不是事实源。**
+- 广播时机：**commit 之后**（`mark_completed` / `mark_failed` 已落盘）。publish 失败
+  （无订阅者 / 队列满 / broker 抛错）**不会**回滚报告，也不会把报告记为 FAILED。
+- 幂等：行已是终态时 `mark_*` 返回 `None`，**不再广播** —— 一份报告只发一次事件。
+
+#### `captain.quick_assessment`（Task 6，两阶段裁判）
+
+- **为什么是独立事件、而不是 `captain.completed` 的子字段**：语义必须可区分。
+  收到 `captain.completed` 的客户端可以**停止 loading**（durable 报告已落盘）；
+  收到 `captain.quick_assessment` 的客户端**必须继续等待**。若把 Quick 内容塞进
+  `captain.completed` 的某个子字段，每个客户端都得检查该子字段才能判断要不要停
+  loading —— 正是报告 `status` 字段所避免的「看起来完成、其实没有」。
+- **广播时机例外**：此事件在报告仍为 `ANALYZING` 时发出，**不是** commit-before-publish。
+  这是刻意的：Quick 的全部价值就是**早**，等到 Deep 落盘再发等于把 Deep 的延迟
+  加到 Quick 上，两阶段设计就失去意义。行仍是 `ANALYZING`，因此漏收该事件的客户端
+  只需继续轮询报告，不丢任何 durable 信息。
+- **Quick 降级时（调用失败 / JSON 不合法）不发此事件**，一个空事件会让面板渲染一张
+  永远填不上的卡片，比不发更糟。
+- payload **绝不包含** `raw_model_output` / `model_name` / prompt / provider 堆栈。
+- 该事件**不改变** `GET .../captain/{report_id}` 的读取契约：`report.quick` /
+  `report.deep` 是 `CaptainReportContent` 上的可选字段，老报告（两字段均为 null）仍
+  按原样校验通过。
+
+### POST /api/meetings/{meeting_id}/demo/utterances — 演示输入
+
+> 会议室页底部的「模拟参会人发言」入口。把一条**人打的**发言变成**真实 FINAL**。
+> 它是**产品功能**，不是调试开关：没有 ESP32 / ASR 在场时，这是唯一能走通
+> 完整真实链路（FINAL → SSE → Meeting State → 水华队长唤醒）的方式。
+
+- Body：`{speaker: str, text?: str, trigger_captain?: bool, start_ms?: int,
+  duration_ms?: int}`。`text` 与 `trigger_captain: true` **必须给其一**。
+- **200**，返回服务端投影：
+  `{meeting_id, segment_seq, utterance_id, speaker, speaker_id, start_ms,
+  end_ms, text, triggered_captain}`。
+- **序号不由前端指定**：请求体里**没有** `segment_seq`（`extra="forbid"`，
+  带上即 422）。实现上它原封不动走既有 `asr_service.ingest_asr_event()` ——
+  也就是真实 ESP32 / Tencent ASR 那条路，因此 ordering / 幂等 / SSE /
+  Meeting State / 唤醒检测**没有第二套实现**可漂移。
+- `trigger_captain: true`（快捷发送）：文本由**服务端**用自身配置的唤醒词
+  （`CAPTAIN_WAKE_WORDS`）填入。前端刻意不持有唤醒词 —— 硬编码会在部署改措辞
+  后发一句唤不醒的话，且失败是静默的。
+- `speaker` 只映射为不透明 `speakerId`（进程内按出现顺序分配），**不承载身份
+  语义**；ADR-002 禁止裁判报告呈现人名 / 职位，UI 标签不会反向变成归因依据。
+- **409**：Meeting 状态不是 `IN_PROGRESS` / `FINALIZING`。**404**：会议不存在，
+  或 `DEMO_INGRESS_ENABLED=false`（能力被移除，不是权限不足）。
+- 时间轴单调：`start_ms` 只被当作**下界**（`max(start_ms, 上一条 end_ms)`）——
+  `captain/context.py` 依赖 ASR 相对时间的正序性来裁剪窗口。
+
+---
+
 ## 2. Internal Transcript Ingress（`/api/internal`）
 
 > 供 ASR / Mock Transcript Producer 调用；是跨团队正式契约。PRD §21 / §48。
@@ -322,10 +454,14 @@ Receive → Validate(status/meeting/seq) → Idempotency Check → Persist → C
   产出（见 §4 Step 状态；payload 仅 `{version,status}`，非 durable，不回放）。
   `meeting.state.updated` 在 **Step UI-INTEL-1** 产出（同上：payload 仅
   `{version,status}`，非 durable，不回放）。
+  `captain.completed` / `captain.failed` 在 **ADR-002 Phase 2-A** 产出（见 §1
+  水华队长；**非 durable，不回放**，但 payload 直接携带报告内容 —— 见该节说明）。
 - **稳定 SSE id（Part 13）**：FINAL = `final:<meeting_id>:<segment_seq>`。
   Meeting State 变更 = `state:<meeting_id>:<version>:<status>`（**必须带 status** ——
   FAILED 刻意不推进 version，仅凭 version 无法区分同 version 下的
   `ACTIVE@N` 与 `STALE@N`；见 `protocols/realtime-events.md §4`）。
+  水华队长报告 = `captain:<meeting_id>:<report_id>:<completed|failed>`（按
+  `report_id` 索引，非 version —— 报告由触发锚点去重，不在 version 体系内）。
 - **PARTIAL 不重放**（Part 12）：只 live 推送，断线后不补。
 - `TRANSCRIPT_STREAM_END` **不广播**（PRD §30 未列出，契约不可扩展）。
 - `Last-Event-ID` header **未实现**（Part 14）：`after_segment_seq` 是唯一恢复游标。

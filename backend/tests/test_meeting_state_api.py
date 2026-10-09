@@ -693,6 +693,12 @@ class TestLegacySseUnaffected:
         `SSEEventEnvelope.event_type` is a closed Literal, so this is also a
         typing-level guard: an undeclared publish is a construction error rather
         than a silent runtime surprise.
+
+        This set is the BACKEND leg of the CLAUDE.md three-place sync rule. When
+        a new type is added here, the frontend whitelist
+        (`utils/sse.ts::SSE_EVENT_TYPES`) and type (`types/sse.ts::SseEventType`)
+        must be updated in the same change, or the frontend silently drops the
+        event and `npm run typecheck` fails on the exhaustiveness guard.
         """
         from typing import get_args
 
@@ -707,5 +713,13 @@ class TestLegacySseUnaffected:
             "summary.completed",
             "summary.failed",
             "meeting.state.updated",
+            # ADR-002 Phase 2-A (水华队长)
+            "captain.completed",
+            "captain.failed",
+            # Task 6: the fast first pass of the two-stage referee. Declared as
+            # its own event rather than a sub-field of captain.completed so that
+            # "the report is durable" and "a first answer exists" stay
+            # distinguishable at the transport layer.
+            "captain.quick_assessment",
             "heartbeat",
         }

@@ -297,7 +297,10 @@ class _AsrReceiver(threading.Thread):
                     )
                     return
 
-                if response.get("sentences"):
+                # ``result`` is the real /asr/v2 shape (one sentence per message,
+                # text in ``voice_text_str``, lifecycle in ``slice_type``);
+                # ``sentences`` is the legacy list shape. Both are accepted.
+                if response.get("sentences") or response.get("result"):
                     sentences = result_parser.print_sentences(
                         response, debug=self._debug, device_id=self._device_id
                     )

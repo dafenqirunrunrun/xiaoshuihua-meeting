@@ -1,797 +1,268 @@
-# 小水华会议助手 MVP V0.1
+# 小水华会议助手
 
-企业内部 AI 会议记录工具。MVP 只跑通两条主链路：
+企业内部 AI 会议记录工具。
 
-1. 实时会议转写（ASR → Backend → SSE → React 实时字幕）
-2. 会后 AI 会议纪要（FINALIZING → Transcript Freeze → LLM → Result）
+核心链路：
 
-## 读取顺序（每次改代码前必读）
+1. 实时转写
+ESP32/Audio
+→ ASR
+→ Backend Transcript
+→ SSE
+→ React
 
-```text
-1. CLAUDE.md               ← 本项目入口
-2. prd.md                  ← 业务 / 状态机 / 契约 / 验收 事实源
-3. docs/architecture.md    ← 已定架构
-4. docs/api-contract.md    ← 已定 API / SSE / Transcript 契约
-5. docs/decisions/         ← Accepted ADR
-6. fronted_designer.md     ← 前端页面 / 组件 / 视觉
-```
+2. 会后纪要
+Meeting FINALIZING
+→ Transcript Freeze
+→ LLM Summary
+→ Result
 
-## 优先级（冲突时）
 
-```text
+# 开发前必读
+
+按顺序：
+
+1. prd.md
+   产品需求、状态机、验收标准
+
+2. docs/architecture.md
+   系统架构与设计原则
+
+3. docs/api-contract.md
+   API / SSE / Transcript协议
+
+4. protocols/
+   ASR与实时事件协议
+
+5. docs/decisions/
+   ADR决策记录
+
+6. docs/handoff.md
+   当前系统边界与未完成事项
+
+7. docs/progress.md
+   开发进度
+
+
+# 优先级
+
+冲突时：
+
 PRD
 >
-Accepted ADR / architecture
+ADR / architecture
 >
-api-contract
+API contract / protocols
 >
 frontend design
 >
-existing implementation
-```
-
-除非用户明确要求，否则不得擅自推翻 Accepted 架构决策。
-
-## 技术栈
-
-- 前端：React + TypeScript + Vite + Zustand + Ant Design + Axios + SSE
-  （禁止替换为 Vue / Pinia / Element Plus / Next.js / Redux）
-- 后端：Python 3.11+ / FastAPI / Pydantic / Uvicorn / httpx / SQLAlchemy
-- LLM：公司内部 DeepSeek V4.1 Flash（统一抽象 LLMProvider）
-- DB：MVP 用 SQLite（Repository 层 DB 无关，后续可换公司数据平台）
-
-## MVP 范围
-
-只做：Create → Meeting Room → Transcript(PARTIAL/FINAL) → 持久化 → SSE → Finish → FINALIZING → STREAM_END → Freeze → LLM Summary → Result。
-
-不做：Agent / Multi-Agent / Memory / RAG / Discussion Node / Todo / Decision /
-向量库 / 真实麦克风音频 / 语音采集 / 声纹身份映射 / 复杂权限 / AI Chat 等。
-
-## 核心不变式
-
-1. Transcript 是会议唯一事实源；Summary 是 AI 派生结果。
-2. PARTIAL 只做实时展示，不得写正式 `transcript_segment` 表。
-3. FINAL 是唯一可持久化的正式事实（先持久化成功，才能广播 SSE；SSE 广播失败不回滚已提交事务）。
-4. Meeting 状态机只有四态：CREATED → IN_PROGRESS → FINALIZING → COMPLETED。
-   禁止新增 `FINALIZING_FAILED` / `FAILED`；Summary 失败用 `summary.status = FAILED` 表达。
-5. 结束会议必须进入 FINALIZING；必须等待最后 FINAL + `TRANSCRIPT_STREAM_END` +
-   完整性确认后才能 Freeze，Freeze 后才允许调 LLM。禁止用固定 `sleep` 等 ASR 尾包。
-6. 前端恢复模型固定为 `GET Meeting → GET Transcript Snapshot → 订阅 SSE 增量`。
-   SSE 不是事实源；前端断连/刷新/关闭不得影响 Backend 接收与保存。
-7. Backend 是 Meeting State + Transcript 的事实源；Frontend 只是 Consumer / Observer。
-8. 当前不接真实 ASR：Mock Transcript Producer 模拟 PARTIAL / FINAL / TRANSCRIPT_STREAM_END。
-   Backend 只定义并实现 Transcript Event 接收契约。
-9. 浏览器不是实际录音源时，禁止做假的麦克风选择器。
-10. LLM 必须经过 Provider 层；API Key 不进前端；日志不输出密钥。
-
-完整清单见 `prd.md §61` 与 `docs/architecture.md`。
-
-## Step 进度
-
-- **Step 5 已完成**：Gap-free SSE Incremental Stream + Snapshot → SSE Recovery
-  （`GET /api/meetings/{meeting_id}/events`，StreamingResponse）。
-- SSE 正式不变式（见 `docs/architecture.md §8.3` 与 `ADR-001 D12`）：
-  - Commit-before-publish：FINAL = `Persist → Commit → Publish`；SSE 失败不回滚业务事务。
-  - Gap-free handoff：FINAL ingest 与 SSE `connect()` 共用同一 per-meeting lock；
-    connect 在锁内"先读 catch-up、后注册订阅" → Snapshot/Catch-up/Live handoff 不丢、
-    不因 connect race 双投。**非端到端 exactly-once**：Consumer 用
-    `final:<meeting_id>:<segment_seq>` 去重。
-  - PARTIAL 只 live 推送、不重放；`TRANSCRIPT_STREAM_END` 不广播（PRD §30 未列出）。
-  - EventBroker 进程内（非 durable log）；慢消费者队列满 → 驱逐，绝不阻塞 Producer。
-  - 心跳 `settings.sse_heartbeat_interval`；`after_segment_seq` 是唯一恢复游标
-    （`Last-Event-ID` 未实现）；`after_segment_seq < 0` → 400。
-- 测试：`backend/scripts/test_sse_step5.py` 21/21 PASS + 2 parser 单测。
-- **Step 6 已完成**：Transcript Freeze + Finalization Readiness（后端）。
-  - freeze = persisted `transcript_stream` ACCEPTED 行（`status=ACCEPTED` +
-    `last_segment_seq`）作为 durable freeze boundary；**no schema change**，
-    不新增 `frozen` / `finalization_ready` / `FROZEN` 字段，`ACCEPTED` 不改名。
-  - 双维度 ingest 门控：`meeting.status` 管生命周期；（freeze 后）
-    **PARTIAL after freeze → 409**（进 cache 前）；**new FINAL after freeze → 409**；
-    **canonical FINAL retry → 200**。
-  - **clear cache only after freeze commit**（`clear_meeting`）；完整性检查失败
-    （gap/overrun 409）不得清理。
-  - **readiness 从 DB 派生**（service 层）：`stream_service.get_finalization_readiness`
-    / `stream_service.is_finalization_ready`，不新增持久化字段 / 公开 API。
-  - **meeting remains FINALIZING**；`FINALIZING → COMPLETED` 由 Step 7 Summary
-    Pipeline 在 `summary.status` 终态（COMPLETED/FAILED）后驱动，不新增 Meeting FAILED。
-- 测试：`backend/scripts/test_finalize_step6.py` 21/21 PASS；
-  Step 5 regression 21/21 PASS；parser 2/2 PASS。
-- **Step 7A 已完成**：LLMProvider + DeepSeekProvider + Summary Generation Pipeline（后端）。
-  - 业务层只依赖 `LLMProvider` 协议（`app/services/llm/base.py`）；`DeepSeekProvider`
-    env-only 配置、**未配置 key 是 lazy 失败**（仅首次 `complete()` 抛，不阻断启动）；
-    `FakeProvider` 为**默认测试基础设施**（离线确定性）；`LLMProviderFactory` 依据
-    `settings.llm_provider` 解析（`fake` 默认 / `deepseek`）。测试注入 `generate(..., provider=...)`。
-  - **只有 Freeze 过的 Transcript 能进 LLM**（D6/D13）：meeting 存在 + FINALIZING +
-    `is_finalization_ready()`；输入只从**持久化 FINAL**（`list_sorted ASC`），PARTIAL 永不进 prompt。
-  - **Phase A/B/C —— 不锁长事务**：A 锁内门控+幂等+upsert GENERATING → B **无锁无事务**
-    调 LLM（httpx 同步）+ `MeetingSummarySchema` Pydantic 校验（成功判据）→ C 锁内回写终态。
-  - **有界重试 + repair prompt**：`SUMMARY_MAX_ATTEMPTS`（默认 2）；校验失败→带失败原文
-    +具体错误的 repair prompt 重试；Provider 级失败（超时/5xx/未配置）不 repair 直接 FAILED。
-  - **无静默截断**：`MAX_TRANSCRIPT_CHARS` 硬上界，超限 → FAILED（reason=too large）。
-  - **幂等**：初始生成 `version=1`，`UNIQUE(meeting_id, version)`；同 version 已终态
-    （COMPLETED/FAILED）重复 generate → **no-op 不覆盖**；并发 double-generate Phase C 同锁裁决。
-  - **失败不传导**：仅 `summary.status = FAILED`；**Meeting 保持 FINALIZING**
-    （`FINALIZING → COMPLETED` 是 Step 7B，summary 终态后驱动）；崩溃遗留 GENERATING 行可 resume。
-  - 明确不做：无 HTTP 端点（GET /summary 等）、无 SSE `summary.*`、无 BackgroundTasks /
-    Celery / Redis / Kafka 队列、无真实 ASR。
-  - 测试：`backend/scripts/test_summary_step7a.py` 28/28 PASS；
-    Step 6 regression 21/21 PASS；Step 5 regression 21/21 PASS；parser 2/2 PASS。
-- **Step 7B 已完成**：Finalizer + Summary API + Summary SSE + Meeting Completion（后端）。
-  - **触发链**：首个 accepted STREAM_END（`newly_accepted=True`）→ FastAPI
-    **BackgroundTasks** 调 `finalizer_service.run_finalizer_background`（**进程内 MVP
-    触发，≠ durable job queue**；durable 事实在 DB，可重跑恢复，无启动期全库扫描）。
-    相同 STREAM_END retry → `newly_accepted=False`，**绝不重跑 LLM（不重付模型成本）**。
-  - **Finalizer**（`finalizer_service.finalize_for_meeting`）：不重实现 Summary
-    管线（调用 Step 7A `summary_service`）；幂等（COMPLETED 早退 / 终态 v1 no-op /
-    `complete_after_summary` 幂等）；**崩溃缺口可恢复**（显式含"summary 终态 +
-    meeting FINALIZING"= 合法可恢复状态，重跑零 LLM）。
-  - **Meeting COMPLETED 只在 Summary 终态后驱动**（COMPLETED **或 FAILED** 都驱动；
-    绝不新增 Meeting FAILED / FINALIZING_FAILED，D1）。`meeting_service.complete_after_summary`
-    是**唯一**完成路径（FINALIZING→COMPLETED / COMPLETED 幂等 / CREATED·IN_PROGRESS 409）；
-    路由层永不直接写 `status=COMPLETED`。
-  - **Provider 工厂 fail-closed（§1/§24）**：未知 `LLM_PROVIDER` → `LLMConfigurationError`
-    （`app/services/llm/base.py`），**绝不回落 FakeProvider**；生成管线当作 provider 级
-    失败 → summary FAILED（零 fake 纪要）。
-  - **GET /api/meetings/{id}/summary**：最新版本 durable 恢复快照
-    （GENERATING/COMPLETED/FAILED 200；meeting 缺失 404 / 无 summary 404）。
-  - **POST /api/meetings/{id}/summary/regenerate** → **202** `{version:vN+1, status:
-    GENERATING}`；同步分配 GENERATING 行 + `summary.started`，BackgroundTasks 后台跑
-    Phase B/C（**自有 session**）；latest GENERATING → 409；版本 **append-only**
-    （v1→v2→v3，never overwrite）；**meeting 永不退出 COMPLETED**；输入仍只用持久化
-    FINAL ASC（`stream_service.is_frozen` 状态无关门控，D6 在 COMPLETED 仍成立）。
-  - **Summary SSE**：`summary.started / completed / failed`（既有 EventBroker）；
-    payload 仅 `{version,status}`（**绝不含** raw_model_output/堆栈/API key/prompt）；
-    稳定 id `summary:<meeting_id>:<version>:<started|completed|failed>`；
-    **非 durable、不回放**（重连用 GET /summary）；commit-before-publish（SSE 失败
-    不回滚 DB）；顺序 `summary.started → summary.completed|failed → meeting.status(COMPLETED)`。
-  - **canonical FINAL retry 跨 COMPLETED 边界仍 200**（幂等重发 ≠ append；
-    新 FINAL / PARTIAL 在 COMPLETED 仍 409）——`transcript_service` 的 `_existing_final`
-    短路。
-  - 不改 Step 5 恢复协议（Snapshot + `after_segment_seq` 原样；无
-    after_summary_version / durable SSE replay / Last-Event-ID）。
-  - 明确不做：React/Zustand/Result Page/真实 ASR/Celery/Redis/Kafka/启动期调度。
-- **Step 8A 已完成**：React Frontend Foundation（前端基础设施）。
-  - 技术栈落地（固定，禁换）：React 18 + TypeScript + Vite 5 + React Router 6
-    + Zustand 4 + Axios + Ant Design 5 + @ant-design/icons。
-  - 目录结构（对齐 `fronted_designer.md §45`）：`src/app`（App + router）/
-    `layouts`（AppShell）/ `pages`（Home · Meetings · MeetingRoom · MeetingResult ·
-    Settings · NotFound）/ `components` / `hooks`（8B 用）/ `stores`（meetingStore）/
-    `api`（http · meeting · transcript · summary）/ `types` / `utils` / `styles`。
-  - **API Client 只对后端实际契约封装**（未猜）：`createMeeting` / `getMeeting` /
-    `startMeeting` / `finishMeeting` / `getTranscriptSnapshot` / `getSummary` /
-    `regenerateSummary`；`http.ts` 统一 Axios + 极薄错误归一化
-    （http status / backend detail / network error，`ApiError`）。
-  - **Types 严格映射后端 schema**：`meeting`（四态 CREATED / IN_PROGRESS /
-    FINALIZING / COMPLETED，**无 FINALIZING_FAILED**）/ `transcript`
-    （TranscriptSegment / TranscriptSnapshot / PartialUtterance）/ `summary`
-    （MeetingSummary · SummaryStatus / RegenerationAccepted）/ `sse`
-    （SseEventType / SseEnvelope / StreamStatus）。
-  - **Zustand store（8A 仅 shape + reset，redducer 8B 填）**：`meeting` /
-    `finalSegments`（FINAL）/ `partialUtterances`（keyed by utterance_id，
-    PARTIAL）/**两者硬分离** / `summary` / `streamStatus` / `resetMeetingState`。
-  - **路由**（fronted_designer §7）：`/` / `/meetings` / `/meetings/:meetingId` /
-    `/meetings/:meetingId/result` / `/settings`；`AppShell` 侧栏 = 首页 · 会议 · 设置。
-  - **Design Token**：`src/styles/designTokens.ts` → Ant Design `ConfigProvider theme`
-    统一入口（色值来自 fronted_designer §47，零散 magic number 只在一处）。
-  - **Vite proxy**：`/api → http://127.0.0.1:8000`（业务代码不硬编码后端 host）；
-    `VITE_API_BASE_URL` 仅作部署覆盖；`.env.example` 提交、真实 `.env` 禁止提交。
-  - Home 页真创建（POST /meetings + /start → navigate(`/meetings/${id}`)）；
-    Meetings 页为 **MVP 占位**（后端无 GET /meetings 列表，不改后端加接口）。
-  - Home / Meetings / MeetingResult / MeetingRoom / Settings 均为 Step 8A 骨架
-    （SSE / Snapshot 恢复 / Summary 渲染在 8B/8C）。**不做前端 Mock Stream 主路径
-    （VITE_USE_MOCK_STREAM）** —— 8B/8C 直连真实后端（真实 HTTP/SSE + Mock
-    Producer + Fake LLMProvider）。
-  - 验证：`npm install` + `npm run typecheck` + `npm run build`（vite build PASS）；
-    `npm run dev` 起 5173，`/ /meetings /settings /meetings/test /meetings/test/result`
-    路由可达（SPA fallback 200），Vite proxy `/api/health → 8000` 连通。
-  - **Backend 零修改**（Step 8A 未动 `backend/`）。
-  - 前端命令见下方「常用命令」。
-- **Step 8B-1 已完成**：Meeting Snapshot + CREATED pre-meeting 态（`7bf6af4`）。
-- **Step 8B-2 已完成**：Start / Finish Lifecycle（`31a6ba9`）。
-  - 创建 ≠ 开始：CREATED 展示「开始会议」→ POST /start → IN_PROGRESS；
-    IN_PROGRESS 展示「结束会议」（Popconfirm）→ POST /finish → FINALIZING。
-  - Server 是 Source of Truth：start/finish 均以 backend 返回的 Meeting 覆盖 store，
-    前端绝不自行写 status / started_at / COMPLETED；错误展示后端 409 detail。
-  - FINALIZING / COMPLETED 无 start/finish 按钮；finish ≠ completed（绝不预置 COMPLETED）。
-- **Step 8B-3 已完成**：Transcript Snapshot（`ae17b38`）。
-  - GET Meeting 成功 → GET /transcript Snapshot → `setFinalSegments`（FINAL 仅 ASC）。
-  - Snapshot 是已持久化 FINAL 的历史事实源；CREATED 不拉；IN_PROGRESS/FINALIZING/
-    COMPLETED 均可看历史。失败只影响 Transcript 区（轻量重试），不动 meeting。
-- **Step 8B-4 已完成**：Realtime Transcript SSE + Auto Scroll（文档见 `architecture.md §6.1`）。
-  - **恢复模型**：GET Meeting → GET Transcript Snapshot → `maxSegmentSeq` →
-    `GET /events?after_segment_seq=maxSeq`（Snapshot FIRST，SSE 只是通知通道）。
-  - `useMeetingStream`：EventSource 生命周期 + 断线 Snapshot-recovery 指数退避
-    （1s/2s/4s/8s/max10s）+ `meeting.status → GET Meeting` 覆盖 store（不猜状态）。
-  - `useMeetingStream.ts` store：`upsertPartial`（utterance_id 原地覆盖）/
-    `removePartialUtterance`（FINAL 落定删除）/ `clearPartialUtterances`（恢复前清空）/
-    `setStreamStatus`；FINAL 去重以 `segment_seq` 为准 + 保持 ASC。
-  - CREATED / COMPLETED 不连流；Finish → FINALIZING **不关流**（trailing FINAL 仍收）；
-    unmount / meetingId 变化 close + 清游标；StrictMode 单 EventSource（gen 计数）。
-  - `useAutoScroll`：底部附近跟随 / 向上查历史暂停 + 「回到底部」/ 首次 instant。
-    纯 UI，不影响数据语义。PARTIAL 次级轻量（opacity），FINAL 正式稳定。
-  - **Backend 零业务修改**；未处理 summary.* 事件（8C）。
-- **Step 8B-5 已完成**：Meeting Workspace UI Polish（`style(frontend): polish meeting workspace experience`，未 push）。
-  - **纯展示层**：不改变任何数据语义 / SSE 协议 / store 结构 / 四态机（8B-1~8B-4 逻辑原样保留）。
-    视觉体系 = 冰蓝工作台：Primary `#3478F6` / AI-Live Mint `#20B486` / Page BG `#F6F9FC` /
-    Card `#FFF` / Border `#E8EEF5` / Text `#172033·#48556A·#8A97AA`；radius 10/12/16；
-    内容 max 1200px；边框优先、阴影极弱（hover 略升）。
-  - **Design Tokens**（`designTokens.ts` 唯一数据源）：新增 `colorMint/colorMintLight`、
-    `shadowCard/shadowCardHover`、`motionFast/motionBase`、`railWidth`；`antdTheme`
-    Menu/Button/Card/Tabs 圆角对齐。CSS 变量见 `global.css :root`。
-  - **Home Hero**：左文右画 ——「小水华，让每一次会议更清晰」+ 唯一 Primary CTA「创建会议」
-    + 次级「查看会议」；`HeroIllustration.tsx`（inline SVG：浮起转写卡片 / 波形 live 线 /
-    呼吸圆点 / 植物，`pointer-events:none`，窄屏淡出）。最近会议保持真实空态。
-  - **Meeting Room 四态展示**（数据逻辑零改动）：CREATED = 圆形麦克风 + `ripple-ring`
-    呼吸环 +「开始会议」（真实 handleStart）；IN_PROGRESS = `● 实时记录` + hint
-    「AI 实时转写 · 自动保存」；FINALIZING =「正在整理会议」+ 三态指示条
-    （✓会议已结束 / ●转写收尾中 / ○AI纪要等待生成，无 fake 百分比）；COMPLETED =
-    「会议已完成」横幅 +「查看会议结果」CTA（`navigate(/meetings/:id/result)`）。
-  - **Transcript**：FINAL = meeting-notes（speaker 弱化小字 + 正文次行，非聊天气泡）；
-    PARTIAL = 次级轻量 + 小薄荷 live 点 +「识别中」+ 原地覆盖；FAB 悬浮右下。
-  - **微交互（CSS-only）**：按钮 hover -2px / active 0.98、卡片 hover 上升阴影增强、
-    侧栏选中浅蓝胶囊 + hover 图标轻推、FAB 出现轻升 / 点击微压、live-dot 2.2s 呼吸；
-    `@media (prefers-reduced-motion: reduce)` 全停 transform / 脉冲 / 平滑滚动。
-    无 Framer Motion / GSAP。
-  - **Responsive**：`≥1200` 双列 / `900–1199` 窄轨 260px / `<900` 单列 + 右轨下移；
-    hero 插画窄屏淡出；无横向滚动。
-  - **侧栏**：品牌 + 导航（选中浅蓝胶囊）+ 底部 tagline「让每一次会议，都有回响。」
-    （浅薄荷装饰板）。
-  - **Meetings / Settings / Result**：头部 + 副标题文案；Meetings 真实空态；Settings
-    分组入口（模型设置 / 数据管理 / 关于我们），无 API Key 输入；Result 双 Tab + 四区
-    纪要骨架原样。
-  - **验证**：`npm run typecheck` PASS + `npm run build` PASS；7 张截图（Home /
-    Meetings / Room-CREATED / IN_PROGRESS / FINALIZING / Result / Settings）通过
-    headless Chrome 生成；UI-01~UI-14 回归（创建 / 开始 / PARTIAL / FINAL / 结束 /
-    FINALIZING / COMPLETED / 结果页跳转）实测通过；**Backend 零修改**。
-  - 明确不做：fake 数据（无会议列表 / 头像 / 时间戳 / 摘要）、动画库、API Key 输入；
-    不进入 8C。
-- **Step 8B-6 已完成**：Meeting Discovery & Resume（`e51a97d` + `7870978` + `c70ea10`）。
-  - 后端 `GET /api/meetings`：`status?/limit?/offset?` 过滤 + 分页（默认 20 / 最大 100），
-    复用 `MeetingOut`；排序 `updated_at DESC, created_at DESC`；路由先于 `GET /{id}`；
-    非法 status/limit/offset → 422。测试 `backend/scripts/test_list_meetings.py` 17/17。
-  - **Resume = 导航不是生命周期**：`/meetings/:id` 进入 = GET Meeting → Snapshot → SSE；
-    Meeting 从不 Pause（无 PAUSED / POST /resume）；离开页面 ≠ 结束/暂停（header
-    「返回会议列表」纯导航）。
-  - Home 发现（Active IN_PROGRESS/FINALIZING ≤3 + Recent CREATED/COMPLETED）与
-    Meetings 真实列表（状态 Tabs → 后端 status 过滤；状态 CTA：继续准备 / 继续会议 /
-    查看收尾 / 查看结果）。无 user isolation。
-  - 修复：`useMeetingList` 依赖稳定标量（`e0e3372`）—— 修复首页无限请求循环抖动；
-    Result 页加「返回」按钮（navigate(-1) / fallback /meetings）。
-  - 验证：后端回归全绿（list 17 + step5 21 + step6 21 + step7A 28 + step7B 36）；
-    typecheck + build PASS；浏览器四态 resume + 各 Tab 过滤实测。
-- **Step 8C-1 已完成**：Summary Snapshot & Real Result Page。
-  - Result 页 = 归档阅读态，恢复模型 `GET Meeting → GET Summary Snapshot（latest） →
-    GET Transcript Snapshot（仅 FINAL ASC）`，刷新后从 Backend 全量恢复，不依赖
-    Zustand 残留；**不连 Transcript SSE、不消费 summary.\* SSE**（实时更新留 8C-2）。
-  - 三个数据域独立 load/error/retry：Meeting（useMeetingLoad 复用）/ Summary
-    （`useMeetingSummary`）/ Transcript（`useTranscriptSnapshotResult`）。任一失败
-    不拖垮其它域。
-  - Summary 状态展示（actual enum NOT_STARTED/GENERATING/COMPLETED/FAILED）：
-    COMPLETED 分节（概述/核心议题/结论/未决）；GENERATING/NOT_STARTED/FINALIZING
-    → 「AI 纪要正在生成」+ 手动「刷新状态」；FAILED → 「生成失败」，Meeting 仍
-    COMPLETED，Transcript 仍可看；404 区分 meeting 不存在 vs summary 未生成。
-  - 只展示 latest version（弱位置 vN），无版本切换 / 无 Regenerate（8C-3）。
-  - **Backend 零修改**；前端仅 Result 页 + 2 个新 hook + global.css 补 classes。
-  - 验证：完整 Happy Path 实测（meeting_092bbe38，3 FINAL → COMPLETED → summary v1
-    COMPLETED），浏览器覆盖 C1-01~C1-15（含 F5 refresh 恢复、Meetings→查看结果、
-    FINALIZING not-ready、FAILED、404、网络错误独立 retry）。
-- **Step 8C-2 已完成**：Summary Realtime SSE（Result 页实时通知，`feat(frontend): stream summary generation status`）。
-  - **SSE 只当通知通道，GET /summary 是 durable 事实源**：summary.started / completed /
-    failed / meeting.status 到达 → 只触发 GET（/summary 或 /meeting），**绝不**把 SSE
-    `{version,status}` payload 直接当 Summary 渲染（summary events 非 durable、不回放）。
-  - 新 hook `useSummaryResultStream`（Result 专用，**不复用/不碰 useMeetingStream**）：
-    仅 summary 非 terminal（meeting FINALIZING，或 COMPLETED + summary GENERATING）
-    才连 SSE；terminal 后关闭；断线恢复 = 指数退避（1s/2s/4s/8s/max10s）+ **GET /summary**
-    → 已 terminal 则不重连，否则重建；StrictMode gen 计数保证单 EventSource。
-  - Result 页 `useSummaryResultStream` + `useMeetingSummary`（重 GET）协作：摘要生成中
-    显示「AI 纪要正在生成」（不造假进度）→ summary.completed 到达 → 自动 GET → 渲染
-    真实持久化摘要；手动「刷新状态」保留为 fallback（降权）。
-  - **不消费 transcript.partial/final**（Result 归档态）；不调用 regenerateSummary
-    （8C-3 加按钮）；不暴露 SSE 技术细节给用户。
-  - **Backend 零修改**；前端仅 `useSummaryResultStream.ts`（新建）+ MeetingResultPage
-    （接 hook）。
-  - 验证：后端回归 7A 28/28 + 7B 36/36 PASS；typecheck + build PASS；浏览器 E2E
-    （新建 FINALIZING → Result 页停留 SSE 已连 + 「AI 纪要正在生成」→ 后台 stream-end
-    → **无刷新**自动转真实摘要 COMPLETED + terminal 后 SSE 关闭）；COMPLETED 页不连
-    SSE + 刷新恢复摘要；FAILED 页显示生成失败且不连 SSE。
-- **Step 8C-3 已完成 ✅**：Regenerate Summary（主动重新生成纪要）。
-  - 入口：Result 页会议纪要区标题行右侧「重新生成纪要」（secondary button +
-    Popconfirm「重新生成会创建一个新的纪要版本，当前纪要不会被删除。」/ 取消 / 重新生成）。
-  - **Meeting 全程 COMPLETED**：绝不 `COMPLETED → FINALIZING`，不改 lifecyle；
-    Transcript 不受影响（仍用已冻结的持久化 FINAL，不重传 / 不重连 live SSE）。
-  - **版本 append-only，唯一分配者是 Backend**：v1 → v2 → v3…，旧版永不覆盖；
-    前端**绝不** `version++`、不猜版本号。
-  - 两种 loading 严格分离：`submitting`（POST 在飞，「正在提交…」）vs
-    `generating`（latest=GENERATING，按钮禁用 + Banner）；GENERATING 期间**不清空**
-    旧纪要（`lastGood` 保留 + 「正在生成新版纪要」Banner）。
-  - **SSE 重建（§9 关键）**：v1 terminal 时 8C-2 已关流 → POST 后立刻 GET /summary
-    → 发现 latest=GENERATING → `terminal` 转 false → `useSummaryResultStream` 自动重连。
-  - 失败不传导：网络错误只表示"请求失败"（绝不置 Summary=FAILED）；409 →
-    「纪要正在生成中，请稍候。」+ GET /summary 同步；Meeting 仍 COMPLETED。
-  - 修复（后端最小修复，Step 7B 遗漏）：`run_regenerate_background` 原先**从不发**
-    `summary.completed|failed` → 重新生成完成后页面永远收不到终态。已按 Finalizer
-    同构补齐（终态 durable 后发布，commit-before-publish）。
-  - **修复（前端关键缺陷，影响 8B + 8C-2/8C-3）**：后端 `_render_frame` 发**具名帧**
-    （`event: <event_type>`），按 SSE 规范具名帧**不触发 `onmessage`**，而两个 hook
-    都只监听 `message` → 8B 实时字幕与 8C-2 summary.* 通知**全部静默失效**。
-    新增 `frontend/src/utils/sse.ts` `subscribeSseEnvelopes()` 逐事件名订阅，
-    `useMeetingStream` + `useSummaryResultStream` 改用它。**Backend 零改动**。
-  - 验证：8C-3 E2E 24/25（唯一"失败"为冷刷新下无旧内容可显示，符合 §19）；
-    边界 E2E 32/32 PASS（FAILED / 409 / 网络错误 / 导航离开回来 / Transcript 回归）；
-    8B 实时字幕回归 6/6 PASS；后端回归 7A 28/28 + 7B 36/36 + Step6 21/21 +
-    Step5 21/21 + list 17/17；typecheck + build PASS。
-- **Step 8C Summary Frontend Chain 完成 ✅**（8C-1 Snapshot + 8C-2 Realtime +
-  8C-3 Regenerate）。
-- **Step ASR-0A 已完成**：Transcript Input Adapter & Mock Contract Integration。
-  - **ASR Boundary**：`Audio/Tencent ASR → Normalized PARTIAL/FINAL → External DTO
-    → Adapter → Ingress → 既有 Transcript Domain → SSE → React`。provider-specific
-    格式**止步于 Adapter**；内部 Domain 保持 snake_case，未因接协作者格式改成 camelCase。
-  - **两个 ingress 并存**：既有 `POST /api/internal/.../transcript-events`（内部契约、
-    snake_case、`segment_seq` **仍 Producer-owned**）**零改动**；新增
-    `POST /api/internal/meetings/{id}/asr-events`（外部协作者、camelCase、
-    `extra="forbid"`、**无 segmentSeq**）。
-  - **segment_seq = Transcript-owned（仅新路由）**：FINAL 由 `asr_service` 在
-    `meeting_lock` 内分配 `max + 1`；**幂等重试复用已存 seq**（否则会撞
-    `UNIQUE(meeting_id, segment_seq)`）。**禁止 `segment_seq = sentenceId`**
-    （sentenceId 是 session 内编号，重连会重号）。
-  - **identity 分开**：`utterance_id = f"{asrSessionId}:{sentenceId}"`（PARTIAL 原地
-    覆盖 + PARTIAL→FINAL 交接）；`FINAL event_id` = 确定性摘要（含 meetingId，
-    因 `UNIQUE(event_id)` 全局）；PARTIAL event_id 混入 revision 内容，**不复用**该句
-    固定 id。`asrSessionId` 上限 48 保证派生 id ≤ 64。
-  - **Case A 不吞冲突**：同 event_id 但 canonical 内容不同 → **409**（沿用既有
-    `_ensure_identical`，未改语义）。
-  - **speakerId = -1 合法**（说话人暂未知）→ 内部 `unknown`，绝不产生 `speaker_-1`。
-  - **未落库 metadata（limitation）**：`provider` / `asrSessionId` / `sentenceId` 只
-    存活于 ingress 生命周期，**不新增 DB 列**；内部不硬编码腾讯（provider 不透明）。
-  - Mock Producer 改为模拟**协作者格式输出**（camelCase、sentenceId、speakerId=-1、
-    多段 PARTIAL、不发 segmentSeq），仍是纯外部 HTTP 客户端。
-  - **PENDING（未单方面锁死）**：① `STREAM_END` 双方契约（谁发/何时/payload/
-    `last_segment_seq` 归属）——继续用内部 mock 仅供回归；② multi-ASR-session
-    时间轴（重连时 startMs/endMs 是否重置）。
-  - **FUTURE**：multi-worker / MySQL 阶段，seq 分配须升级为数据库级安全机制
-    （现为进程内 `RLock`，仅 MVP 单进程成立）。
-  - **未改**：DB schema / 新 UNIQUE / migration / LLM Provider / DeepSeek /
-    Meeting 状态机 / Freeze 语义 / 既有 ingress / 前端业务代码。
-  - 测试：`scripts/test_asr_adapter.py` **ASR-A01~A20 20/20 PASS**；
-    `scripts/e2e_asr_browser.py` 真实 Chrome CDP **14/14 PASS**（named SSE 真实到达、
-    PARTIAL 原地覆盖、FINAL 替换、刷新 Snapshot 恢复、Summary 渲染、Regenerate v2）；
-    回归 Step5 21 + Step6 21 + Step7A 28 + Step7B 36 + list 17 全绿；
-    前端 typecheck + build PASS。
+implementation
 
 
-## 常用命令
+# 技术栈
 
-```bash
-# 后端
+Frontend:
+- React
+- TypeScript
+- Vite
+- Zustand
+- Ant Design
+- Axios
+- SSE
+
+
+Backend:
+- Python 3.11
+- FastAPI
+- SQLAlchemy
+- Pydantic
+- Uvicorn
+
+
+LLM:
+- Provider统一抽象
+- 禁止前端调用模型
+- 禁止泄露API Key
+
+
+Database:
+- MVP SQLite
+- Repository隔离DB实现
+
+
+# 核心不可破坏规则
+
+## Transcript
+
+1. Transcript 是唯一会议事实源。
+2. Summary 是AI派生结果。
+3. PARTIAL只用于实时展示，不落正式表。
+4. FINAL才能持久化。
+5. SSE不是事实源。
+
+
+## Meeting State
+
+状态机固定：
+
+CREATED
+→ IN_PROGRESS
+→ FINALIZING
+→ COMPLETED
+
+
+禁止新增状态。
+
+结束会议必须：
+
+最后FINAL
++
+STREAM_END
++
+完整性确认
+
+之后才能Freeze并调用LLM。
+
+
+## Frontend
+
+Frontend只是Consumer。
+
+恢复流程：
+
+GET Meeting
+↓
+GET Transcript Snapshot
+↓
+Subscribe SSE
+
+
+禁止前端自行推导会议状态。
+
+
+## Transcript Seq
+
+segment_seq由Backend生成。
+
+禁止使用ASR sentenceId。
+
+
+## LLM
+
+所有模型调用必须经过：
+
+LLMProvider
+
+禁止：
+- 前端调用
+- Fake fallback
+- 日志输出密钥/完整模型结果
+
+
+# SSE规范
+
+新增SSE事件必须同步：
+
+Backend:
+SSE_EVENT_TYPES
+
+Frontend:
+types/sse.ts
+
+Frontend:
+utils/sse.ts
+
+
+统一使用：
+
+subscribeSseEnvelopes()
+
+
+# 工程规范
+
+- commit-before-publish
+- 所有重试路径必须幂等
+- 可选字段失败不能导致500
+- MVP单进程，不支持多worker
+
+
+# 测试
+
+Backend:
+
+pytest tests/
+
+
+真实Provider测试：
+
+scripts/replay_real_provider*.py
+
+
+禁止：
+
+CI调用真实付费模型。
+
+
+# 常用命令
+
+Backend:
+
 cd backend
+
 .venv/Scripts/python -m uvicorn app.main:app --reload --port 8000
 
-# 依赖
-cd backend && .venv/Scripts/python -m pip install -r requirements.txt
 
-# 前端
+Test:
+
+.venv/Scripts/python -m pytest tests/ -q
+
+
+Frontend:
+
 cd frontend
-npm install
-npm run dev        # Vite dev server on :5173（proxy /api -> :8000）
-npm run typecheck  # tsc --noEmit
-npm run build      # tsc --noEmit && vite build
-```
 
-## 文档索引
+npm run dev
 
-- `prd.md` — 产品 / 技术契约 / 状态机 / 验收
-- `fronted_designer.md` — 前端设计
-- `docs/architecture.md` — 架构与原则
-- `docs/api-contract.md` — API / SSE / Transcript 契约（与实际实现一致）
-- `docs/decisions/ADR-001-mvp-architecture.md` — MVP 架构决策
-- **Step ASR-0B 已完成**：ASR Event Contract Freeze + E2E Acceptance。
-  - **定位**：ASR-0A 让系统"能吃下"协作者输入；ASR-0B 把口头约定变成**有回归保护的
-    冻结契约**。不接真实 ASR（V0.2），不改 MVP 产品范围。
-  - **两个 PENDING 处置**：
-    - **PENDING 1（STREAM_END）部分冻结**：`last_segment_seq` 归属已定（Transcript-owned，
-      改**可选** + `ge=0`，省略时后端派生 `max(seq) or 0`，提供时保留完整 gap/overrun 校验）；
-      **发送者身份与时机仍 PENDING**，MVP 由内部 mock 发（仅供 E2E，代码已标注非最终契约）。
-    - **PENDING 2（multi-ASR-session 时间轴）✅ 冻结**：`startMs/endMs` = **session-local
-      相对偏移**，跨 session **不可比较**；排序**永远只认 `segment_seq`**；MVP **不做 rebase**。
-      ⏳ V0.2 tech debt：会议级全局时间轴需先持久化 session 元数据（当前不落库）。
-  - **五个冻结决策**：① `last_segment_seq` 可选 + `ge=0` + 服务端派生；② `segment_seq`
-    继续 Transcript-owned，上游不必反向查询；③ 时间轴如上；④ **utterance 关闭**——同
-    utterance 一旦 FINAL 即 closed，后续 PARTIAL → **409** 且不进 live cache
-    （`transcript_service._ensure_utterance_open`，**领域级**，两个 ingress 同时生效）；
-    ⑤ `asrSessionId` maxLength=**48** 写入正式协议 + OpenAPI schema。
-  - **修复真实缺陷：空会议永久卡死**。创建 → 开始 → 直接「结束会议」→ 因
-    `Field(default=None, ge=1)` + 显式 `None → 400`，空会议 `0 → 422`、`1 → 409 missing [1]`，
-    **永久停留 FINALIZING**、无出口。修复：`ge=1 → ge=0` + 字段可选 + 派生 `max_seq or 0`
-    （`_find_gaps(last=0)` 为空，完整性算法本身无需改动）。**边界**：显式提供值时
-    gap/overrun 校验原样保留，这不是放宽校验。
-  - **`protocols/*.md` 升格为协议事实源**（原为 5 个 3 行占位）：README（优先级/变更流程/
-    三条铁律）+ `transcript-format.md` ✅ + `realtime-events.md` ✅ + `meeting-api.md` ✅
-    （均 FROZEN）+ `esp32-audio.md` ⏸（V0.2，列出开工前必答 6 问）。
-  - **Mock Producer 场景覆盖**（`--scenario`）：`happy` / `reconnect` / `duplicate` /
-    `out-of-order` / `errors`（9 项错误矩阵断言）/ `all`。仍是纯外部 HTTP 客户端，
-    **仅依赖标准库**（有回归断言保证不 import Backend 内部）。
-  - **internal ASR 独立 OpenAPI**：`GET /api/internal/docs`（Swagger UI）+
-    `GET /api/internal/openapi.json`，**从真实路由派生**（同一 router 构造临时 app）
-    故**不会漂移**；主 `/docs` 不变，此为附加视图。
-  - **E2E 验收链路**：`mock producer（子进程，真网络）→ asr-events ingress → Transcript
-    Domain → Snapshot → SSE（具名帧）→ Finalizer → Summary COMPLETED`，用**真实 uvicorn
-    子进程 + 临时 SQLite**（TestClient 绕开网络与 socket，无法证明 SSE 帧真的到达）。
-    ⚠️ 子进程 stdout **必须重定向到文件**，不可 `subprocess.PIPE`（access log 填满
-    未读管道会阻塞服务器，曾致整套测试挂起）。
-  - **pytest 收口 + CI 准备**：pytest 9.1.1 入 `requirements-dev.txt`；`backend/tests/`
-    （`conftest.py` 每测试新建 schema；env 必须在任何 `app.*` import **前**注入，因
-    `settings` 是 import 期单例）+ `test_asr_contract_freeze.py`（35）+
-    `test_asr_e2e_acceptance.py`（20）。**两套并存**：`scripts/test_*.py` 手写脚本仍是
-    早前 Step 的权威回归记录，**不删除**；CI 跑 `pytest` + `legacy-suites` **两个 job**，
-    避免早期回归被绿色 pytest 掩盖。`.github/workflows/backend-tests.yml`（Python 3.13，
-    全程离线，无需真实密钥）。
-  - 测试：**pytest 55/55 PASS**；`test_asr_adapter.py` ASR-A01~A20 20/20；
-    回归全绿（Step5 21 + Step6 21 + Step7A 28 + Step7B 36 + list 17）。
-  - **未改**：DB schema / 新 UNIQUE / migration / LLM Provider / DeepSeek /
-    Meeting 状态机 / Freeze 语义（仅 STREAM_END「终值来源」放宽）/ 前端业务代码
-    （本 Step 零前端改动）。
-  - 明确不做：真实 Tencent ASR / 音频采集 / ESP32 / PCM / 腾讯签名 / 真实 LLM Provider。
-- **Step AGENT-1 已完成**：Meeting State Agent（Streaming Transcript → 会议工作记忆）。
-  - **定位**：`Meeting State ≠ Final Summary`。State 是会议进行中的**工作记忆**
-    （随 FINAL 增量更新）；Summary 是会后一次性的派生结果。**本 Step 不重构 Summary**，
-    下一步（AGENT-2/后续）才考虑 `Meeting State → Final Summary Agent`。
-  - **范围授权**：`Agent` 原属 PRD §3.2/§56 与 arch §10「MVP 不做」。本 Step 按用户
-    **明确要求**实现，属授权范围变更，三处文档已同步标注（`prd.md §3.2` 变更记录 /
-    arch §10 变更记录 / arch §19）。其余各项（RAG / Memory / Multi-Agent / 向量库 /
-    跨会议问答 / LangGraph 等）**仍然不做**。
-  - **链路**：`ASR → Transcript Domain →（FINAL 首次提交）FinalApplied → 应用层
-    BackgroundTasks → Meeting State Consumer → Batch Buffer → LLM（Previous State +
-    New Batch）→ Pydantic 校验 → meeting_state upsert`。
-  - **三条边界（硬约束）**：① `asr_adapter` / `asr_service` **零 Agent 调用**
-    （禁止 `save_transcript(); call_agent()`）；② Agent **只读持久化 FINAL**
-    （`meeting_id`/`segment_seq`/`text`/speaker），**绝不**碰 provider raw payload /
-    `asrSessionId` / `sentenceId`；③ Agent 是**下游消费者**，FINAL 落库 + SSE 广播
-    在它被调度**之前**已完成 —— Agent 失败**绝不**阻塞 Transcript。
-  - **幂等（§4）**：游标 `last_processed_segment_seq`，只处理 `seq > cursor`。
-    游标与 `state_json` **同一次 commit** 写入，且**只在成功时推进**。
-    `FinalApplied` 机制保证幂等重试**不调度**（不重付模型成本）；并发 run 在 Phase C
-    锁内重读游标，不一致 → `SUPERSEDED` 丢弃本次结果。
-  - **Batch/Flush（§5）**：`select_batches` 返回 `(ready, remainder)`；**只有达阈值**
-    （`AGENT_BATCH_MAX_SEGMENTS` / `MAX_CHARS`）的批次才值得一次 LLM 调用，
-    **未达阈值的尾部继续缓冲**（提前 flush = 每句一次调用，正是要避免的）。
-    单次 run 上限 `AGENT_MAX_BATCHES_PER_RUN`。**无定时器 / 无后台线程**。
-  - **强制 Flush（§11）**：`POST /finish` → `force_flush=True`，用 `_chunk()` 把
-    **含尾部 remainder** 的全部 pending 按**同样阈值切分**后处理 —— **只解除批次数量
-    上限，不并成一条超大 prompt**（否则会被尺寸守卫拒绝，反而丢掉最该抢救的尾句）。
-  - **Persistence（§9）**：新增 `meeting_state` 表（**`create_all` 建表，无 ALTER /
-    无 migration**）：`meeting_id PK / version / last_processed_segment_seq /
-    state_json / status(EMPTY·ACTIVE·FAILED·FROZEN) / model_name / last_error /
-    timestamps`。**必须新表**：既有三表语义均不兼容「单行 · 原地更新 · 会中可用」
-    （meeting=四态生命周期；transcript_segment=append-only 事实；
-    meeting_summary=append-only 版本化终稿）。
-  - **Failure Policy（§18）**：失败 → `mark_failed` 记录 `last_error`，
-    **游标不推进 + `state_json` 不动 + version 不增长** → 下次触发**重放**该批。
-    Provider 级失败（超时/5xx/未配置/未知 provider）**不 repair**；仅形状级
-    （JSON/Pydantic）走有界 repair。**无静默截断**（超硬上界整批拒绝）。
-    `run_agent_background` **吞掉一切异常**，绝不让下游反噬转写路径。
-  - **Feature Flag（§17）**：`MEETING_AGENT_ENABLED`（默认 true）；置 false 后
-    ASR / Transcript / SSE / 既有 Summary **行为与变更前完全一致**，
-    Agent 不构成新的单点故障。
-  - **Observability（§15）**：每次 run 一行结构化日志（`meeting_id` / `agent_run_id` /
-    `from..to_segment_seq` / `previous..new_state_version` / `llm_latency_ms` /
-    `status`）；**绝不输出 transcript 原文**。
-  - **配置（§16）**：全部集中在 `app/config.py`（无散落 `os.getenv()`）：
-    `MEETING_AGENT_ENABLED` / `_BATCH_MAX_SEGMENTS`(8) / `_BATCH_MAX_CHARS`(1200) /
-    `_MAX_ATTEMPTS`(2) / `_PARSE_REPAIR`(true) / `_MAX_BATCH_CHARS`(12000) /
-    `_MAX_STATE_CHARS`(24000) / `_MAX_BATCHES_PER_RUN`(4)。
-    **刻意不提供 `MEETING_AGENT_MODEL`**（模型名归 Provider 层，独立开关会漂移）。
-  - **Debug API（§21）**：`GET /api/internal/meetings/{id}/state`（空状态 200 /
-    会议缺失 404）+ `POST .../state/process-pending`（后台 drain，幂等）。
-    **仅内部调试，非产品 UI；前端不使用**。
-  - **明确不做（§19）**：真实腾讯 ASR / ESP32 / PCM / MQ / Kafka / Redis Stream /
-    Celery / Multi-Agent 编排 / Planning Agent / Critic Agent / RAG / 向量库 /
-    自动执行任务 / 邮件 / Calendar / 声纹映射 / 会议级时间轴 rebase / **Summary 重构** /
-    **前端大改**。
-  - **Known Limitations**：① **multi-worker 不安全**（游标推进依赖进程内
-    `meeting_lock`，与 Step 5/6 同一限制；升级路径 = DB 行锁或
-    `UPDATE ... WHERE version = :expected`）；② merge 已区分**字段缺省**与**显式空值**
-    （缺省保留，空数组/`null` 清除，可表达纠正、撤回与问题解决）；③ 状态在批次未满时
-    **可能滞后**于 Transcript，结束会议会强制 flush；
-    ④ `source_segment_seqs` 只保证字段存在，**不保证引用正确**。
-  - 测试：`backend/tests/test_meeting_state_agent.py` **40/40 PASS**
-    （含 §13 确定性 6 段脚本会议回放：schema 有效 / 游标 / 去重重放不重复 /
-    批次边界 / finish 强制 flush / 非法输出不污染 / source trace）；
-    `pytest` **95/95 PASS**；回归全绿（Step5 21 + Step6 21 + Step7A 28 + Step7B 36 +
-    list 17 + ASR-A 22）；前端 typecheck + build PASS。
-  - **零改动**：Meeting 四态机 / Freeze 语义 / Transcript 契约（ASR-0A·0B）/
-    LLM Provider / DeepSeek / **DB 既有表**（仅新增 1 张表，无 migration）/
-    **前端业务代码**。
-  - **本 Step 未 push**（按用户要求：可 commit 到 `dafenqi`，等待确认后再 push）。
-- **Step AGENT-2 已完成**：Final Summary V2 —— Meeting State as the primary summary input。
-  - **输入升级（本步唯一实质变更）**：`full transcript → LLM → summary` 升级为
-    `Meeting State（工作记忆）+ 完整 FINAL 转写 → LLM → summary`；仅在输入超限时
-    退化为优先选择的 Transcript Evidence。**Meeting State 负责结构和重点，完整转写
-    负责查漏与事实校验，Evidence 是超长会议的容量保护**。
-  - **§2 排序不变式（本步最重要）**：`finish → flush 剩余 FINAL → Meeting State 达到最新
-    → 才生成 Final Summary`。`finalize_for_meeting` 现在**自己**同步强制 flush
-    （`meeting_state_service.process_pending(force_flush=True)`，Step 0）——
-    因为 `/finish` 的 flush 跑在**另一个后台任务**里，可能失败/竞争/根本没跑
-    （trailing FINAL / crash-gap）。`assess_usability` 守住最后一跳：状态游标落后于
-    transcript 时**拒绝使用**（`state_stale`）→ 降级。**绝不静默使用过期状态当完整状态**。
-  - **Fallback（§8/§9，设计的降级，非失败）**：`v2_disabled` / `agent_disabled` /
-    `no_state` / `state_failed` / `state_empty` / `state_stale` / `state_unreadable`
-    任一 → legacy 全量 transcript 路径。`summary_source = meeting_state |
-    transcript_fallback | empty_meeting`（**只在日志，不落库**）。
-  - **结构化输出（§5）+ 向后兼容**：新增内部 `FinalMeetingSummary`
-    （overview / key_topics / decisions / action_items / open_questions / risks /
-    closing_summary，`extra="forbid"`，全部列表可空）。**既有 `MeetingSummarySchema`
-    零改动**——`to_legacy_schema` 把它投影回去（decision → conclusions，
-    action item 折叠为「task（owner，deadline）」以免承诺丢失，risk → open_questions）。
-    前端 / API 契约 / SSE / DB 列**全部不动**。
-  - **Evidence 策略（§4）**：复用 Meeting State 已有的 `source_segment_seqs`，±1 邻域
-    扩展，**按优先级排序**（decision 0 > action_item 1 > risk 2 > open_question 3 >
-    topic 4），`max_evidence_segments` 上限截断。**无 RAG / Embedding / 向量库**。
-    引用不存在的 seq **静默丢弃**（不给模型凭空编号）。
-  - **State/Evidence 冲突收口（§7）**：State = 语义候选，Evidence = 事实依据；
-    Final Summary Agent 做第二遍收口，证据不足时**降级为 open_question 或省略**，
-    **绝不编造更确定的结论**。Prompt 12 条规则显式禁止把提议升格为决策、禁止编造
-    owner/deadline（未出现时保持 `null`）。
-  - **空会议（§16）**：`final_transcript_seq == 0` → **确定性、零 LLM** 的
-    `precomputed` 计划（`overview="本次会议未产生有效转写内容。"` + 空列表）——
-    不 404、不永久 GENERATING、不让模型编内容。
-  - **Feature flag（§10）**：`FINAL_SUMMARY_V2_ENABLED=false` **完整还原**旧行为
-    （可逆切换，非单向门）。另有 `FINAL_SUMMARY_MAX_EVIDENCE_SEGMENTS` /
-    `FINAL_SUMMARY_EVIDENCE_NEIGHBOR_WINDOW` / `FINAL_SUMMARY_MAX_INPUT_CHARS` /
-    `FINAL_SUMMARY_MODEL`，全部走既有 settings，**无散落 `os.getenv()`**。
-  - **可观测（§19）**：`final_summary_plan` 日志输出 `summary_source` / `state_version`
-    / `last_processed_segment_seq` / `final_transcript_seq` / `evidence_segment_count`
-    / `fallback_reason`；**不打印 Transcript 原文 / 模型输出 / 密钥**。
-  - **§2 顺序陷阱（重要，测试必须知道）**：legacy `step7a/7b` 套件**默认阈值下不创建
-    state 行**（只 seed 3 条 FINAL < 阈值 8），因此走 fallback → **它们全绿并不能证明
-    V2 生效**。V2 由 `test_final_summary_v2.py` 单独证明（断言 `summary_source` +
-    `ScriptedProvider` 同时服务 AGENT-1 与 AGENT-2 两种 prompt）。
-  - **Known Limitations**：① V2 明细（decisions/action_items/risks/evidence）**塞在既有
-    `raw_model_output` 列**里，**不新增 DB 列**（加列 = 对核心表 ALTER，是本步的
-    stop condition）；`summary_source` **只在日志**，未持久化；② 前端**仍只消费扁平化
-    后的旧四字段**，V2 明细的点击溯源 UI 属后续步骤（本步只保证后端数据具备能力）；
-    ③ multi-worker 不安全（沿用进程内 `meeting_lock`）。
-  - 测试：`backend/tests/test_final_summary_v2.py` **35/35 PASS**
-    （T01~T32：来源选择 / §2 stale 拒绝 / 空会议 / evidence 优先级·邻域·截断·悬空引用 /
-    schema 与兼容映射 / §7 过度自信不落结论 / §14 action item 合并 / §15 语义边界 /
-    §13 证据溯源端到端 / §2 三态排序 / §10 flag OFF 还原 / §17 六段脚本回放 E2E）。
-    `pytest` **130/130 PASS**；回归全绿（Step5 21 + Step6 21 + Step7A 28 + Step7B 36 +
-    list 17 + ASR-A 22 + AGENT-1 40）；前端 typecheck + build PASS。
-  - **零改动**：Meeting 四态机 / Freeze 语义 / Transcript 契约 / LLM Provider /
-    DeepSeek / **DB 既有表（无 schema change / 无 migration）** / **前端业务代码**。
-  - **本 Step 未 push**（按用户要求：可 commit 到 `dafenqi`，等待确认后再 push）。
-- **Step LLM-CONFIG-1 已完成**：Real DeepSeek Provider Wiring + FakeProvider DX Fix。
-  - **定位**：不扩展业务功能。验证 AGENT-1 + AGENT-2 在**真实 DeepSeek**（而非
-    仅 Scripted/FakeProvider）下端到端跑通，并修复 FakeProvider 的开发体验缺陷。
-  - **§2 配置解析审计（真实生效值）**：`LLM_PROVIDER=deepseek` →
-    `DeepSeekProvider(name="deepseek-v4.1-flash")`，model=`DeepSeek-V4.1-Flash`，
-    `DEEPSEEK_BASE_URL=<内部地址，见本机 .env>`；`FINAL_SUMMARY_MODEL` 为空 →
-    用 provider 自身默认模型。**Base URL 与密钥均只存在于 `backend/.env`
-    （`.gitignore:21` 已忽略，`git check-ignore` 确认；从未进入 Git / 日志 / 前端）。**
-  - **Endpoint 形状**：协作者给的 `ANTHROPIC_BASE_URL` 是 Anthropic 形状，但
-    `DeepSeekProvider` 说的是 OpenAI 兼容 `POST {base_url}/chat/completions`。
-    实测 `<base_url>/v1/chat/completions` 返回 **HTTP 200 + OpenAI 形状**
-    （`choices[0].message.content`）→ **Provider 传输层零改动**。
-  - **fail-closed 未动**：未知 `LLM_PROVIDER` 仍 → `LLMConfigurationError`，
-    **绝不回落 FakeProvider**；`DeepSeekProvider` 仍 **lazy**（构造不触网，
-    首次 `complete()` 才失败）。
-  - **✅ 修复真实缺陷：FakeProvider 单形状导致 AGENT-1 必然失败**。原 `complete()`
-    对**所有** prompt 返回 legacy summary JSON，而 AGENT-1 校验
-    `MeetingStateUpdate`（`extra="forbid"`）→ 默认配置下每次状态更新都校验失败 →
-    静默降级 `transcript_fallback` → **本地开发从未跑通过 AGENT-1 → AGENT-2 路径**。
-    修复：按真实 prompt 的**分隔符常量**分派三种确定性形状
-    （`<meeting_state>` → Final Summary V2 / `<new_transcript>` → Meeting State
-    Update / 其它 → legacy summary）。**标记从 prompt 模块 import，不硬编码
-    —— 硬编码副本会在分隔符改名时静默失配**。无新框架、无 prompt 猜测解析；
-    `responses` FIFO 与 `error` 优先级不变。FakeProvider **仍仅离线开发/CI，
-    不代表生产模型效果**。
-  - **真实链路 deterministic replay**（`scripts/replay_real_provider.py`，**故意
-    不放在 `tests/`** —— 它发真实付费非确定性请求，CI 绝不能跑）：
-    `6 段 FINAL → AGENT-1 → DeepSeek → Meeting State → finish + force flush →
-    STREAM_END → Finalizer → AGENT-2 → DeepSeek → Final Summary`。
-    **12/12 PASS**：state 非 FAILED / cursor=6 / 决策「下周三上线」/ action item
-    「后端接口联调」/ owner「小王」/ deadline「周二之前」/ risk「支付接口稳定性」/
-    `source_segment_seqs` 存在 / summary COMPLETED / meeting COMPLETED /
-    **plan 日志 `summary_source=meeting_state`** / **未走 `transcript_fallback`**
-    （后两项从**捕获的 `final_summary_plan` 日志行**断言，非从结果反推）。
-  - **§7 输出稳定性实测**（`scripts/replay_real_provider_stability.py`，CountingProvider
-    透明代理计数真实 provider）：**12/12 次运行全部一次成功（0 次 repair）**，
-    summary 与 state 各恰好 1 次调用 → **未触发 repair / retry / fallback**，
-    无需放宽 Pydantic 严格度。（`STATUS_ACTIVE` + `cursor=6`；6 段 < 阈值 8，
-    故 AGENT-1 由 force flush 合成单次调用。）
-  - **✅ 修复 `.env` 引入的回归（重要）**：新增 `backend/.env` 后，
-    `pydantic-settings` 的 `env_file=".env"` 让 `LLM_PROVIDER=deepseek` 成为
-    **所有从 `backend/` 启动进程的环境默认值**，`os.environ.setdefault` **无法**
-    覆盖（env 文件也参与读取）→ 离线回归套件开始发**真实 API 调用**甚至挂起。
-    已为 `test_summary_step7a/7b`、`test_finalize_step6` 显式
-    `os.environ["LLM_PROVIDER"]="fake"` + 清空 `DEEPSEEK_*`（含 7b/6 的
-    uvicorn 子进程 `env`）。另重写 7A `S20`：原断言「本机没有 DeepSeek 凭据」
-    是**关于开发者机器的陈述**而非代码不变式，改用显式未配置的 `DeepSeekProvider`
-    断言「构造不触网 + 首次 `complete()` 抛 `SummaryGenerationError`」。
-  - **新增契约测试**：`tests/test_fake_provider_shapes.py` **10/10 PASS**
-    （用真实 prompt builder 断言三种形状 + 三个默认值对**真实 schema** 校验 +
-    标记顺序 + FIFO/error 优先级）。**已做 mutation 验证**：删除 state 分派分支 →
-    测试立即捕获原缺陷。
-  - 测试：`pytest` **140/140 PASS**（130 + 新增 10）；回归全绿（Step5 21 +
-    Step6 21 + Step7A 28 + Step7B 36 + list 17 + ASR-A 22）；前端 typecheck + build PASS。
-  - **零改动**：Meeting 四态机 / Transcript 契约 / ASR 契约 / Freeze 语义 /
-    **DB schema（无 migration）** / **前端业务代码** / `DeepSeekProvider` 传输层。
-  - **本 Step 未 push**（按用户要求：等待确认后再 push）。
-- **Step UI-INTEL-1 已完成**：Meeting Intelligence Panel（会中 AI 会议理解面板）。
-  - **定位**：把进行中的会议页从「只有实时字幕」升级为「实时字幕 + AI 会议理解」——
-    会议**进行中**就展示 AI 已理解出的结构化内容。**不是新数据域**：复用 AGENT-1
-    已产出的 Meeting State，本步只是**暴露**它并让它**实时可见**。
-  - **三条边界**：① `Meeting State ≠ Final Summary`（会中工作记忆 vs 会后派生终稿，
-    禁止互相推导）；② **前端绝不重新推导**（禁止 `Transcript → 关键词规则 → 猜
-    decision`，展示的每一条都必须来自服务端持久化状态）；③ **零 Agent 改动**
-    （不改 AGENT-1 核心 schema / 游标 / 批次 / 失败策略）。
-  - **公开读取 API**：`GET /api/meetings/{id}/state` → `MeetingStatePublic`
-    （**产品侧唯一入口**；internal 调试接口保留不变，前端不使用）。
-    只有 11 个字段；**结构性**不含 `model_name`（`last_error` 在两个模型上都不是
-    字段，不靠"记得别传"）。会议不存在 → 404；未处理任何 FINAL → **200 +
-    version=0 + EMPTY**（不是错误）。
-  - **损坏降级（§6）**：`state_json` 不可解析时**不 500、不回写 DB**，在**投影层**
-    降级为 `status=FAILED` + 保留可安全读取的标量 + 内容置空。
-    **绝不返回 `ACTIVE + 空内容`**（那等于谎称 AI 正常）；**绝不**把解析异常当产品 500。
-  - **SSE 失效通知 `meeting.state.updated`**（复用既有 `/events` 连接，
-    **不新增第二条 EventSource**）：
-    - 语义是「**product-visible durable 状态变了**」，**不是**「version +1」。
-      必须覆盖：`ACTIVE vN → ACTIVE vN+1`、`ACTIVE|EMPTY → FAILED`、
-      `FAILED → ACTIVE`、`ACTIVE → FROZEN`；`FAILED → FAILED` 与 `NO_WORK` 抑制。
-      **必须覆盖 FAILED** —— `mark_failed` 刻意不推进 version，"version+1 才发"
-      会**静默丢掉整个失败通知**。
-    - payload 仅 `{version,status}`；**先 commit 后 publish**；发布失败**绝不回滚**。
-      **非 durable、不回放**，不改变 `after_segment_seq` 协议，无 Last-Event-ID。
-    - **稳定 id 必须带 status**：`state:<mid>:<version>:<status>` ——
-      `ACTIVE@4` 与 `FAILED@4` 是两个不同的 durable 状态、同一个 version，
-      仅凭 version 无法区分，客户端去重会误判为重复而丢弃。
-      **不引入新的持久化事件序号**。
-  - **✅ 修复真实缺陷（SQLAlchemy identity-map aliasing）**：`db.get()` 每次返回
-    **同一个** identity-mapped 实例，而 `repository.upsert` **原地修改**该实例 ——
-    于是「写后读 `row.status`」拿到的是**新值**，发布判据恒为"没变"，
-    **每一次状态变更都会被静默抑制**（`ACTIVE → FROZEN` 已实测复现）。
-    修复：在写**之前**把 `previous_status` / `previous_version` 读进**普通局部变量**；
-    `_current_state_identity()` 返回**普通元组而非 ORM 行**（docstring 记录此陷阱）。
-    **已做 mutation 验证**：改回别名读 → `test_freeze_is_announced` 立即失败。
-  - **SSE 白名单三处同步 + 编译期守卫（§4 硬要求）**：后端具名帧**不触发
-    `onmessage`**，遗漏订阅是**完全静默**的失效。三处 = 后端 `SSE_EVENT_TYPES` /
-    `types/sse.ts` 的 `SseEventType` / `utils/sse.ts` 的白名单。新增
-    `Exclude<SseEventType, typeof SSE_EVENT_TYPES[number]> extends never` 穷尽性守卫
-    （`satisfies` 只能查多余，查不出**遗漏**——而遗漏恰是静默方向）。
-    **已做 mutation 验证**：删白名单成员 → `npm run typecheck` 立即报错。
-  - **前端数据架构（§7/§8）**：`useMeetingIntelligence(meetingId, enabled)` ——
-    初始 GET / 两道守卫 / `refreshState()`；**状态留在 hook 内，不扩 Zustand 全局
-    store**。`useMeetingStream(..., onStateInvalidated)` 收到失效通知 → `refreshState()`
-    （回调经 `Ref` 读取，故意不进 effect 依赖，否则每次 render 换引用都会重连 SSE）。
-    - **两道守卫缺一不可**：*request sequence*（乱序旧响应不覆盖新响应）+
-      *version*（`incoming.version >= current.version` 才落地）。必须 `>=` 而非 `>`：
-      FAILED 不推进 version，`>` 会丢掉同 version 下的 `ACTIVE → FAILED`。
-      **初始基线 `-1`**，保证首个 `version=0 / EMPTY` 正常进入。
-  - **展示（§9~§12）**：面板挂既有 `room__rail`（轨首），**不重构 MeetingRoom**。
-    四态 Loading / Empty / Error / Normal；**FAILED 保留 last-good 内容** + 轻量提示
-    （**会议 `COMPLETED` + State `FAILED` 是合法组合**）。
-    `owner` / `deadline` = null → 「待确认」，**纯展示层 fallback，绝不写回后端**。
-    `source_segment_seqs` 保留在类型与 API，**点击溯源属 UI-INTEL-2**。
-    视觉沿用既有体系（无新 UI 库 / 动画库 / 渐变 / 发光 / emoji）：
-    `.intel-*` CSS + 宽屏 `--rail-width: 340px` + `<900px` 单列面板独占整行。
-  - 测试：`backend/tests/test_meeting_state_api.py` **31/31 PASS**；
-    `pytest` **171/171 PASS**；回归全绿（Step5 21 + Step6 21 + Step7A 28 +
-    Step7B 36 + list 17 + ASR-A 22）；前端 typecheck + build PASS。
-  - **E2E**：`scripts/e2e_ui_intel_browser.py` 真实 Chrome CDP **17/17 PASS** ——
-    含**只有浏览器能证明**的断言：`meeting.state.updated` **不刷新**页面即更新面板
-    （具名帧真实到达）、`ACTIVE→FAILED` **同 version** 转换、FAILED 保留 last-good、
-    无内部细节泄漏、Agent FAILED ≠ Transcript FAILED。
-    **已做 mutation 验证**：删掉前端失效分派 → UI-I06/UI-I14 失败而 UI-I11（刷新恢复）
-    仍通过，证明测的是**实时失效**而非恢复。
-  - **零改动**：Meeting 四态机 / Freeze 语义 / Transcript 契约 / ASR 契约 /
-    LLM Provider / **DB schema（无 migration，`meeting_state` 表结构不变）** /
-    AGENT-1 核心 schema / AGENT-2。
-  - **本 Step 未 push**（按用户要求：可 commit 到 `dafenqi`，等待确认后再 push）。
-- **Step UI-INTEL-2A 已完成**：Transcript Evidence Trace（会中证据溯源）。
-  - 会议进行中的 `AI 会议理解`面板条目 →「查看原文」→ 定位持久化 FINAL 行 +
-    高亮；复用既有 `/events` 连接，无新路由、无新数据域。
-  - `utils/evidence.ts`（唯一规范化实现：正整数 / 去重 / 升序 / 上限 50）+
-    `useTranscriptEvidenceNavigation`（唯一 DOM 定位实现：`data-segment-seq`）+
-    `EvidenceTraceButton`（无 evidence 则**不渲染**，不给 disabled 假按钮）。
-  - **定位依据只有 `data-segment-seq`**（`UNIQUE(meeting_id, segment_seq)`）；
-    禁止数组 index / 文本内容 / utterance_id。
-  - **§10 核心**：跳转后新 FINAL **不得把用户拽回底部**。与 `useAutoScroll`
-    的协作是**可选的**：`pauseAutoFollow()` 只覆盖「跳转不产生 scroll 事件」
-    这一种情况（其余情况 `onScroll` 会按几何重新推导跟随态）。
-    **mutation 证明**：删掉 `pauseAutoFollow()` 调用，2A-15 仍然通过 —— 因此
-    新增严格用例 2A-24/2A-25（跳转不滚动 + 随后到 FINAL 不被追），只有显式
-    暂停才能覆盖。冗余关系已在 hook 与测试双向注释。
-  - 降级：部分 seq 缺失 → 忽略缺失项、有则高亮；**全部**缺失 → 轻提示
-    「原始记录暂不可定位」，不弹窗、不抛错。
-  - 测试：`scripts/e2e_ui_intel_2a_browser.py` 真实 Chrome CDP **31/31 PASS**；
-    后端回归全绿；前端 typecheck + build PASS。**Backend 零改动**。
-- **Step UI-INTEL-2B 已完成 ✅**：Final Summary → Transcript Evidence Trace（会后证据溯源）。
-  - **定位**：把 AGENT-2 已经产生的 Final Summary evidence **暴露**出来并可点击
-    溯源。**不重新生成 evidence，不修模型引用质量，不新增数据域**（§12）。
-  - **后端 B1（唯一实质变更）**：`get_summary` 在既有 summary row 上做**公开读投影**
-    → `SummaryOut.summary_evidence`（可选）。
-    `final_summary_schemas.project_summary_evidence(raw_model_output)` 解析
-    `raw_model_output` → 识别合法 `FinalMeetingSummary` → 输出
-    `SummaryEvidence{topics, decisions, action_items, risks, open_questions}`，
-    每条保留 `source_segment_seqs` 与业务字段（topic: title/summary；decision:
-    text；action: task/owner/deadline；risk/open_question: text）。
-    **无新 DB 列、无 migration、不改 Summary 持久化结构。**
-  - **V2 判定方式（唯一依据）**：`FinalMeetingSummary` 的 **`extra="forbid"`**。
-    legacy payload 必带 `conclusions`（V2 未声明该字段）→ **校验失败**，而不是
-    "成功解析出空列表"。没有这条 config 两种形状无法区分（共享
-    `overview`/`key_topics`/`open_questions`），每个 legacy 摘要都会静默宣称
-    "结构化 evidence 为空"。**已做 mutation 验证**。
-  - **legacy / fallback 降级（§3）**：非可验证 V2 → `summary_evidence = null`。
-    **不猜、不从 legacy 字符串反推、不关键词匹配、不调 LLM 补、不抛 500**。
-    投影失败**只能降级这一个可选字段**，绝不能把可读摘要变成 500。
-  - **修复读路径严于写路径（真实缺陷）**：`parse_v2` 走 `_prune_code_fence`
-    而投影直接 `json.loads` → 带 ``` 围栏的真实 DeepSeek 响应**写得进、读不出**，
-    evidence 永久为 null（测试全绿、线上失效）。修复：`prune_code_fence` 上移到
-    `final_summary_schemas.py`，读写共用同一实现（`final_summary_service` 以
-    别名引用，避免漂移）。
-  - **§13 doc drift 修复**：`final_summary_schemas.py` docstring 曾描述一个
-    **并不存在**的 sanitize 流程。已改为与实现一致（引用不存在的 seq
-    **不修复、不丢弃**，是否可解析由读侧决定）。**未新增未经设计的 sanitize**。
-  - **前端（§5/§6/§7）**：
-    - 复用 UI-INTEL-2A 的 `utils/evidence.ts` / `useTranscriptEvidenceNavigation` /
-      `EvidenceTraceButton` / `.transcript-segment--evidence` / `data-segment-seq`
-      —— **没有第二套 querySelector / scrollIntoView / highlight timer**。
-    - **不跳回 MeetingRoom、不新增 route query**：Result 页本就有「会议纪要 /
-      会议内容」两个 Tab，点击 → 切到「会议内容」→ 定位 + 高亮。
-    - **不接 auto-follow**：会后转写是静态归档，无新 FINAL 抢滚动；
-      `pauseAutoFollow` / `jumpToBottom` **没有被带进 Result 页**（§7）。
-    - 两条渲染路径：`summary_evidence` 非 null → 按**核心议题 / 已确认决策 /
-      待办事项 / 未决问题 / 风险**五类结构化渲染；null → 原样扁平渲染，
-      **无任何入口**。
-  - **★ 修复真实缺陷：异步 Tab 假「不可定位」**。`setActiveTab` 只改我们自己的
-    state；AntD 用它**内部** activeKey 决定渲染哪个面板，并在**更晚的一次 commit**
-    才同步。实测（本 Step E2E）：仅依赖 `activeTab` 的 `useEffect` **不够** ——
-    effect 跑时 ref 仍是 null，而 `contentSettled` 早已 true → hook 判定
-    「已定稿但容器不存在」→ **每次点击都弹假的「原始记录暂不可定位」**。
-    修复：把容器挂载提升为 state（callback ref），effect 依赖
-    `[activeTab, transcriptNode, traceEvidence]`，节点出现的那一刻才定位；
-    已在 `handleTraceEvidence` 中保留「已在该 Tab 且容器已挂载 → 直接定位」分支
-    （callback ref 只在挂载时触发，覆盖不到这种可见性变化）。
-  - **§8 边界**：`[4,5,999]` 中 4、5 存在 → 定位成功并同时高亮，999 **静默忽略**
-    （**不得**报「暂不可定位」）；**全部**不存在 → 轻提示，页面不崩。
-    后端**原样透传** seqs（不去重/不排序/不过滤非法值）—— 规范化只有前端一份。
-  - **§9 展示**：仅「查看原文」轻量入口，**不显示 `source_segment_seqs` /
-    Evidence ID**，**不宣称「AI 已验证」**。
-  - 测试：`backend/tests/test_summary_evidence_api.py` **20/20 PASS**
-    （T01~T11 投影单测：五种类型 / null owner·deadline 保持 null / seqs 原样透传
-    `[5,2,5,999,2]` 不变 / legacy 拒绝 / 围栏 V2 接受 / malformed·非对象·None·
-    空·FAILED reason 全 None / 空会议 precomputed vs 合法空 V2 / `extra="forbid"`
-    守卫；T12~T18 HTTP 面：12 键集合、404、无内部泄漏；T19~T20 走**真实链路**
-    断言 seqs 来自 AGENT-1 而非手写 fixture）。
-    `pytest` **191/191 PASS**（三次连跑一致）。
-  - **Browser E2E**：`scripts/e2e_ui_intel_2b_browser.py` 真实 Chrome CDP
-    **37/37 PASS**，覆盖用户指定的 6 个 Case：
-    - Case 1 Decision →「查看原文」→ 自动切「会议内容」Tab → 对应行高亮
-      （并断言**不是**假的「暂不可定位」）；
-    - Case 2 Action Item `[4,5]` → 4、5 同时高亮；
-    - Case 3 部分 dangling `[4,5,999]` → 4、5 正常工作、note 为空；
-    - Case 4 全部 evidence 不存在 →「原始记录暂不可定位」、无高亮、页面不崩、
-      无内部细节泄漏、提示会自行消失、之后仍可正常溯源；
-    - Case 5 legacy / fallback → `summary_evidence=null` → **0 个假按钮**，
-      且旧扁平字段内容照常展示（走真实 §9 降级：empty state → 全量 transcript 路径）；
-    - Case 6 前端源码**不读取 / 不 JSON.parse `raw_model_output`**（源码级断言）。
-    另含：Tab 面即导航面（无新 route/query）、重复点击可重触发、高亮自动过期、
-    F5 后从 durable API 恢复、Result 页**无** auto-follow 控件、Transcript 未被改动。
-  - **Dev-only 启动器**：`scripts/e2e_ui_intel_stack.sh`（`up|down` + `intel1|intel2a|intel2b`），
-    三套 E2E 只差端口与 harness 模块；端口占用是唯一可靠的清理信号
-    （Windows 下残留 Chrome 会占住端口 + profile 锁，导致下次 `up` 以
-    "Lock file can not be created" 失败）。intel1 额外需要
-    `MEETING_AGENT_MAX_BATCH_CHARS=2000`（否则 UI-I13/14 会以 state 仍 ACTIVE 失败）。
-  - 回归：pytest 191/191；legacy suites 全绿（Step5 21 + Step6 21 + Step7A 28 +
-    Step7B 36 + list 17 + ASR-A 22）；**UI-INTEL-1 browser E2E 17/17**；
-    **UI-INTEL-2A browser E2E 31/31**；**UI-INTEL-2B 37/37**；
-    前端 typecheck + build PASS。
-  - **Known limitations**：① 4 个 evidence 入口共用「主要结论 / 未决问题」两节
-    （后端 `to_legacy_schema` 本就压平到此），不新开四节；② 空会议 precomputed
-    摘要是 legacy payload → evidence 为 `null`（诚实回答：无可溯源内容），而
-    "真的什么都没决定的 V2 会议" 是可到达的**非 null 空** `SummaryEvidence`；
-    ③ 后端不改写 seqs，悬空引用仍原样出现（读侧解释）；④ multi-worker 不安全
-    （沿用进程内锁，与 Step 5/6/AGENT-1 同一限制）。
-  - **零改动**：Meeting 四态机 / Freeze 语义 / Transcript 契约 / ASR 契约 /
-    LLM Provider / DeepSeek / **DB schema（无 migration）** / AGENT-1 /
-    AGENT-2 生成行为 / evidence 语义正确性。
-  - **本 Step 未 push**（按用户要求：可 commit 到 `dafenqi`，等待确认后再 push）。
+npm run typecheck
+
+npm run build
+
+
+# 当前开发原则
+
+新增能力：
+
+优先新增独立模块。
+
+不要破坏已有：
+
+ASR
+→ Transcript
+→ SSE
+→ Summary
+
+新增Agent默认采用旁路设计。
+
+详细架构：
+docs/architecture.md
+
+
+# 文档入口
+
+prd.md
+          产品事实源
+
+docs/architecture.md
+          系统架构
+
+docs/api-contract.md
+          API协议
+
+protocols/
+          外部协议
+
+docs/handoff.md
+          当前状态
+
+docs/progress.md
+          开发记录

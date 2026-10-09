@@ -35,11 +35,27 @@ import type { SseEnvelope } from '@/types/sse'
 const BASE_DELAY = 1000
 const MAX_DELAY = 10000
 
+/**
+ * `captain.quick_assessment` payload 的线上形状（见 docs/api-contract.md）。
+ *
+ * 唯一与 `CaptainQuickAssessment` 的差别是多了 `report_id` 与
+ * `provisional` —— 前者让客户端知道这条临时结果属于哪一份报告，后者是
+ * 后端的不变式（永远 true），UI 用它做防御而不是做判断。
+ */
+export interface CaptainQuickEventPayload {
+  report_id: string
+  provisional: true
+  issue: string
+  key_evidence: { segment_seq: number; quote: string; supports: string }[]
+  provisional_judgement: string
+  question_to_resolve: string
+}
+
 function backoffDelay(attempt: number): number {
   return Math.min(BASE_DELAY * 2 ** attempt, MAX_DELAY)
 }
 
-interface UseMeetingStreamParams {
+export interface UseMeetingStreamParams {
   meetingId: string | undefined
   status: Meeting['status'] | undefined
   /** Snapshot 首次加载成功后才为 true —— 是建立 SSE 的前置条件 */
@@ -60,7 +76,46 @@ interface UseMeetingStreamParams {
    * 否则回调每次 render 换新引用都会重连 SSE。
    */
   onStateInvalidated?: () => void
+  /**
+   * 裁判事件回调（ADR-002 Phase 2-A + Task 6），**一个入口覆盖三种事件**：
+   *
+   *   `captain.completed` / `captain.failed` → `{kind:'terminal', reportId}`
+   *      可以**停止等待**（durable 报告已落盘）。调用方按 `reportId` 回源
+   *      `GET /captain/{reportId}`。
+   *   `captain.quick_assessment`           → `{kind:'quick', quick}`
+   *      **必须继续等待**（这只是第一段结果，Deep 仍在跑）。不回源 —— 此时
+   *      GET 回来只有空报告；调用方直接渲染临时卡片。
+   *
+   * 为什么是**一个**回调而不是两个（Phase C.5）
+   * -------------------------------------------
+   * 归属规则必须由同一个 owner 持有。两个独立回调意味着「接受 B 的临时结果」
+   * 时没有任何东西知道「A 已经落盘终态」，那份临时卡片就会挂到已经完成的 A 上。
+   * 合并后，`useCaptainReferee` 内部持有 reportId / status 两个 ref，两条规则
+   * （属于当前报告 / 当前不是终态）在一处判定，不存在二者不同步的窗口。
+   *
+   * 与 `onStateInvalidated` 一样，**不把 terminal payload 当内容**交给调用方：
+   * `captain.completed` 虽然例外地携带了报告的一部分字段（positions /
+   * dispute_points / uncertainty，后端为即时渲染刻意做的偏离），
+   * 但它是完整报告的子集 —— 缺 `discussion_summary` / `agreement_points` /
+   * `evidence` / `suggestion`。用它渲染会得到一份看起来完整、实则残缺的报告，
+   * 所以调用方一律回源 `GET /captain/{report_id}`（payload 里始终有 report_id）。
+   *
+   * 存在 `Ref` 里，故意**不**进 effect 依赖 —— 同 onStateInvalidated 的理由：
+   * 回调每次 render 换引用会重连 SSE。
+   */
+  onCaptainEvent?: (event: CaptainStreamEvent) => void
 }
+
+/**
+ * 裁判事件的三态联合（Task 6 / Phase C.5 §5）。
+ *
+ * 判别式 `kind` 而不是把 `quick` 做成可选字段：可选字段会让「terminal 事件却带
+ * 了 quick」和「quick 事件却没有 quick」两种非法组合都类型合法，调用方只能靠
+ * 运行时 if 兜住 —— 这正是下面要防的错归因。
+ */
+export type CaptainStreamEvent =
+  | { kind: 'terminal'; reportId: string | null }
+  | { kind: 'quick'; quick: CaptainQuickEventPayload | null }
 
 /** 从 partial 记录里摘掉某 utterance（无则原样返回，避免无谓 setState） */
 function withoutPartial(
@@ -79,6 +134,7 @@ export function useMeetingStream({
   snapshotReady,
   maxSegmentSeq,
   onStateInvalidated,
+  onCaptainEvent,
 }: UseMeetingStreamParams) {
   const esRef = useRef<EventSource | null>(null)
   const timerRef = useRef<number | null>(null)
@@ -89,6 +145,9 @@ export function useMeetingStream({
   // 失效回调经 Ref 读取：handler 闭包与 effect 依赖都不随回调引用变化（见参数注释）
   const onStateInvalidatedRef = useRef(onStateInvalidated)
   onStateInvalidatedRef.current = onStateInvalidated
+  // 同上：裁判事件回调经 Ref 读取，不参与 effect 依赖（否则每次 render 重连 SSE）
+  const onCaptainEventRef = useRef(onCaptainEvent)
+  onCaptainEventRef.current = onCaptainEvent
   // Snapshot 游标只增不减：初始以此 seed；后续 live FINAL / 显式 recovery 更新。
   // 若每次 render 都覆盖会把「已收到的 live max」打回 snapshot 值，破坏重连游标。
   if (maxSegmentSeq > maxSeqRef.current) maxSeqRef.current = maxSegmentSeq
@@ -235,6 +294,35 @@ export function useMeetingStream({
           // 所以这里只触发拉取，不消费 payload、不做版本比较（由 hook 守卫）。
           onStateInvalidatedRef.current?.()
           break
+        case 'captain.completed':
+        case 'captain.failed': {
+          // ADR-002 Phase 2-A：裁判报告就绪 / 失败 → 回源读那一份报告。
+          // 只把 report_id 传出去，**不**消费 payload 的报告片段（它是子集，
+          // 渲染它会得到残缺报告 —— 见 onCaptainEvent 的参数注释）。
+          // 成功与失败走同一条路径：两种情况下事实源都是 GET（失败时
+          // report_json 为 NULL，GET 回来就是 status=FAILED，没有内容）。
+          const p = env.payload as { report_id?: unknown }
+          const reportId = typeof p.report_id === 'string' ? p.report_id : null
+          onCaptainEventRef.current?.({ kind: 'terminal', reportId })
+          break
+        }
+        case 'captain.quick_assessment': {
+          // Task 6：两阶段裁判的第一段。**不**回源 GET —— 此时报告仍是
+          // ANALYZING，GET 回来只有空报告；这一段的全部价值就是不等 Deep。
+          // 与 terminal 事件的关键区别是**不能**停止 loading，所以走同一个
+          // 回调的另一种 kind，由消费方（useCaptainReferee）按 ref 做归属判定
+          // —— 归属规则必须与 terminal 的判定在同一处，见参数注释。
+          const p = env.payload as { report_id?: unknown }
+          if (typeof p.report_id !== 'string') {
+            onCaptainEventRef.current?.({ kind: 'quick', quick: null }) // 防御：无主，不渲染
+            break
+          }
+          onCaptainEventRef.current?.({
+            kind: 'quick',
+            quick: env.payload as unknown as CaptainQuickEventPayload,
+          })
+          break
+        }
         default:
           break // heartbeat / summary.*（留给 8C）忽略
       }
